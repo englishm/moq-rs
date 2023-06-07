@@ -35,8 +35,10 @@ async fn main() -> anyhow::Result<()> {
 	let moq_args = Cli::parse();
 	let http_args = moq_args.clone();
 
-	// TODO return result instead of panicing
-	tokio::task::spawn(async move { run_transport(moq_args).unwrap() });
+	tokio::task::spawn(async move {
+		run_transport(moq_args)?;
+		Ok::<(), anyhow::Error>(())
+	});
 
 	run_http(http_args).await
 }
@@ -49,7 +51,7 @@ fn run_transport(args: Cli) -> anyhow::Result<()> {
 		key: args.key,
 	};
 
-	let mut server = transport::Server::<session::Session>::new(server_config).unwrap();
+	let mut server = transport::Server::<session::Session>::new(server_config)?;
 	server.run()
 }
 

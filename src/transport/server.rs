@@ -27,10 +27,10 @@ pub struct Config {
 }
 
 impl<T: app::App> Server<T> {
-	pub fn new(config: Config) -> io::Result<Self> {
+	pub fn new(config: Config) -> anyhow::Result<Self> {
 		// Listen on the provided socket address
 		let addr = config.addr.parse().unwrap();
-		let mut socket = mio::net::UdpSocket::bind(addr).unwrap();
+		let mut socket = mio::net::UdpSocket::bind(addr)?;
 
 		// Setup the event loop.
 		let poll = mio::Poll::new().unwrap();
@@ -45,7 +45,7 @@ impl<T: app::App> Server<T> {
 		let seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
 
 		// Create the configuration for the QUIC conns.
-		let mut quic = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+		let mut quic = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
 		quic.load_cert_chain_from_pem_file(&config.cert).unwrap();
 		quic.load_priv_key_from_pem_file(&config.key).unwrap();
 		quic.set_application_protos(quiche::h3::APPLICATION_PROTOCOL).unwrap();
