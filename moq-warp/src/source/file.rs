@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Seek};
 
 use std::{fs, io, path, time};
 
@@ -104,13 +104,27 @@ impl File {
 
 	pub async fn run(mut self) -> anyhow::Result<()> {
 		// The timestamp when the broadcast "started", so we can sleep to simulate a live stream.
-		let start = tokio::time::Instant::now();
+		let mut start = tokio::time::Instant::now();
+		dbg!(start);
 
 		// The current track name
 		let mut track_name = None;
 
 		loop {
-			let atom = read_atom(&mut self.reader)?;
+			let start_pos = self.reader.seek(io::SeekFrom::Current(0))?;
+			let atom = match read_atom(&mut self.reader) {
+				Ok(atom) => atom,
+				Err(e) => {
+					dbg!(e);
+					// TODO: Check for specific error like ErrorKind::UnexpectedEof
+					println!("Reached EOF, looping");
+					start = tokio::time::Instant::now();
+					self.reader.seek(io::SeekFrom::Start(0))?; //TODO: skip past init and get to first moof
+					read_atom(&mut self.reader)? // if this doesn't work we still just bail up with an error
+				}
+			};
+			let current_pos = self.reader.seek(io::SeekFrom::Current(0))?;
+			dbg!(start_pos, current_pos);
 
 			let mut reader = io::Cursor::new(&atom);
 			let header = mp4::BoxHeader::read(&mut reader)?;
