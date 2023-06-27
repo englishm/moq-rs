@@ -119,7 +119,15 @@ impl File {
 					// TODO: Check for specific error like ErrorKind::UnexpectedEof
 					println!("Reached EOF, looping");
 					start = tokio::time::Instant::now();
-					self.reader.seek(io::SeekFrom::Start(0))?; //TODO: skip past init and get to first moof
+					self.reader.seek(io::SeekFrom::Start(0))?;
+
+					// skip past init
+					let ftyp = read_atom(&mut self.reader)?;
+					anyhow::ensure!(&ftyp[4..8] == b"ftyp", "expected ftyp atom");
+					let moov = read_atom(&mut self.reader)?;
+					anyhow::ensure!(&moov[4..8] == b"moov", "expected moov atom");
+
+					// get to first moof
 					read_atom(&mut self.reader)? // if this doesn't work we still just bail up with an error
 				}
 			};
