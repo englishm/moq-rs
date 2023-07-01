@@ -105,7 +105,7 @@ impl File {
 	pub async fn run(mut self) -> anyhow::Result<()> {
 		// The timestamp when the broadcast "started", so we can sleep to simulate a live stream.
 		let mut start = tokio::time::Instant::now();
-		dbg!(start);
+		//dbg!(start);
 
 		// The current track name
 		let mut track_name = None;
@@ -115,7 +115,7 @@ impl File {
 			let atom = match read_atom(&mut self.reader) {
 				Ok(atom) => atom,
 				Err(e) => {
-					dbg!(e);
+					//dbg!(e);
 					// TODO: Check for specific error like ErrorKind::UnexpectedEof
 					println!("Reached EOF, looping");
 					start = tokio::time::Instant::now();
@@ -132,7 +132,7 @@ impl File {
 				}
 			};
 			let current_pos = self.reader.seek(io::SeekFrom::Current(0))?;
-			dbg!(start_pos, current_pos);
+			//dbg!(start_pos, current_pos);
 
 			let mut reader = io::Cursor::new(&atom);
 			let header = mp4::BoxHeader::read(&mut reader)?;
