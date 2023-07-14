@@ -1,7 +1,13 @@
-use anyhow;
+use anyhow::{self, Context};
+use env_logger;
+use log;
 use std::io::{self, Cursor, Read};
+use tokio;
+use webtransport_quinn;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+	env_logger::init();
 	// let atom = read_atom(io::stdin().by_ref());
 	//dbg!(&atom);
 	let ftyp = read_atom(io::stdin().by_ref())?;
@@ -16,6 +22,36 @@ fn main() -> anyhow::Result<()> {
 	let mut moov_reader = Cursor::new(moov);
 	let parsed_moov = mp4::BoxHeader::read(&mut moov_reader);
 	dbg!(&parsed_ftyp, &parsed_moov);
+
+	let mut tls_config = rustls::ClientConfig::builder()
+		.with_safe_defaults()
+		.with_custom_certificate_verifier(SkipServerVerification::new()) // TODO: Replace this!!!
+		.with_no_client_auth();
+
+	tls_config.alpn_protocols = vec![webtransport_quinn::ALPN.to_vec()]; // this one is important
+
+	let config = quinn::ClientConfig::new(std::sync::Arc::new(tls_config));
+
+	let addr = "[::]:0".parse()?;
+	let mut client = quinn::Endpoint::client(addr)?;
+	client.set_default_client_config(config);
+
+	let uri = "https://localhost:4443/webtransport/devious-baton"
+		.try_into()
+		.context("failed to parse uri")?;
+
+	// Use a helper method to convert URI to host/port.
+	let conn = webtransport_quinn::dial(&client, &uri).await?;
+	log::info!("connecting to {}", uri);
+
+	let conn = conn.await?;
+	log::info!("established QUIC connection");
+
+	// Perform the WebTransport handshake.
+	let session = webtransport_quinn::connect(conn, &uri).await?;
+	log::info!("established WebTransport session");
+
+	// TODO MoQT stuffs
 
 	Ok(())
 }
@@ -57,4 +93,28 @@ fn read_atom<R: Read>(reader: &mut R) -> anyhow::Result<Vec<u8>> {
 	limit.read_to_end(&mut raw)?;
 
 	Ok(raw)
+}
+
+// Implementation of `ServerCertVerifier` that verifies everything as trustworthy.
+// WARNING: Don't use this in production.
+struct SkipServerVerification;
+
+impl SkipServerVerification {
+	fn new() -> std::sync::Arc<Self> {
+		std::sync::Arc::new(Self)
+	}
+}
+
+impl rustls::client::ServerCertVerifier for SkipServerVerification {
+	fn verify_server_cert(
+		&self,
+		_end_entity: &rustls::Certificate,
+		_intermediates: &[rustls::Certificate],
+		_server_name: &rustls::ServerName,
+		_scts: &mut dyn Iterator<Item = &[u8]>,
+		_ocsp_response: &[u8],
+		_now: std::time::SystemTime,
+	) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+		Ok(rustls::client::ServerCertVerified::assertion())
+	}
 }

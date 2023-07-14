@@ -7,5 +7,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.71"
+env_logger = "0.10.0"
+log = "0.4.19"
 mp4 = "0.13.0"
+quinn = "0.10.1"
+quinn-proto = "0.10.1"
+rustls = {version = "0.21.5", features = ["dangerous_configuration", "quic"]}
+tokio = {version = "1.29", features = ["macros", "rt", "rt-multi-thread"]}
 webtransport-quinn = "0.1.0"
