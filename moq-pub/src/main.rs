@@ -11,10 +11,10 @@ fn main() -> anyhow::Result<()> {
 	anyhow::ensure!(&moov[4..8] == b"moov", "expected moov atom");
 
 	dbg!(&ftyp, &moov);
-	let mut c_ftyp = Cursor::new(ftyp);
-	let parsed_ftyp = mp4::BoxHeader::read(&mut c_ftyp);
-	let mut c_moov = Cursor::new(moov);
-	let parsed_moov = mp4::BoxHeader::read(&mut c_moov);
+	let mut ftyp_reader = Cursor::new(ftyp);
+	let parsed_ftyp = mp4::BoxHeader::read(&mut ftyp_reader);
+	let mut moov_reader = Cursor::new(moov);
+	let parsed_moov = mp4::BoxHeader::read(&mut moov_reader);
 	dbg!(&parsed_ftyp, &parsed_moov);
 
 	Ok(())
