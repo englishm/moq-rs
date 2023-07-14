@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.71"
 mp4 = "0.13.0"
+webtransport-quinn = "0.1.0"

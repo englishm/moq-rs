@@ -753,7 +753,9 @@ dependencies = [
 name = "moq-pub"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "mp4",
+ "webtransport-quinn",
 ]
 
 [[package]]
@@ -1738,6 +1740,20 @@ checksum = "f095d78192e208183081cc07bc5515ef55216397af48b873e5edcd72637fa1bd"
 dependencies = [
  "ring",
  "untrusted",
+]
+
+[[package]]
+name = "webtransport-quinn"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e1207e2bdc7b82e98254adc748faf1a26d6a4d8ff37a373783718f9b504b1cb"
+dependencies = [
+ "bytes",
+ "http",
+ "quinn",
+ "quinn-proto",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
