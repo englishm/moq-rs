@@ -6,7 +6,7 @@ use bytes::{Buf, BufMut};
 // Sent by the server in response to a client.
 // NOTE: This is not a message type, but rather the control stream header.
 // Proposal: https://github.com/moq-wg/moq-transport/issues/138
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SetupServer {
 	// The list of supported versions in preferred order.
 	pub version: Version,

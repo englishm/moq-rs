@@ -2,7 +2,7 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError, VarInt};
 
 use bytes::{Buf, BufMut};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AnnounceError {
 	// Echo back the namespace that was announced.
 	// TODO Propose using an ID to save bytes.

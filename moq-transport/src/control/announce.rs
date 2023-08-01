@@ -2,7 +2,7 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 
 use bytes::{Buf, BufMut};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Announce {
 	// The track namespace
 	pub track_namespace: String,

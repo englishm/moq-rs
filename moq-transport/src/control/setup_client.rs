@@ -4,7 +4,7 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use bytes::{Buf, BufMut};
 
 // Sent by the client to setup up the session.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SetupClient {
 	// NOTE: This is not a message type, but rather the control stream header.
 	// Proposal: https://github.com/moq-wg/moq-transport/issues/138

@@ -2,7 +2,7 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError, VarInt};
 
 use bytes::{Buf, BufMut};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Subscribe {
 	// An ID we choose so we can map to the track_name.
 	// Proposal: https://github.com/moq-wg/moq-transport/issues/209

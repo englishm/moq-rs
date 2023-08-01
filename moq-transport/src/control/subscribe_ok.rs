@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use bytes::{Buf, BufMut};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SubscribeOk {
 	// NOTE: No full track name because of this proposal: https://github.com/moq-wg/moq-transport/issues/209
 
