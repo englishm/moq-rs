@@ -2,7 +2,7 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError, VarInt};
 
 use bytes::{Buf, BufMut};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Object {
 	// An ID for this track.
 	// Proposal: https://github.com/moq-wg/moq-transport/issues/209
