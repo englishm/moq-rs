@@ -4,6 +4,7 @@ use anyhow::Context;
 use clap::Parser;
 use ring::digest::{digest, SHA256};
 use warp::Filter;
+use console_subscriber;
 
 mod config;
 mod server;
@@ -15,13 +16,16 @@ pub use session::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	env_logger::init();
+	// env_logger::init();
 
 	// Disable tracing so we don't get a bunch of Quinn spam.
-	let tracer = tracing_subscriber::FmtSubscriber::builder()
-		.with_max_level(tracing::Level::WARN)
-		.finish();
-	tracing::subscriber::set_global_default(tracer).unwrap();
+	// let tracer = tracing_subscriber::FmtSubscriber::builder()
+	// 	.with_max_level(tracing::Level::WARN)
+	// 	.finish();
+	// tracing::subscriber::set_global_default(tracer).unwrap();
+
+	console_subscriber::init();
+
 
 	let config = Config::parse();
 
