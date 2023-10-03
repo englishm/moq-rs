@@ -88,6 +88,7 @@ impl Server {
 		})
 	}
 
+	#[tracing::instrument(skip(self))]
 	pub async fn run(mut self) -> anyhow::Result<()> {
 		log::info!("listening on {}", self.server.local_addr()?);
 

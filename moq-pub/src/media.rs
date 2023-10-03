@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::time;
 use tokio::io::AsyncReadExt;
+use tracing::instrument;
 
 pub struct Media {
 	// We hold on to publisher so we don't close then while media is still being published.
@@ -75,6 +76,7 @@ impl Media {
 		})
 	}
 
+	#[instrument(name = "media::run", skip(self))]
 	pub async fn run(&mut self) -> anyhow::Result<()> {
 		let mut stdin = tokio::io::stdin();
 		// The current track name
@@ -88,6 +90,7 @@ impl Media {
 
 			match header.name {
 				mp4::BoxType::MoofBox => {
+					tracing::info!("Handling a moof" );
 					let moof = mp4::MoofBox::read_box(&mut reader, header.size).context("failed to read MP4")?;
 
 					// Process the moof.
@@ -105,6 +108,7 @@ impl Media {
 					track.header(atom, fragment).context("failed to publish moof")?;
 				}
 				mp4::BoxType::MdatBox => {
+					tracing::info!("Handling an mdat" );
 					// Get the track ID from the previous moof.
 					let name = track_name.take().context("missing moof")?;
 					let track = self.tracks.get_mut(&name).context("failed to find track")?;
@@ -185,7 +189,9 @@ impl Media {
 }
 
 // Read a full MP4 atom into a vector.
+#[tracing::instrument(skip(reader))]
 async fn read_atom<R: AsyncReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Vec<u8>> {
+	tracing::info!("Reading an atom" );
 	// Read the 8 bytes for the size + type
 	let mut buf = [0u8; 8];
 	reader.read_exact(&mut buf).await?;

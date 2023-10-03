@@ -2,6 +2,7 @@ use std::{
 	collections::{hash_map, HashMap},
 	sync::{Arc, Mutex},
 };
+use tracing::span;
 
 use anyhow::Context;
 
@@ -22,6 +23,8 @@ impl Session {
 
 		// Wait for the QUIC connection to be established.
 		let conn = conn.await.context("failed to establish QUIC connection")?;
+		let s = span!(tracing::Level::DEBUG, "connection", id = %conn.stable_id(), ip = %conn.remote_address());
+		let _span_entered = s.enter();
 
 		log::debug!(
 			"established QUIC connection: ip={:?} id={}",

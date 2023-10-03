@@ -5,6 +5,7 @@ use clap::Parser;
 use ring::digest::{digest, SHA256};
 use warp::Filter;
 use console_subscriber;
+use tracing_subscriber::prelude::*;
 
 mod config;
 mod server;
@@ -24,7 +25,17 @@ async fn main() -> anyhow::Result<()> {
 	// 	.finish();
 	// tracing::subscriber::set_global_default(tracer).unwrap();
 
-	console_subscriber::init();
+	// console_subscriber::init();
+
+	let console_layer = console_subscriber::ConsoleLayer::builder()
+    .with_default_env()
+    .spawn();
+
+	tracing_subscriber::registry()
+		.with(console_layer)
+		.with(tracing_subscriber::fmt::layer())
+	//  .with(...)
+		.init();
 
 
 	let config = Config::parse();

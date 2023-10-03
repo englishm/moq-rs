@@ -24,3 +24,4 @@ indexmap = "2"
 
 quinn = "0.10"
 webtransport-quinn = {path = "../../webtransport-rs/webtransport-quinn", version = "0.5.3"}
+tracing = "0.1.37"

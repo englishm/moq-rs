@@ -1132,6 +1132,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_mangen",
+ "console-subscriber",
  "env_logger",
  "http",
  "log",
@@ -1145,6 +1146,8 @@ dependencies = [
  "rustls-pemfile",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "webtransport-generic",
  "webtransport-quinn",
 ]
@@ -1183,6 +1186,7 @@ dependencies = [
  "quinn",
  "thiserror",
  "tokio",
+ "tracing",
  "webtransport-quinn",
 ]
 

@@ -97,7 +97,9 @@ impl Publisher {
 	}
 
 	/// Write a new chunk of bytes.
+	#[tracing::instrument(skip(self, data))]
 	pub fn write_chunk(&mut self, data: Bytes) -> Result<(), Error> {
+		tracing::info!("Writing chunk: size={}", data.len());
 		let mut state = self.state.lock_mut();
 		state.closed.clone()?;
 		state.data.push(data);

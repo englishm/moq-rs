@@ -1,5 +1,6 @@
 use anyhow::Context;
 use clap::Parser;
+use tracing_subscriber::prelude::*;
 
 mod cli;
 use cli::*;
@@ -13,7 +14,18 @@ use moq_transport::model::broadcast;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	env_logger::init();
+	//env_logger::init();
+	//console_subscriber::init();
+
+	let console_layer = console_subscriber::ConsoleLayer::builder()
+    .with_default_env()
+    .spawn();
+
+	tracing_subscriber::registry()
+		.with(console_layer)
+		.with(tracing_subscriber::fmt::layer())
+	//  .with(...)
+		.init();
 
 	let config = Config::parse();
 

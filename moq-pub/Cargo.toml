@@ -28,7 +28,7 @@ rustls = "0.21.2"
 rustls-pemfile = "1.0.2"
 
 # Async stuff
-tokio = { version = "1.27", features = ["full"] }
+tokio = { version = "1.27", features = ["full", "tracing"] }
 
 # CLI, logging, error handling
 clap = { version = "4.0", features = ["derive"] }
@@ -39,6 +39,9 @@ rustls-native-certs = "0.6.3"
 anyhow = { version = "1.0.70", features = ["backtrace"] }
 serde_json = "1.0.105"
 rfc6381-codec = "0.1.0"
+console-subscriber = "0.1.10"
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"
 
 [build-dependencies]
 http = "0.2.9"
