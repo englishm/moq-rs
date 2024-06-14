@@ -1,7 +1,4 @@
-use std::{
-	io::Cursor,
-	sync::Arc,
-};
+use std::{io::Cursor, sync::Arc};
 
 use anyhow::Context;
 use log::{debug, info, trace, warn};
@@ -38,7 +35,10 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 	pub async fn run(&mut self) -> anyhow::Result<()> {
 		let moov = {
 			let init_track_name = "0.mp4";
-			let track = self.tracks_writer.create(init_track_name).context("failed to create init track")?;
+			let track = self
+				.tracks_writer
+				.create(init_track_name)
+				.context("failed to create init track")?;
 			self.subscriber.subscribe(track).await?;
 			let track = self.broadcast.subscribe(init_track_name).context("no init track")?;
 			let mut group = match track.mode().await? {
