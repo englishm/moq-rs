@@ -1,8 +1,7 @@
-use std::{fs, io, net, path, sync::Arc, time};
+use std::{net, time};
 
 use anyhow::Context;
 use clap::Parser;
-use moq_transport::session::Subscriber;
 use url::Url;
 
 use moq_native::quic;

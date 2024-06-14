@@ -1,12 +1,12 @@
 use std::{
-	io::{Cursor, Write},
+	io::Cursor,
 	sync::Arc,
 };
 
 use anyhow::Context;
 use log::{debug, info, trace, warn};
 use moq_transport::serve::{
-	GroupObjectReader, GroupReader, GroupsReader, TrackReader, TrackReaderMode, Tracks, TracksReader, TracksWriter,
+	GroupObjectReader, GroupReader, TrackReader, TrackReaderMode, Tracks, TracksReader, TracksWriter,
 };
 use moq_transport::session::Subscriber;
 use mp4::ReadBox;
