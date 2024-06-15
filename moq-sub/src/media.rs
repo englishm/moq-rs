@@ -39,7 +39,14 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 				.tracks_writer
 				.create(init_track_name)
 				.context("failed to create init track")?;
-			self.subscriber.subscribe(track).await?;
+
+			let mut subscriber = self.subscriber.clone();
+			tokio::task::spawn(async move {
+				subscriber.subscribe(track).await.unwrap_or_else(|err| {
+					warn!("failed to subscribe to init track: {err:?}");
+				});
+			});
+
 			let track = self.broadcast.subscribe(init_track_name).context("no init track")?;
 			let mut group = match track.mode().await? {
 				TrackReaderMode::Groups(mut groups) => groups.next().await?.context("no init group")?,
@@ -82,7 +89,14 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 			}
 			if active {
 				let track = self.tracks_writer.create(&name).context("failed to create track")?;
-				self.subscriber.subscribe(track).await?;
+
+				let mut subscriber = self.subscriber.clone();
+				tokio::task::spawn(async move {
+					subscriber.subscribe(track).await.unwrap_or_else(|err| {
+						warn!("failed to subscribe to track: {err:?}");
+					});
+				});
+
 				tracks.push(self.broadcast.subscribe(&name).context("no track")?);
 			}
 		}
