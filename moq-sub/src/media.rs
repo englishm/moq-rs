@@ -22,7 +22,7 @@ pub struct Media<O> {
 
 impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 	pub async fn new(subscriber: Subscriber, output: O) -> anyhow::Result<Self> {
-		let (tracks_writer, _tracks_request, tracks_reader) = Tracks::new("".to_string()).produce();
+		let (tracks_writer, _tracks_request, tracks_reader) = Tracks::new("bbb".to_string()).produce();
 		let broadcast = tracks_reader;
 		Ok(Self {
 			subscriber,
