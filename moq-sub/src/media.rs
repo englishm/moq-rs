@@ -149,7 +149,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 
 	async fn recv_object(mut object: GroupObjectReader) -> anyhow::Result<Vec<u8>> {
 		let mut buf = Vec::with_capacity(object.size);
-		while let Some(chunk) = object.read_all().await?.into() {
+		while let Some(chunk) = object.read().await? {
 			buf.extend_from_slice(&chunk);
 		}
 		Ok(buf)
