@@ -82,6 +82,10 @@ impl Publisher {
 						}
 					});
 				},
+				_ = track_status_tasks.next(), if !track_status_tasks.is_empty() => {},
+				else => return Ok(done.unwrap()?)
+			}
+			tokio::select! {
 				subscribe = announce.subscribed(), if done.is_none() => {
 					let subscribe = match subscribe {
 						Ok(Some(subscribe)) => subscribe,
@@ -98,7 +102,6 @@ impl Publisher {
 						}
 					});
 				},
-				_ = track_status_tasks.next(), if !track_status_tasks.is_empty() => {},
 				_ = tasks.next(), if !tasks.is_empty() => {},
 				else => return Ok(done.unwrap()?)
 			}
@@ -221,16 +224,13 @@ impl Publisher {
 
 	fn recv_track_status_request(&mut self, msg: message::TrackStatusRequest) -> Result<(), SessionError> {
 		let namespace = msg.track_namespace.clone();
-		let track_name = msg.track_name.clone();
 
-		let announce = self.announces.lock().unwrap().get(&namespace).ok_or(ServeError::NotFound)?;
+		let mut announces = self.announces.lock().unwrap();
+		let announce = announces.get_mut(&namespace).ok_or(SessionError::Internal)?;
 
 		let track_status_requested = TrackStatusRequested::new(self.clone(), msg);
 
-		// TODO
-
-
-		Ok(())
+		announce.recv_track_status_requested(track_status_requested).map_err(Into::into)
 	}
 
 	pub(super) fn send_message<T: Into<message::Publisher> + Into<Message>>(&mut self, msg: T) {

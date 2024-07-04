@@ -15,7 +15,9 @@ pub struct TrackStatusRequested {
 
 impl TrackStatusRequested {
     pub fn new(publisher: Publisher, msg: message::TrackStatusRequest) -> Self {
-        Self { publisher, msg, info: TrackStatusRequestedInfo { namespace: msg.track_namespace.clone(), track: msg.track_name.clone() }}
+        let namespace = msg.track_namespace.clone();
+        let track = msg.track_name.clone();
+        Self { publisher, msg, info: TrackStatusRequestedInfo { namespace, track }}
     }
 
     pub async fn respond(&mut self, status: message::TrackStatus) -> Result<(), SessionError> {
