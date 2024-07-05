@@ -9,7 +9,7 @@ pub struct TrackStatusRequestedInfo {
 
 pub struct TrackStatusRequested {
 	publisher: Publisher,
-	msg: message::TrackStatusRequest,
+	// msg: message::TrackStatusRequest, // TODO: See if we actually need this
     pub info: TrackStatusRequestedInfo,
 }
 
@@ -17,7 +17,7 @@ impl TrackStatusRequested {
     pub fn new(publisher: Publisher, msg: message::TrackStatusRequest) -> Self {
         let namespace = msg.track_namespace.clone();
         let track = msg.track_name.clone();
-        Self { publisher, msg, info: TrackStatusRequestedInfo { namespace, track }}
+        Self { publisher, info: TrackStatusRequestedInfo { namespace, track }}
     }
 
     pub async fn respond(&mut self, status: message::TrackStatus) -> Result<(), SessionError> {

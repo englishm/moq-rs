@@ -6,9 +6,7 @@ use std::{
 use futures::{stream::FuturesUnordered, StreamExt};
 
 use crate::{
-	message::{self, Message},
-	serve::{ServeError, TracksReader},
-	setup,
+	message::{self, Message}, serve::{ServeError, TracksReader}, session::track_status_requested, setup
 };
 
 use crate::watch::Queue;
@@ -51,7 +49,7 @@ impl Publisher {
 	/// Announce a namespace and serve tracks using the provided [serve::TracksReader].
 	/// The caller uses [serve::TracksWriter] for static tracks and [serve::TracksRequest] for dynamic tracks.
 	pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-		let mut announce = match self.announces.lock().unwrap().entry(tracks.namespace.clone()) {
+		let announce = match self.announces.lock().unwrap().entry(tracks.namespace.clone()) {
 			hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
 			hash_map::Entry::Vacant(entry) => {
 				let (send, recv) = Announce::new(self.clone(), tracks.namespace.clone());
@@ -60,13 +58,22 @@ impl Publisher {
 			}
 		};
 
+		let announce = Arc::new(tokio::sync::Mutex::new(announce));
+
+
 		let mut track_status_tasks = FuturesUnordered::new();
 		let mut tasks = FuturesUnordered::new();
 		let mut done = None;
 
 		loop {
 			tokio::select! {
-				track_status_request = announce.track_status_requested(), if done.is_none() => {
+				track_status_request = {
+					let announce = announce.clone();
+					async move {
+						let mut announce = announce.lock().await;
+						announce.track_status_requested().await
+					}
+				}, if done.is_none() => {
 					let track_status_request = match track_status_request {
 						Ok(Some(track_status_request)) => track_status_request,
 						Ok(None) => { done = Some(Ok(())); continue },
@@ -82,11 +89,14 @@ impl Publisher {
 						}
 					});
 				},
-				_ = track_status_tasks.next(), if !track_status_tasks.is_empty() => {},
-				else => return Ok(done.unwrap()?)
-			}
-			tokio::select! {
-				subscribe = announce.subscribed(), if done.is_none() => {
+
+				subscribe = {
+					let announce = announce.clone();
+					async move {
+						let mut announce = announce.lock().await;
+						announce.subscribed().await
+					}
+				}, if done.is_none() => {
 					let subscribe = match subscribe {
 						Ok(Some(subscribe)) => subscribe,
 						Ok(None) => { done = Some(Ok(())); continue },
@@ -102,6 +112,8 @@ impl Publisher {
 						}
 					});
 				},
+
+				_ = track_status_tasks.next(), if !track_status_tasks.is_empty() => {},
 				_ = tasks.next(), if !tasks.is_empty() => {},
 				else => return Ok(done.unwrap()?)
 			}
