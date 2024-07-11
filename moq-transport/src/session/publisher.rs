@@ -62,8 +62,11 @@ impl Publisher {
 		let announce_for_track_status_requests = announce_for_subscriptions.clone();
 		let tracks_for_track_status_requests = tracks.clone();
 
-		self.serve_subscribes(announce_for_subscriptions, tracks).await
-
+		tokio::select! {
+			result = self.serve_subscribes(announce_for_subscriptions, tracks) => {
+				result
+			},
+		}
 	}
 
 	async fn serve_subscribes(&mut self, announce: Arc<tokio::sync::Mutex<Announce>>, tracks: TracksReader) -> Result<(), SessionError> {
