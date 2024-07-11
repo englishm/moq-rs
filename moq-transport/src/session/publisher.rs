@@ -66,10 +66,13 @@ impl Publisher {
 			result = self.serve_subscribes(announce_for_subscriptions, tracks) => {
 				result
 			},
+			result2 = self.serve_track_statuses(announce_for_track_status_requests, tracks_for_track_status_requests) => {
+				result2
+			}
 		}
 	}
 
-	async fn serve_subscribes(&mut self, announce: Arc<tokio::sync::Mutex<Announce>>, tracks: TracksReader) -> Result<(), SessionError> {
+	async fn serve_subscribes(&self, announce: Arc<tokio::sync::Mutex<Announce>>, tracks: TracksReader) -> Result<(), SessionError> {
 
 		// let mut track_status_tasks = FuturesUnordered::new();
 		let mut tasks = FuturesUnordered::new();
@@ -96,6 +99,41 @@ impl Publisher {
 						let info = subscribe.info.clone();
 						if let Err(err) = Self::serve_subscribe(subscribe, tracks).await {
 							log::warn!("failed serving subscribe: {:?}, error: {}", info, err)
+						}
+					});
+				},
+
+				_ = tasks.next(), if !tasks.is_empty() => {},
+				else => return Ok(done.unwrap()?)
+			}
+		}
+	}
+
+	async fn serve_track_statuses(&self, announce: Arc<tokio::sync::Mutex<Announce>>, tracks: TracksReader) -> Result<(), SessionError> {
+		let mut tasks = FuturesUnordered::new();
+		let mut done = None;
+
+		loop {
+			tokio::select! {
+				track_status_request = {
+					let announce = announce.clone();
+					async move {
+						let mut announce = announce.lock().await;
+						announce.track_status_requested().await
+					}
+				}, if done.is_none() => {
+					let track_status_request = match track_status_request {
+						Ok(Some(track_status_request)) => track_status_request,
+						Ok(None) => { done = Some(Ok(())); continue },
+						Err(err) => { done = Some(Err(err)); continue },
+					};
+
+					let tracks = tracks.clone();
+
+					tasks.push(async move {
+						let info = track_status_request.info.clone();
+						if let Err(err) = Self::serve_track_status_request(track_status_request, tracks).await {
+							log::warn!("failed serving track status request: {:?}, error: {}", info, err)
 						}
 					});
 				},
