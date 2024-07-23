@@ -56,6 +56,7 @@ pub struct State<T> {
 
 impl<T> State<T> {
 	pub fn new(initial: T) -> Self {
+		log::debug!("State<{}>::new", std::any::type_name::<T>());
 		let state = Arc::new(Mutex::new(StateInner::new(initial)));
 
 		Self {
@@ -65,6 +66,7 @@ impl<T> State<T> {
 	}
 
 	pub fn lock(&self) -> StateRef<T> {
+		log::debug!("State<{}>::lock", std::any::type_name::<T>());
 		StateRef {
 			state: self.state.clone(),
 			drop: self.drop.clone(),
@@ -73,6 +75,7 @@ impl<T> State<T> {
 	}
 
 	pub fn lock_mut(&self) -> Option<StateMut<T>> {
+		log::debug!("State<{}>::lock_mut", std::any::type_name::<T>());
 		let lock = self.state.lock().unwrap();
 		lock.dropped?;
 		Some(StateMut {
@@ -133,7 +136,9 @@ pub struct StateRef<'a, T> {
 impl<'a, T> StateRef<'a, T> {
 	// Release the lock and wait for a notification when next updated.
 	pub fn modified(self) -> Option<StateChanged<T>> {
+		log::debug!("StateRef::modified 1");
 		self.lock.dropped?;
+		log::debug!("StateRef::modified 2");
 
 		Some(StateChanged {
 			state: self.state,
@@ -196,6 +201,7 @@ impl<'a, T: fmt::Debug> fmt::Debug for StateMut<'a, T> {
 	}
 }
 
+#[derive(Debug)]
 pub struct StateChanged<T> {
 	state: Arc<Mutex<StateInner<T>>>,
 	epoch: usize,
@@ -209,6 +215,7 @@ impl<T> Future for StateChanged<T> {
 		let mut state = self.state.lock().unwrap();
 
 		if state.epoch > self.epoch {
+			log::debug!("StateChanged::poll: ready");
 			task::Poll::Ready(())
 		} else {
 			state.register(cx.waker());

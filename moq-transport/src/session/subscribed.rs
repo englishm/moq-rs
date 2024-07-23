@@ -37,6 +37,7 @@ impl Default for SubscribedState {
 	}
 }
 
+#[derive(Debug)]
 pub struct Subscribed {
 	publisher: Publisher,
 	state: State<SubscribedState>,
