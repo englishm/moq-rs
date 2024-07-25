@@ -83,7 +83,7 @@ impl Announce {
 		}
 	}
 
-	pub async fn subscribed(&mut self) -> Result<Option<Subscribed>, ServeError> {
+	pub async fn subscribed(&self) -> Result<Option<Subscribed>, ServeError> {
 		loop {
 			{
 				let state = self.state.lock();
@@ -101,7 +101,7 @@ impl Announce {
 		}
 	}
 
-	pub async fn track_status_requested(&mut self) -> Result<Option<TrackStatusRequested>, ServeError> {
+	pub async fn track_status_requested(&self) -> Result<Option<TrackStatusRequested>, ServeError> {
 		loop {
 			{
 				let state = self.state.lock();

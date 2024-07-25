@@ -51,7 +51,7 @@ impl Publisher {
 	/// Announce a namespace and serve tracks using the provided [serve::TracksReader].
 	/// The caller uses [serve::TracksWriter] for static tracks and [serve::TracksRequest] for dynamic tracks.
 	pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-		let mut announce = match self.announces.lock().unwrap().entry(tracks.namespace.clone()) {
+		let announce = match self.announces.lock().unwrap().entry(tracks.namespace.clone()) {
 			hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
 			hash_map::Entry::Vacant(entry) => {
 				let (send, recv) = Announce::new(self.clone(), tracks.namespace.clone());
