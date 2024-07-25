@@ -6,12 +6,14 @@ use std::{
 use futures::{stream::FuturesUnordered, StreamExt};
 
 use crate::{
-	message::{self, Message}, serve::{ServeError, TracksReader}, session::track_status_requested, setup
+	message::{self, Message},
+	serve::{ServeError, TracksReader},
+	setup,
 };
 
 use crate::watch::Queue;
 
-use super::{Announce, AnnounceRecv, Session, SessionError, Subscribed, SubscribedRecv, TrackStatusRequested};
+use super::{Announce, AnnounceRecv, Session, SessionError, Subscribed, SubscribedRecv};
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -49,7 +51,7 @@ impl Publisher {
 	/// Announce a namespace and serve tracks using the provided [serve::TracksReader].
 	/// The caller uses [serve::TracksWriter] for static tracks and [serve::TracksRequest] for dynamic tracks.
 	pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-		let announce = match self.announces.lock().unwrap().entry(tracks.namespace.clone()) {
+		let mut announce = match self.announces.lock().unwrap().entry(tracks.namespace.clone()) {
 			hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
 			hash_map::Entry::Vacant(entry) => {
 				let (send, recv) = Announce::new(self.clone(), tracks.namespace.clone());
@@ -58,35 +60,12 @@ impl Publisher {
 			}
 		};
 
-		let announce_for_subscriptions = Arc::new(tokio::sync::Mutex::new(announce));
-		let announce_for_track_status_requests = announce_for_subscriptions.clone();
-		let tracks_for_track_status_requests = tracks.clone();
-
-		tokio::select! {
-			result = self.serve_subscribes(announce_for_subscriptions, tracks) => {
-				result
-			},
-			result2 = self.serve_track_statuses(announce_for_track_status_requests, tracks_for_track_status_requests) => {
-				result2
-			}
-		}
-	}
-
-	async fn serve_subscribes(&self, announce: Arc<tokio::sync::Mutex<Announce>>, tracks: TracksReader) -> Result<(), SessionError> {
-
-		// let mut track_status_tasks = FuturesUnordered::new();
 		let mut tasks = FuturesUnordered::new();
 		let mut done = None;
 
 		loop {
 			tokio::select! {
-				subscribe = {
-					let announce = announce.clone();
-					async move {
-						let mut announce = announce.lock().await;
-						announce.subscribed().await
-					}
-				}, if done.is_none() => {
+				subscribe = announce.subscribed(), if done.is_none() => {
 					let subscribe = match subscribe {
 						Ok(Some(subscribe)) => subscribe,
 						Ok(None) => { done = Some(Ok(())); continue },
@@ -102,63 +81,10 @@ impl Publisher {
 						}
 					});
 				},
-
 				_ = tasks.next(), if !tasks.is_empty() => {},
 				else => return Ok(done.unwrap()?)
 			}
 		}
-	}
-
-	async fn serve_track_statuses(&self, announce: Arc<tokio::sync::Mutex<Announce>>, tracks: TracksReader) -> Result<(), SessionError> {
-		let mut tasks = FuturesUnordered::new();
-		let mut done = None;
-
-		loop {
-			tokio::select! {
-				track_status_request = {
-					let announce = announce.clone();
-					async move {
-						let mut announce = announce.lock().await;
-						announce.track_status_requested().await
-					}
-				}, if done.is_none() => {
-					let track_status_request = match track_status_request {
-						Ok(Some(track_status_request)) => track_status_request,
-						Ok(None) => { done = Some(Ok(())); continue },
-						Err(err) => { done = Some(Err(err)); continue },
-					};
-
-					let tracks = tracks.clone();
-
-					tasks.push(async move {
-						let info = track_status_request.info.clone();
-						if let Err(err) = Self::serve_track_status_request(track_status_request, tracks).await {
-							log::warn!("failed serving track status request: {:?}, error: {}", info, err)
-						}
-					});
-				},
-
-				_ = tasks.next(), if !tasks.is_empty() => {},
-				else => return Ok(done.unwrap()?)
-			}
-		}
-	}
-
-	pub async fn serve_track_status_request(mut track_status_request: TrackStatusRequested, mut tracks: TracksReader) -> Result<(), SessionError> {
-		let track = tracks.subscribe(&track_status_request.info.track.clone()).ok_or(ServeError::NotFound)?;
-		let (latest_group_id, latest_object_id) = track.latest().ok_or(ServeError::NotFound)?;
-
-		let response = message::TrackStatus {
-			track_namespace: track_status_request.info.namespace.clone(),
-			track_name: track_status_request.info.track.clone(),
-			status_code: 0x00, // TODO: Implement status codes
-			last_group_id: latest_group_id,
-			last_object_id: latest_object_id,
-		};
-
-		track_status_request.respond(response).await?;
-
-		Ok(())
 	}
 
 	pub async fn serve_subscribe(subscribe: Subscribed, mut tracks: TracksReader) -> Result<(), SessionError> {
@@ -183,7 +109,6 @@ impl Publisher {
 			message::Subscriber::AnnounceCancel(msg) => self.recv_announce_cancel(msg),
 			message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg),
 			message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg),
-			message::Subscriber::TrackStatusRequest(msg) => self.recv_track_status_request(msg),
 		};
 
 		if let Err(err) = res {
@@ -256,17 +181,6 @@ impl Publisher {
 		}
 
 		Ok(())
-	}
-
-	fn recv_track_status_request(&mut self, msg: message::TrackStatusRequest) -> Result<(), SessionError> {
-		let namespace = msg.track_namespace.clone();
-
-		let mut announces = self.announces.lock().unwrap();
-		let announce = announces.get_mut(&namespace).ok_or(SessionError::Internal)?;
-
-		let track_status_requested = TrackStatusRequested::new(self.clone(), msg);
-
-		announce.recv_track_status_requested(track_status_requested).map_err(Into::into)
 	}
 
 	pub(super) fn send_message<T: Into<message::Publisher> + Into<Message>>(&mut self, msg: T) {
