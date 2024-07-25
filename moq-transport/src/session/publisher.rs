@@ -115,15 +115,31 @@ impl Publisher {
 		Ok(())
 	}
 
-	pub async fn serve_track_status(mut status: TrackStatusRequested, mut _tracks: TracksReader) -> Result<(), SessionError> {
-		status.respond(
-			crate::message::TrackStatus{
-				track_namespace: status.info.namespace.clone(),
-				track_name: status.info.track.clone(),
-				status_code: 0x00, // TODO: Implement this
-				last_group_id: 0x00, // TODO: Implement this
-				last_object_id: 0x00, // TODO: Implement this
-			}).await?;
+	pub async fn serve_track_status(mut track_status_request: TrackStatusRequested, mut tracks: TracksReader) -> Result<(), SessionError> {
+		let track = tracks.subscribe(&track_status_request.info.track.clone()).ok_or(ServeError::NotFound)?;
+		let response;
+
+		if let Some((latest_group_id, latest_object_id)) = track.latest() {
+			response = message::TrackStatus {
+				track_namespace: track_status_request.info.namespace.clone(),
+				track_name: track_status_request.info.track.clone(),
+				status_code: message::TrackStatusCode::InProgress,
+				last_group_id: latest_group_id,
+				last_object_id: latest_object_id,
+			};
+		} else {
+			response = message::TrackStatus {
+				track_namespace: track_status_request.info.namespace.clone(),
+				track_name: track_status_request.info.track.clone(),
+				status_code: message::TrackStatusCode::DoesNotExist,
+				last_group_id: 0,
+				last_object_id: 0,
+			};
+		}
+		// TODO: can we know of any other statuses in this context?
+
+		track_status_request.respond(response).await?;
+
 		Ok(())
 	}
 
