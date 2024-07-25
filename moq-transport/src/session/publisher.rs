@@ -60,7 +60,8 @@ impl Publisher {
 			}
 		};
 
-		let mut tasks = FuturesUnordered::new();
+		let mut subscribe_tasks = FuturesUnordered::new();
+		let mut status_tasks = FuturesUnordered::new();
 		let mut subscribe_done = false;
 		let mut status_done = false;
 
@@ -71,7 +72,7 @@ impl Publisher {
 						Some(subscribed) => {
 							let tracks = tracks.clone();
 
-							tasks.push(async move {
+							subscribe_tasks.push(async move {
 								let info = subscribed.info.clone();
 								if let Err(err) = Self::serve_subscribe(subscribed, tracks).await {
 									log::warn!("failed serving subscribe: {:?}, error: {}", info, err)
@@ -87,7 +88,7 @@ impl Publisher {
 						Some(status) => {
 							let tracks = tracks.clone();
 
-							tasks.push(async move {
+							status_tasks.push(async move {
 								let info = status.info.clone();
 								if let Err(err) = Self::serve_track_status(status, tracks).await {
 									log::warn!("failed serving track status request: {:?}, error: {}", info, err)
@@ -97,7 +98,8 @@ impl Publisher {
 						None => status_done = true,
 					}
 				},
-				Some(res) = tasks.next() => res,
+				Some(res) = subscribe_tasks.next() => res,
+				Some(res) = status_tasks.next() => res,
 				else => return Ok(())
 			}
 		}
