@@ -62,7 +62,7 @@ impl Publisher {
 
 		let mut tasks = FuturesUnordered::new();
 		let mut subscribe_done = false;
-		let mut _status_done = false;
+		let mut status_done = false;
 
 		loop {
 			tokio::select! {
@@ -81,6 +81,21 @@ impl Publisher {
 						None => subscribe_done = true,
 					}
 
+				},
+				res = announce.track_status_requested(), if !status_done => {
+					match res? {
+						Some(status) => {
+							let tracks = tracks.clone();
+
+							tasks.push(async move {
+								let info = status.info.clone();
+								if let Err(err) = Self::serve_track_status(status, tracks).await {
+									log::warn!("failed serving track status request: {:?}, error: {}", info, err)
+								}
+							});
+						},
+						None => status_done = true,
+					}
 				},
 				Some(res) = tasks.next() => res,
 				else => return Ok(())
