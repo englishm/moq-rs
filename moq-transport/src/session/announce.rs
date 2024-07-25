@@ -10,7 +10,6 @@ pub struct AnnounceInfo {
 	pub namespace: String,
 }
 
-#[derive(Debug)]
 struct AnnounceState {
 	subscribers: VecDeque<Subscribed>,
 	track_statuses_requested: VecDeque<TrackStatusRequested>,
@@ -87,93 +86,53 @@ impl Announce {
 
 	pub async fn subscribed(&mut self) -> Result<Option<Subscribed>, ServeError> {
 		loop {
-			log::debug!("subscribed loop");
 			{
-				log::debug!("subscribed 1");
 				let state = self.state.lock();
-				log::debug!("subscribed 2");
 				if !state.subscribers.is_empty() {
-					log::debug!("subscribed 3");
 					return Ok(state.into_mut().and_then(|mut state| state.subscribers.pop_front()));
 				}
 
-				log::debug!("subscribed 4");
 				state.closed.clone()?;
-				log::debug!("subscribed 5");
 				match state.modified() {
-					Some(notified) => {
-						log::debug!("subscribed 6");
-						notified
-					},
-
-					None => {
-						log::debug!("subscribed 7");
-						return Ok(None)
-					},
+					Some(notified) => notified,
+					None => return Ok(None),
 				}
 			}
 			.await;
-			log::debug!("subscribed 8");
 		}
 	}
 
 	pub async fn track_status_requested(&mut self) -> Result<Option<TrackStatusRequested>, ServeError> {
 		loop {
-			log::debug!("track_status_requested loop");
 			{
-				log::debug!("track_status_requested 1");
 				let state = self.state.lock();
-				log::debug!("track_status_requested 2");
 				if !state.track_statuses_requested.is_empty() {
-					log::debug!("track_status_requested 3");
 					return Ok(state.into_mut().and_then(|mut state| state.track_statuses_requested.pop_front()));
 				}
-				log::debug!("track_status_requested 4");
 
 				state.closed.clone()?;
-				log::debug!("track_status_requested 5");
 				match state.modified() {
-					Some(notified) => {
-						log::debug!("track_status_requested 5.1");
-						dbg!(&notified);
-						notified
-					},
-					None => {
-						log::debug!("track_status_requested 5.2");
-						return Ok(None)
-					},
+					Some(notified) => notified,
+					None => return Ok(None),
 				}
 			}
 			.await;
-			log::debug!("track_status_requested 6");
 		}
 	}
 
 	// Wait until an OK is received
 	pub async fn ok(&self) -> Result<(), ServeError> {
 		loop {
-			log::debug!("ok loop");
 			{
-				log::debug!("ok 1");
 				let state = self.state.lock();
-				log::debug!("ok 2");
 				if state.ok {
-					log::debug!("ok 3");
 					return Ok(());
 				}
-				log::debug!("ok 4");
 				state.closed.clone()?;
-				log::debug!("ok 5");
+
 				match state.modified() {
-					Some(notified) =>
-						{
-							log::debug!("ok 6");
-							notified
-						} ,
-					None => {
-						log::debug!("ok 7");
-						return Ok(())
-					},
+					Some(notified) => notified,
+					None => return Ok(()),
 				}
 			}
 			.await;

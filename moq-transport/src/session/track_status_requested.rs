@@ -7,7 +7,6 @@ pub struct TrackStatusRequestedInfo {
     pub track: String,
 }
 
-#[derive(Debug)]
 pub struct TrackStatusRequested {
 	publisher: Publisher,
 	// msg: message::TrackStatusRequest, // TODO: See if we actually need this

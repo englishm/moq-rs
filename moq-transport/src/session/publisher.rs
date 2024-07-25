@@ -1,6 +1,5 @@
 use std::{
 	collections::{hash_map, HashMap},
-	fmt::Debug,
 	sync::{Arc, Mutex},
 };
 
@@ -24,12 +23,6 @@ pub struct Publisher {
 	unknown: Queue<Subscribed>,
 
 	outgoing: Queue<Message>,
-}
-
-impl Debug for Publisher {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "Publisher")
-	}
 }
 
 impl Publisher {
@@ -56,7 +49,6 @@ impl Publisher {
 	/// Announce a namespace and serve tracks using the provided [serve::TracksReader].
 	/// The caller uses [serve::TracksWriter] for static tracks and [serve::TracksRequest] for dynamic tracks.
 	pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-		log::debug!("announcing!");
 		let announce = match self.announces.lock().unwrap().entry(tracks.namespace.clone()) {
 			hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
 			hash_map::Entry::Vacant(entry) => {
@@ -72,11 +64,9 @@ impl Publisher {
 
 		tokio::select! {
 			result = self.serve_subscribes(announce_for_subscriptions, tracks) => {
-				log::debug!("select - subscribes");
 				result
 			},
 			result2 = self.serve_track_statuses(announce_for_track_status_requests, tracks_for_track_status_requests) => {
-				log::debug!("select - track statuses");
 				result2
 			}
 		}
@@ -89,20 +79,14 @@ impl Publisher {
 		let mut done = None;
 
 		loop {
-			log::debug!("serve_subscribes loop");
 			tokio::select! {
 				subscribe = {
-					log::debug!("DEBUG: {}:{}", file!(), line!());
 					let announce = announce.clone();
-					log::debug!("DEBUG: {}:{}", file!(), line!());
 					async move {
-						log::debug!("DEBUG: {}:{}", file!(), line!());
 						let mut announce = announce.lock().await;
-						log::debug!("DEBUG: {}:{}", file!(), line!());
 						announce.subscribed().await
 					}
 				}, if done.is_none() => {
-					log::debug!("DEBUG: {}:{}", file!(), line!());
 					let subscribe = match subscribe {
 						Ok(Some(subscribe)) => subscribe,
 						Ok(None) => { done = Some(Ok(())); continue },
@@ -119,9 +103,7 @@ impl Publisher {
 					});
 				},
 
-				_ = tasks.next(), if !tasks.is_empty() => {
-					log::debug!("doing stuff in serve_subscribes");
-				},
+				_ = tasks.next(), if !tasks.is_empty() => {},
 				else => return Ok(done.unwrap()?)
 			}
 		}
@@ -132,36 +114,23 @@ impl Publisher {
 		let mut done = None;
 
 		loop {
-			log::debug!("serve_track_statuses loop");
 			tokio::select! {
 				track_status_request = {
-					log::debug!("serve_track_statuses getting track status request");
 					let announce = announce.clone();
 					async move {
 						let mut announce = announce.lock().await;
 						announce.track_status_requested().await
 					}
 				}, if done.is_none() => {
-					log::debug!("done.is_none()");
 					let track_status_request = match track_status_request {
-						Ok(Some(track_status_request)) => {
-							log::debug!("Ok(Some(track_status_request))");
-							track_status_request
-						},
-						Ok(None) => {
-							log::debug!("Ok(None)");
-							done = Some(Ok(())); continue },
-						Err(err) => {
-							log::debug!("Err(err)");
-							done = Some(Err(err)); continue },
+						Ok(Some(track_status_request)) => track_status_request,
+						Ok(None) => { done = Some(Ok(())); continue },
+						Err(err) => { done = Some(Err(err)); continue },
 					};
 
-					log::debug!("cloning tracks...");
 					let tracks = tracks.clone();
 
-					log::debug!("pushing task...");
 					tasks.push(async move {
-						log::debug!("task being pushed");
 						let info = track_status_request.info.clone();
 						if let Err(err) = Self::serve_track_status_request(track_status_request, tracks).await {
 							log::warn!("failed serving track status request: {:?}, error: {}", info, err)
@@ -169,13 +138,8 @@ impl Publisher {
 					});
 				},
 
-				_ = tasks.next(), if !tasks.is_empty() => {
-					log::debug!("doing stuff in serve_track_statuses");
-				},
-				else => {
-					log::debug!("else");
-					return Ok(done.unwrap()?)
-				}
+				_ = tasks.next(), if !tasks.is_empty() => {},
+				else => return Ok(done.unwrap()?)
 			}
 		}
 	}
