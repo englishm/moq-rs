@@ -98,6 +98,18 @@ impl Publisher {
 		Ok(())
 	}
 
+	pub async fn serve_track_status(mut status: TrackStatusRequested, mut _tracks: TracksReader) -> Result<(), SessionError> {
+		status.respond(
+			crate::message::TrackStatus{
+				track_namespace: status.info.namespace.clone(),
+				track_name: status.info.track.clone(),
+				status_code: 0x00, // TODO: Implement this
+				last_group_id: 0x00, // TODO: Implement this
+				last_object_id: 0x00, // TODO: Implement this
+			}).await?;
+		Ok(())
+	}
+
 	// Returns subscriptions that do not map to an active announce.
 	pub async fn subscribed(&mut self) -> Option<Subscribed> {
 		self.unknown.pop().await
