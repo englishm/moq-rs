@@ -13,7 +13,7 @@ use crate::{
 
 use crate::watch::Queue;
 
-use super::{Announce, AnnounceRecv, Session, SessionError, Subscribed, SubscribedRecv};
+use super::{Announce, AnnounceRecv, Session, SessionError, Subscribed, SubscribedRecv, TrackStatusRequested};
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -61,28 +61,29 @@ impl Publisher {
 		};
 
 		let mut tasks = FuturesUnordered::new();
-		let mut done = None;
+		let mut subscribe_done = false;
+		let mut _status_done = false;
 
 		loop {
 			tokio::select! {
-				subscribe = announce.subscribed(), if done.is_none() => {
-					let subscribe = match subscribe {
-						Ok(Some(subscribe)) => subscribe,
-						Ok(None) => { done = Some(Ok(())); continue },
-						Err(err) => { done = Some(Err(err)); continue },
-					};
+				res = announce.subscribed(), if !subscribe_done => {
+					match res? {
+						Some(subscribed) => {
+							let tracks = tracks.clone();
 
-					let tracks = tracks.clone();
+							tasks.push(async move {
+								let info = subscribed.info.clone();
+								if let Err(err) = Self::serve_subscribe(subscribed, tracks).await {
+									log::warn!("failed serving subscribe: {:?}, error: {}", info, err)
+								}
+							});
+						},
+						None => subscribe_done = true,
+					}
 
-					tasks.push(async move {
-						let info = subscribe.info.clone();
-						if let Err(err) = Self::serve_subscribe(subscribe, tracks).await {
-							log::warn!("failed serving subscribe: {:?}, error: {}", info, err)
-						}
-					});
 				},
-				_ = tasks.next(), if !tasks.is_empty() => {},
-				else => return Ok(done.unwrap()?)
+				Some(res) = tasks.next() => res,
+				else => return Ok(())
 			}
 		}
 	}
@@ -109,6 +110,7 @@ impl Publisher {
 			message::Subscriber::AnnounceCancel(msg) => self.recv_announce_cancel(msg),
 			message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg),
 			message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg),
+			message::Subscriber::TrackStatusRequest(msg) => self.recv_track_status_request(msg),
 		};
 
 		if let Err(err) = res {
@@ -174,6 +176,18 @@ impl Publisher {
 
 		Ok(())
 	}
+
+	fn recv_track_status_request(&mut self, msg: message::TrackStatusRequest) -> Result<(), SessionError> {
+		let namespace = msg.track_namespace.clone();
+
+		let mut announces = self.announces.lock().unwrap();
+		let announce = announces.get_mut(&namespace).ok_or(SessionError::Internal)?;
+
+		let track_status_requested = TrackStatusRequested::new(self.clone(), msg);
+
+		announce.recv_track_status_requested(track_status_requested).map_err(Into::into)
+	}
+
 
 	fn recv_unsubscribe(&mut self, msg: message::Unsubscribe) -> Result<(), SessionError> {
 		if let Some(subscribed) = self.subscribed.lock().unwrap().get_mut(&msg.id) {
