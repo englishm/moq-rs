@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/englishm/moq-rs/compare/moq-native-ietf-v0.5.0...moq-native-ietf-v0.5.1) - 2024-10-23
+
+### Other
+
+- release
+
 ## [0.5.0](https://github.com/englishm/moq-rs/releases/tag/moq-native-ietf-v0.5.0) - 2024-10-23
 
 ### Other
