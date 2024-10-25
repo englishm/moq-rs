@@ -12,15 +12,15 @@ use super::{Publisher, SessionError, SubscribeInfo, Writer};
 
 #[derive(Debug)]
 struct SubscribedState {
-	max: Option<(u64, u64)>,
+	max_group_id: Option<(u64, u64)>,
 	closed: Result<(), ServeError>,
 }
 
 impl SubscribedState {
-	fn update_max(&mut self, group_id: u64, object_id: u64) -> Result<(), ServeError> {
-		if let Some((max_group, max_object)) = self.max {
+	fn update_max_group_id(&mut self, group_id: u64, object_id: u64) -> Result<(), ServeError> {
+		if let Some((max_group, max_object)) = self.max_group_id {
 			if group_id >= max_group && object_id >= max_object {
-				self.max = Some((group_id, object_id));
+				self.max_group_id = Some((group_id, object_id));
 			}
 		}
 
@@ -31,7 +31,7 @@ impl SubscribedState {
 impl Default for SubscribedState {
 	fn default() -> Self {
 		Self {
-			max: None,
+			max_group_id: None,
 			closed: Ok(()),
 		}
 	}
@@ -79,7 +79,7 @@ impl Subscribed {
 
 	async fn serve_inner(&mut self, track: serve::TrackReader) -> Result<(), SessionError> {
 		let latest = track.latest();
-		self.state.lock_mut().ok_or(ServeError::Cancel)?.max = latest;
+		self.state.lock_mut().ok_or(ServeError::Cancel)?.max_group_id = latest;
 
 		self.publisher.send_message(message::SubscribeOk {
 			id: self.msg.id,
@@ -93,7 +93,7 @@ impl Subscribed {
 		match track.mode().await? {
 			// TODO cancel track/datagrams on closed
 			TrackReaderMode::Stream(stream) => self.serve_track(stream).await,
-			TrackReaderMode::Groups(groups) => self.serve_groups(groups).await,
+			TrackReaderMode::Subgroups(subgroups) => self.serve_subgroups(subgroups).await,
 			TrackReaderMode::Objects(objects) => self.serve_objects(objects).await,
 			TrackReaderMode::Datagrams(datagrams) => self.serve_datagrams(datagrams).await,
 		}
@@ -137,13 +137,13 @@ impl Drop for Subscribed {
 	fn drop(&mut self) {
 		let state = self.state.lock();
 		let err = state.closed.as_ref().err().cloned().unwrap_or(ServeError::Done);
-		let max = state.max;
+		let max_group_id = state.max_group_id;
 		drop(state); // Important to avoid a deadlock
 
 		if self.ok {
 			self.publisher.send_message(message::SubscribeDone {
 				id: self.msg.id,
-				last: max,
+				last: max_group_id,
 				code: err.code(),
 				reason: err.to_string(),
 			});
@@ -190,7 +190,7 @@ impl Subscribed {
 				self.state
 					.lock_mut()
 					.ok_or(ServeError::Done)?
-					.update_max(object.group_id, object.object_id)?;
+					.update_max_group_id(object.group_id, object.object_id)?;
 
 				writer.encode(&header).await?;
 
@@ -208,27 +208,28 @@ impl Subscribed {
 		Ok(())
 	}
 
-	async fn serve_groups(&mut self, mut groups: serve::GroupsReader) -> Result<(), SessionError> {
+	async fn serve_subgroups(&mut self, mut subgroups: serve::SubgroupsReader) -> Result<(), SessionError> {
 		let mut tasks = FuturesUnordered::new();
 		let mut done: Option<Result<(), ServeError>> = None;
 
 		loop {
 			tokio::select! {
-				res = groups.next(), if done.is_none() => match res {
-					Ok(Some(group)) => {
-						let header = data::GroupHeader {
+				res = subgroups.next(), if done.is_none() => match res {
+					Ok(Some(subgroup)) => {
+						let header = data::SubgroupHeader {
 							subscribe_id: self.msg.id,
 							track_alias: self.msg.track_alias,
-							group_id: group.group_id,
-							publisher_priority: group.priority,
+							group_id: subgroup.group_id,
+							subgroup_id: subgroup.subgroup_id,
+							publisher_priority: subgroup.priority,
 						};
 
 						let publisher = self.publisher.clone();
 						let state = self.state.clone();
-						let info = group.info.clone();
+						let info = subgroup.info.clone();
 
 						tasks.push(async move {
-							if let Err(err) = Self::serve_group(header, group, publisher, state).await {
+							if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state).await {
 								log::warn!("failed to serve group: {:?}, error: {}", info, err);
 							}
 						});
@@ -243,16 +244,16 @@ impl Subscribed {
 		}
 	}
 
-	async fn serve_group(
-		header: data::GroupHeader,
-		mut group: serve::GroupReader,
+	async fn serve_subgroup(
+		header: data::SubgroupHeader,
+		mut subgroup: serve::SubgroupReader,
 		mut publisher: Publisher,
 		state: State<SubscribedState>,
 	) -> Result<(), SessionError> {
 		let mut stream = publisher.open_uni().await?;
 
 		// TODO figure out u32 vs u64 priority
-		stream.set_priority(group.priority as i32);
+		stream.set_priority(subgroup.priority as i32);
 
 		let mut writer = Writer::new(stream);
 
@@ -261,8 +262,8 @@ impl Subscribed {
 
 		log::trace!("sent group: {:?}", header);
 
-		while let Some(mut object) = group.next().await? {
-			let header = data::GroupObject {
+		while let Some(mut object) = subgroup.next().await? {
+			let header = data::SubgroupObject {
 				object_id: object.object_id,
 				size: object.size,
 				status: object.status,
@@ -273,7 +274,7 @@ impl Subscribed {
 			state
 				.lock_mut()
 				.ok_or(ServeError::Done)?
-				.update_max(group.group_id, object.object_id)?;
+				.update_max_group_id(subgroup.group_id, object.object_id)?;
 
 			log::trace!("sent group object: {:?}", header);
 
@@ -335,7 +336,7 @@ impl Subscribed {
 		state
 			.lock_mut()
 			.ok_or(ServeError::Done)?
-			.update_max(object.group_id, object.object_id)?;
+			.update_max_group_id(object.group_id, object.object_id)?;
 
 		let mut stream = publisher.open_uni().await?;
 
@@ -380,7 +381,7 @@ impl Subscribed {
 			self.state
 				.lock_mut()
 				.ok_or(ServeError::Done)?
-				.update_max(datagram.group_id, datagram.object_id)?;
+				.update_max_group_id(datagram.group_id, datagram.object_id)?;
 		}
 
 		Ok(())
