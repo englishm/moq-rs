@@ -161,21 +161,22 @@ impl SubscribeRecv {
 		Ok(stream)
 	}
 
-	pub fn group(&mut self, header: data::GroupHeader) -> Result<serve::GroupWriter, ServeError> {
+	pub fn subgroup(&mut self, header: data::SubgroupHeader) -> Result<serve::SubgroupWriter, ServeError> {
 		let writer = self.writer.take().ok_or(ServeError::Done)?;
 
-		let mut groups = match writer {
+		let mut subgroups = match writer {
 			TrackWriterMode::Track(init) => init.groups()?,
-			TrackWriterMode::Groups(groups) => groups,
+			TrackWriterMode::Subgroups(subgroups) => subgroups,
 			_ => return Err(ServeError::Mode),
 		};
 
-		let writer = groups.create(serve::Group {
+		let writer = subgroups.create(serve::Subgroup {
 			group_id: header.group_id,
+			subgroup_id: header.subgroup_id,
 			priority: header.publisher_priority,
 		})?;
 
-		self.writer = Some(groups.into());
+		self.writer = Some(subgroups.into());
 
 		Ok(writer)
 	}

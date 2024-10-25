@@ -58,7 +58,8 @@ impl Default for SubgroupsState {
 pub struct SubgroupsWriter {
 	pub info: Arc<Track>,
 	state: State<SubgroupsState>,
-	next: u64, // Not in the state to avoid a lock
+	next: u64,          // Not in the state to avoid a lock
+	last_group_id: u64, // Not in the state to avoid a lock
 }
 
 impl SubgroupsWriter {
@@ -67,12 +68,14 @@ impl SubgroupsWriter {
 			info: track,
 			state,
 			next: 0,
+			last_group_id: 0,
 		}
 	}
 
 	// Helper to increment the group by one.
 	pub fn append(&mut self, priority: u8) -> Result<SubgroupWriter, ServeError> {
 		self.create(Subgroup {
+			group_id: self.last_group_id,
 			subgroup_id: self.next,
 			priority,
 		})
@@ -98,8 +101,9 @@ impl SubgroupsWriter {
 		} else {
 			state.latest = Some(reader);
 		}
-		// TODO: group_id should be incremented somewhere
+
 		self.next = state.latest.as_ref().unwrap().subgroup_id + 1;
+		self.last_group_id = state.latest.as_ref().unwrap().group_id;
 		state.epoch += 1;
 
 		Ok(writer)

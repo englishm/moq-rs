@@ -180,7 +180,7 @@ impl Subscriber {
 		// This is super silly, but I couldn't figure out a way to avoid the mutex guard across awaits.
 		enum Writer {
 			Track(serve::StreamWriter),
-			Group(serve::GroupWriter),
+			Subgroup(serve::SubgroupWriter),
 			Object(serve::ObjectWriter),
 		}
 
@@ -190,14 +190,14 @@ impl Subscriber {
 
 			match header {
 				data::Header::Track(track) => Writer::Track(subscribe.track(track)?),
-				data::Header::Group(group) => Writer::Group(subscribe.group(group)?),
+				data::Header::Subgroup(subgroup) => Writer::Subgroup(subscribe.subgroup(subgroup)?),
 				data::Header::Object(object) => Writer::Object(subscribe.object(object)?),
 			}
 		};
 
 		match writer {
 			Writer::Track(track) => Self::recv_track(track, reader).await?,
-			Writer::Group(group) => Self::recv_group(group, reader).await?,
+			Writer::Subgroup(group) => Self::recv_subgroup(group, reader).await?,
 			Writer::Object(object) => Self::recv_object(object, reader).await?,
 		};
 
@@ -234,11 +234,11 @@ impl Subscriber {
 		Ok(())
 	}
 
-	async fn recv_group(mut group: serve::GroupWriter, mut reader: Reader) -> Result<(), SessionError> {
+	async fn recv_subgroup(mut group: serve::SubgroupWriter, mut reader: Reader) -> Result<(), SessionError> {
 		log::trace!("received group: {:?}", group.info);
 
 		while !reader.done().await? {
-			let object: data::GroupObject = reader.decode().await?;
+			let object: data::SubgroupObject = reader.decode().await?;
 
 			log::trace!("received group object: {:?}", object);
 			let mut remain = object.size;
