@@ -1,6 +1,6 @@
 use anyhow::{self, Context};
 use bytes::{Buf, Bytes};
-use moq_transport::serve::{GroupWriter, GroupsWriter, TrackWriter, TracksWriter};
+use moq_transport::serve::{SubgroupWriter, SubgroupsWriter, TrackWriter, TracksWriter};
 use mp4::{self, ReadBox, TrackType};
 use std::cmp::max;
 use std::collections::HashMap;
@@ -15,8 +15,8 @@ pub struct Media {
 	broadcast: TracksWriter,
 
 	// The init and catalog tracks
-	init: GroupsWriter,
-	catalog: GroupsWriter,
+	init: SubgroupsWriter,
+	catalog: SubgroupsWriter,
 
 	// The ftyp and moov atoms at the start of the file.
 	ftyp: Option<Bytes>,
@@ -297,10 +297,10 @@ fn next_atom<B: Buf>(buf: &mut B) -> anyhow::Result<Option<Bytes>> {
 
 struct Track {
 	// The track we're producing
-	track: GroupsWriter,
+	track: SubgroupsWriter,
 
 	// The current segment
-	current: Option<GroupWriter>,
+	current: Option<SubgroupWriter>,
 
 	// The number of units per second.
 	timescale: u64,
