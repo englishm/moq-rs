@@ -59,6 +59,7 @@ pub struct SubgroupsWriter {
 	pub info: Arc<Track>,
 	state: State<SubgroupsState>,
 	next: u64,          // Not in the state to avoid a lock
+	next_group_id: u64, // Not in the state to avoid a lock
 	last_group_id: u64, // Not in the state to avoid a lock
 }
 
@@ -68,15 +69,35 @@ impl SubgroupsWriter {
 			info: track,
 			state,
 			next: 0,
+			next_group_id: 0,
 			last_group_id: 0,
 		}
 	}
 
 	// Helper to increment the group by one.
 	pub fn append(&mut self, priority: u8) -> Result<SubgroupWriter, ServeError> {
+		let group_id;
+		let subgroup_id;
+
+		// TODO: refactor here... For now, every subgroup is mapped to a new group...
+		let start_new_group = true;
+
+		if start_new_group {
+			group_id = self.next_group_id;
+			subgroup_id = 0;
+		} else {
+			group_id = self.last_group_id;
+			subgroup_id = self.next;
+		}
+
+		println!(
+			"SubgroupsWriter::append group_id: {}, subgroup_id: {}",
+			group_id, subgroup_id
+		);
+
 		self.create(Subgroup {
-			group_id: self.last_group_id,
-			subgroup_id: self.next,
+			group_id,
+			subgroup_id,
 			priority,
 		})
 	}
@@ -93,16 +114,24 @@ impl SubgroupsWriter {
 		let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
 
 		if let Some(latest) = &state.latest {
-			match writer.group_id.cmp(&latest.group_id) {
-				cmp::Ordering::Less => return Ok(writer), // dropped immediately, lul
-				cmp::Ordering::Equal => return Err(ServeError::Duplicate),
-				cmp::Ordering::Greater => state.latest = Some(reader),
+			// TODO: Check this logic again
+			if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Equal {
+				match writer.subgroup_id.cmp(&latest.subgroup_id) {
+					cmp::Ordering::Less => return Ok(writer), // dropped immediately, lul
+					cmp::Ordering::Equal => return Err(ServeError::Duplicate),
+					cmp::Ordering::Greater => state.latest = Some(reader),
+				}
+			} else if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Greater {
+				state.latest = Some(reader);
+			} else {
+				return Ok(writer); // drop here as well
 			}
 		} else {
 			state.latest = Some(reader);
 		}
 
 		self.next = state.latest.as_ref().unwrap().subgroup_id + 1;
+		self.next_group_id = state.latest.as_ref().unwrap().group_id + 1;
 		self.last_group_id = state.latest.as_ref().unwrap().group_id;
 		state.epoch += 1;
 
