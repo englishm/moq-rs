@@ -90,11 +90,6 @@ impl SubgroupsWriter {
 			subgroup_id = self.next;
 		}
 
-		println!(
-			"SubgroupsWriter::append group_id: {}, subgroup_id: {}",
-			group_id, subgroup_id
-		);
-
 		self.create(Subgroup {
 			group_id,
 			subgroup_id,
