@@ -341,6 +341,11 @@ impl Track {
 		// Create a new segment.
 		let mut segment = self.track.append(priority)?;
 
+		println!(
+			"timestamp: {:?} segment: {:?}:{:?} priority: {:?}",
+			fragment.timestamp, segment.info.group_id, segment.info.subgroup_id, priority
+		);
+
 		// Write the fragment in it's own object.
 		segment.write(raw)?;
 
