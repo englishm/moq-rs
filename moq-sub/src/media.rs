@@ -3,7 +3,7 @@ use std::{io::Cursor, sync::Arc};
 use anyhow::Context;
 use log::{debug, info, trace, warn};
 use moq_transport::serve::{
-	GroupObjectReader, GroupReader, TrackReader, TrackReaderMode, Tracks, TracksReader, TracksWriter,
+	SubgroupObjectReader, SubgroupReader, TrackReader, TrackReaderMode, Tracks, TracksReader, TracksWriter,
 };
 use moq_transport::session::Subscriber;
 use mp4::ReadBox;
@@ -49,7 +49,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 
 			let track = self.broadcast.subscribe(init_track_name).context("no init track")?;
 			let mut group = match track.mode().await? {
-				TrackReaderMode::Groups(mut groups) => groups.next().await?.context("no init group")?,
+				TrackReaderMode::Subgroups(mut groups) => groups.next().await?.context("no init group")?,
 				_ => anyhow::bail!("expected init segment"),
 			};
 
@@ -119,7 +119,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 	async fn recv_track(track: TrackReader, out: Arc<Mutex<O>>) -> anyhow::Result<()> {
 		let name = track.name.clone();
 		debug!("track {name}: start");
-		if let TrackReaderMode::Groups(mut groups) = track.mode().await? {
+		if let TrackReaderMode::Subgroups(mut groups) = track.mode().await? {
 			while let Some(group) = groups.next().await? {
 				let out = out.clone();
 				if let Err(err) = Self::recv_group(group, out).await {
@@ -131,7 +131,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 		Ok(())
 	}
 
-	async fn recv_group(mut group: GroupReader, out: Arc<Mutex<O>>) -> anyhow::Result<()> {
+	async fn recv_group(mut group: SubgroupReader, out: Arc<Mutex<O>>) -> anyhow::Result<()> {
 		trace!("group={} start", group.group_id);
 		while let Some(object) = group.next().await? {
 			trace!("group={} fragment={} start", group.group_id, object.object_id);
@@ -144,7 +144,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 		Ok(())
 	}
 
-	async fn recv_object(mut object: GroupObjectReader) -> anyhow::Result<Vec<u8>> {
+	async fn recv_object(mut object: SubgroupObjectReader) -> anyhow::Result<Vec<u8>> {
 		let mut buf = Vec::with_capacity(object.size);
 		while let Some(chunk) = object.read().await? {
 			buf.extend_from_slice(&chunk);
