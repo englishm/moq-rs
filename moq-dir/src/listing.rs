@@ -64,7 +64,7 @@ impl ListingWriter {
 	fn snapshot(&mut self) -> Result<SubgroupWriter, ServeError> {
 		let mut subgroups = match self.subgroups.take() {
 			Some(subgroups) => subgroups,
-			None => self.track.take().unwrap().subgroups()?,
+			None => self.track.take().unwrap().groups()?,
 		};
 
 		let priority = 127;
