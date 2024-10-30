@@ -37,7 +37,7 @@ impl Decode for Subscribe {
 		let track_namespace = String::decode(r)?;
 		let track_name = String::decode(r)?;
 
-		let subscriber_priority = u8::decode(r)?;
+		let subscriber_priority = u64::decode(r)?;
 		let group_order = GroupOrder::decode(r)?;
 
 		let filter_type = FilterType::decode(r)?;
@@ -87,7 +87,7 @@ impl Decode for Subscribe {
 			track_alias,
 			track_namespace,
 			track_name,
-			subscriber_priority,
+			subscriber_priority: subscriber_priority.try_into().map_err(|_| DecodeError::InvalidValue)?,
 			group_order,
 			filter_type,
 			start,
