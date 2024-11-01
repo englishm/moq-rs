@@ -21,6 +21,9 @@ pub enum SessionError {
 	#[error("parameter length mismatch")]
 	ParameterLengthMismatch,
 
+	#[error("too many subscribes")]
+	TooManySubscribes,
+
 	#[error("goaway timeout")]
 	GoawayTimeout,
 
@@ -40,6 +43,7 @@ impl MoqError for SessionError {
 			Self::ProtocolViolation => 0x3,
 			Self::DuplicateTrackAlias => 0x4,
 			Self::ParameterLengthMismatch => 0x5,
+			Self::TooManySubscribes => 0x6,
 			Self::GoawayTimeout => 0x10,
 			Self::Unknown(code) => *code,
 			// Unofficial error codes
