@@ -1,7 +1,7 @@
 use anyhow::Context;
 use moq_transport::serve::{
-	DatagramsReader, ObjectsReader, StreamReader, Subgroup, SubgroupWriter, SubgroupsReader, SubgroupsWriter,
-	TrackReader, TrackReaderMode,
+	DatagramsReader, StreamReader, Subgroup, SubgroupWriter, SubgroupsReader, SubgroupsWriter, TrackReader,
+	TrackReaderMode,
 };
 
 use chrono::prelude::*;
@@ -91,7 +91,6 @@ impl Subscriber {
 		match self.track.mode().await.context("failed to get mode")? {
 			TrackReaderMode::Stream(stream) => Self::recv_stream(stream).await,
 			TrackReaderMode::Subgroups(subgroups) => Self::recv_subgroups(subgroups).await,
-			TrackReaderMode::Objects(objects) => Self::recv_objects(objects).await,
 			TrackReaderMode::Datagrams(datagrams) => Self::recv_datagrams(datagrams).await,
 		}
 	}
@@ -121,16 +120,6 @@ impl Subscriber {
 				let str = String::from_utf8_lossy(&object);
 				println!("{}{}", base, str);
 			}
-		}
-
-		Ok(())
-	}
-
-	async fn recv_objects(mut objects: ObjectsReader) -> anyhow::Result<()> {
-		while let Some(mut object) = objects.next().await? {
-			let payload = object.read_all().await?;
-			let str = String::from_utf8_lossy(&payload);
-			println!("{}", str);
 		}
 
 		Ok(())
