@@ -15,8 +15,8 @@
 use crate::watch::State;
 
 use super::{
-	Datagrams, DatagramsReader, DatagramsWriter, Objects, ObjectsReader, ObjectsWriter, ServeError, Stream,
-	StreamReader, StreamWriter, Subgroups, SubgroupsReader, SubgroupsWriter,
+	Datagrams, DatagramsReader, DatagramsWriter, ObjectsWriter, ServeError, Stream, StreamReader, StreamWriter,
+	Subgroups, SubgroupsReader, SubgroupsWriter,
 };
 use paste::paste;
 use std::{ops::Deref, sync::Arc};
@@ -82,19 +82,9 @@ impl TrackWriter {
 		Ok(writer)
 	}
 
+	// TODO: rework this whole interface for clarity?
 	pub fn groups(self) -> Result<SubgroupsWriter, ServeError> {
 		let (writer, reader) = Subgroups {
-			track: self.info.clone(),
-		}
-		.produce();
-
-		let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
-		state.mode = Some(reader.into());
-		Ok(writer)
-	}
-
-	pub fn objects(self) -> Result<ObjectsWriter, ServeError> {
-		let (writer, reader) = Objects {
 			track: self.info.clone(),
 		}
 		.produce();
@@ -220,7 +210,7 @@ macro_rules! track_readers {
 	}
 }
 
-track_readers!(Stream, Subgroups, Objects, Datagrams,);
+track_readers!(Stream, Subgroups, Datagrams,);
 
 macro_rules! track_writers {
     {$($name:ident,)*} => {
