@@ -94,7 +94,6 @@ impl Subscribed {
 			// TODO cancel track/datagrams on closed
 			TrackReaderMode::Stream(stream) => self.serve_track(stream).await,
 			TrackReaderMode::Subgroups(subgroups) => self.serve_subgroups(subgroups).await,
-			TrackReaderMode::Objects(objects) => self.serve_objects(objects).await,
 			TrackReaderMode::Datagrams(datagrams) => self.serve_datagrams(datagrams).await,
 		}
 	}
@@ -285,77 +284,6 @@ impl Subscribed {
 
 			log::trace!("sent group done");
 		}
-
-		Ok(())
-	}
-
-	pub async fn serve_objects(&mut self, mut objects: serve::ObjectsReader) -> Result<(), SessionError> {
-		let mut tasks = FuturesUnordered::new();
-		let mut done = None;
-
-		loop {
-			tokio::select! {
-				res = objects.next(), if done.is_none() => match res {
-					Ok(Some(object)) => {
-						let header = data::ObjectHeader {
-							subscribe_id: self.msg.id,
-							track_alias: self.msg.track_alias,
-							group_id: object.group_id,
-							object_id: object.object_id,
-							publisher_priority: object.priority,
-							object_status: object.status,
-
-						};
-
-						let publisher = self.publisher.clone();
-						let state = self.state.clone();
-						let info = object.info.clone();
-
-						tasks.push(async move {
-							if let Err(err) = Self::serve_object(header, object, publisher, state).await {
-								log::warn!("failed to serve object: {:?}, error: {}", info, err);
-							};
-						});
-					},
-					Ok(None) => done = Some(Ok(())),
-					Err(err) => done = Some(Err(err)),
-				},
-				_ = tasks.next(), if !tasks.is_empty() => {},
-				res = self.closed(), if done.is_none() => done = Some(res),
-				else => return Ok(done.unwrap()?),
-			}
-		}
-	}
-
-	async fn serve_object(
-		header: data::ObjectHeader,
-		mut object: serve::ObjectReader,
-		mut publisher: Publisher,
-		state: State<SubscribedState>,
-	) -> Result<(), SessionError> {
-		state
-			.lock_mut()
-			.ok_or(ServeError::Done)?
-			.update_max_group_id(object.group_id, object.object_id)?;
-
-		let mut stream = publisher.open_uni().await?;
-
-		// TODO figure out u32 vs u64 priority
-		stream.set_priority(object.priority as i32);
-
-		let mut writer = Writer::new(stream);
-
-		let header: data::Header = header.into();
-		writer.encode(&header).await?;
-
-		log::trace!("sent object: {:?}", header);
-
-		while let Some(chunk) = object.read().await? {
-			writer.write(&chunk).await?;
-			log::trace!("sent object payload: {:?}", chunk.len());
-		}
-
-		log::trace!("sent object done");
 
 		Ok(())
 	}

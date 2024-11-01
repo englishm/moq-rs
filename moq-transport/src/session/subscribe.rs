@@ -181,26 +181,6 @@ impl SubscribeRecv {
 		Ok(writer)
 	}
 
-	pub fn object(&mut self, header: data::ObjectHeader) -> Result<serve::ObjectWriter, ServeError> {
-		let writer = self.writer.take().ok_or(ServeError::Done)?;
-
-		let mut objects = match writer {
-			TrackWriterMode::Track(init) => init.objects()?,
-			TrackWriterMode::Objects(objects) => objects,
-			_ => return Err(ServeError::Mode),
-		};
-
-		let writer = objects.create(serve::Object {
-			group_id: header.group_id,
-			object_id: header.object_id,
-			priority: header.publisher_priority,
-		})?;
-
-		self.writer = Some(objects.into());
-
-		Ok(writer)
-	}
-
 	pub fn datagram(&mut self, datagram: data::Datagram) -> Result<(), ServeError> {
 		let writer = self.writer.take().ok_or(ServeError::Done)?;
 

@@ -181,7 +181,6 @@ impl Subscriber {
 		enum Writer {
 			Track(serve::StreamWriter),
 			Subgroup(serve::SubgroupWriter),
-			Object(serve::ObjectWriter),
 		}
 
 		let writer = {
@@ -191,14 +190,12 @@ impl Subscriber {
 			match header {
 				data::Header::Track(track) => Writer::Track(subscribe.track(track)?),
 				data::Header::Subgroup(subgroup) => Writer::Subgroup(subscribe.subgroup(subgroup)?),
-				data::Header::Object(object) => Writer::Object(subscribe.object(object)?),
 			}
 		};
 
 		match writer {
 			Writer::Track(track) => Self::recv_track(track, reader).await?,
 			Writer::Subgroup(group) => Self::recv_subgroup(group, reader).await?,
-			Writer::Object(object) => Self::recv_object(object, reader).await?,
 		};
 
 		Ok(())
@@ -250,17 +247,6 @@ impl Subscriber {
 				remain -= data.len();
 				object.write(data)?;
 			}
-		}
-
-		Ok(())
-	}
-
-	async fn recv_object(mut object: serve::ObjectWriter, mut reader: Reader) -> Result<(), SessionError> {
-		log::trace!("received object: {:?}", object.info);
-
-		while let Some(data) = reader.read_chunk(usize::MAX).await? {
-			log::trace!("received object payload: {:?}", data.len());
-			object.write(data)?;
 		}
 
 		Ok(())

@@ -2,7 +2,7 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use paste::paste;
 use std::fmt;
 
-use super::{ObjectHeader, SubgroupHeader, TrackHeader};
+use super::{SubgroupHeader, TrackHeader};
 
 // Use a macro to generate the message types rather than copy-paste.
 // This implements a decode/encode method that uses the specified type.
@@ -84,10 +84,9 @@ macro_rules! header_types {
     }
 }
 
-// TODO: These types are removed in draft-06. Remove them if they are not needed.
-// Each object type is prefixed with the given VarInt type.
+// Each stream type is prefixed with the given VarInt type.
+// https://www.ietf.org/archive/id/draft-ietf-moq-transport-06.html#section-7
 header_types! {
-	Object = 0x0,
 	//Datagram = 0x1,
 	Subgroup = 0x51,
 	Track = 0x50,
