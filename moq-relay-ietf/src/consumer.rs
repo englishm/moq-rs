@@ -51,10 +51,10 @@ impl Consumer {
 	async fn serve(mut self, mut announce: Announced) -> Result<(), anyhow::Error> {
 		let mut tasks = FuturesUnordered::new();
 
-		let (_, mut request, reader) = Tracks::new(announce.namespace.to_string()).produce();
+		let (_, mut request, reader) = Tracks::new(announce.namespace.clone()).produce();
 
 		if let Some(api) = self.api.as_ref() {
-			let mut refresh = api.set_origin(reader.namespace.clone()).await?;
+			let mut refresh = api.set_origin(reader.namespace.to_utf8_path()).await?;
 			tasks.push(async move { refresh.run().await.context("failed refreshing origin") }.boxed());
 		}
 

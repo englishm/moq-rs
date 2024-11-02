@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-	coding::Decode,
+	coding::{Decode, Tuple},
 	data,
 	message::{self, Message},
 	serve::{self, ServeError},
@@ -19,7 +19,7 @@ use super::{Announced, AnnouncedRecv, Reader, Session, SessionError, Subscribe, 
 // TODO remove Clone.
 #[derive(Clone)]
 pub struct Subscriber {
-	announced: Arc<Mutex<HashMap<String, AnnouncedRecv>>>,
+	announced: Arc<Mutex<HashMap<Tuple, AnnouncedRecv>>>,
 	announced_queue: Queue<Announced>,
 
 	subscribes: Arc<Mutex<HashMap<u64, SubscribeRecv>>>,
@@ -102,7 +102,7 @@ impl Subscriber {
 			hash_map::Entry::Vacant(entry) => entry,
 		};
 
-		let (announced, recv) = Announced::new(self.clone(), msg.namespace.to_string());
+		let (announced, recv) = Announced::new(self.clone(), msg.namespace.clone());
 		if let Err(announced) = self.announced_queue.push(announced) {
 			announced.close(ServeError::Cancel)?;
 			return Ok(());
@@ -152,7 +152,7 @@ impl Subscriber {
 		Ok(())
 	}
 
-	fn drop_announce(&mut self, namespace: &str) {
+	fn drop_announce(&mut self, namespace: &Tuple) {
 		self.announced.lock().unwrap().remove(namespace);
 	}
 

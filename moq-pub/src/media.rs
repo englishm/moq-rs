@@ -157,7 +157,7 @@ impl Media {
 			let mut track = moq_catalog::Track {
 				init_track: Some(self.init.name.clone()),
 				name: name.clone(),
-				namespace: Some(self.broadcast.namespace.clone()),
+				namespace: Some(self.broadcast.namespace.to_utf8_path()),
 				packaging: Some(moq_catalog::TrackPackaging::Cmaf),
 				render_group: Some(1),
 				..Default::default()

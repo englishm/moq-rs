@@ -6,7 +6,7 @@ use url::Url;
 
 use moq_native_ietf::quic;
 use moq_sub::media::Media;
-use moq_transport::serve::Tracks;
+use moq_transport::{coding::Tuple, serve::Tracks};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
 		.context("failed to create MoQ Transport session")?;
 
 	// Associate empty set of Tracks with provided namespace
-	let tracks = Tracks::new(config.name);
+	let tracks = Tracks::new(Tuple::from_utf8_path(&config.name));
 
 	let mut media = Media::new(subscriber, tracks, out).await?;
 

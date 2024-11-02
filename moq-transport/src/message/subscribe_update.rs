@@ -1,4 +1,4 @@
-use crate::coding::{Decode, DecodeError, Encode, EncodeError, Params};
+use crate::coding::{Decode, DecodeError, Encode, EncodeError, Params, Tuple};
 use crate::message::subscribe::{SubscribeLocation, SubscribePair};
 use crate::message::FilterType;
 use crate::message::GroupOrder;
@@ -13,7 +13,7 @@ pub struct SubscribeUpdate {
 
 	/// Track properties
 	pub track_alias: u64, // This alias is useless but part of the spec
-	pub track_namespace: String,
+	pub track_namespace: Tuple,
 	pub track_name: String,
 
 	// Subscriber Priority
@@ -35,7 +35,7 @@ impl Decode for SubscribeUpdate {
 	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
 		let id = u64::decode(r)?;
 		let track_alias = u64::decode(r)?;
-		let track_namespace = String::decode(r)?;
+		let track_namespace = Tuple::decode(r)?;
 		let track_name = String::decode(r)?;
 
 		let subscriber_priority = u8::decode(r)?;

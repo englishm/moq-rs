@@ -18,18 +18,19 @@ use super::{
 	Datagrams, DatagramsReader, DatagramsWriter, ObjectsWriter, ServeError, Stream, StreamReader, StreamWriter,
 	Subgroups, SubgroupsReader, SubgroupsWriter,
 };
+use crate::coding::Tuple;
 use paste::paste;
 use std::{ops::Deref, sync::Arc};
 
 /// Static information about a track.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Track {
-	pub namespace: String,
+	pub namespace: Tuple,
 	pub name: String,
 }
 
 impl Track {
-	pub fn new(namespace: String, name: String) -> Self {
+	pub fn new(namespace: Tuple, name: String) -> Self {
 		Self { namespace, name }
 	}
 

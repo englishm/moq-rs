@@ -3,6 +3,7 @@ use std::{
 	sync::{Arc, Mutex},
 };
 
+use moq_transport::coding::Tuple;
 use moq_transport::serve::{ServeError, Tracks, TracksReader, TracksWriter};
 
 use crate::{ListingReader, ListingWriter};
@@ -20,7 +21,7 @@ pub struct Listings {
 
 impl Listings {
 	pub fn new(namespace: String) -> Self {
-		let (writer, _, reader) = Tracks::new(namespace).produce();
+		let (writer, _, reader) = Tracks::new(Tuple::from_utf8_path(&namespace)).produce();
 
 		let state = State {
 			writer,
@@ -37,13 +38,15 @@ impl Listings {
 	pub fn register(&mut self, path: &str) -> Result<Option<Registration>, ServeError> {
 		let (prefix, base) = Self::prefix(path);
 
-		if !prefix.starts_with(&self.reader.namespace) {
+		let namespace = self.reader.namespace.to_utf8_path();
+
+		if !prefix.starts_with(&namespace) {
 			// Ignore anything that isn't in our namespace.
 			return Ok(None);
 		}
 
 		// Remove the namespace prefix from the path.
-		let prefix = &prefix[self.reader.namespace.len()..];
+		let prefix = &prefix[namespace.len()..];
 
 		let mut state = self.state.lock().unwrap();
 		if let Some(listing) = state.active.get_mut(prefix) {

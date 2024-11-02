@@ -8,7 +8,7 @@ use tokio::io::AsyncReadExt;
 
 use moq_native_ietf::quic;
 use moq_pub::Media;
-use moq_transport::{serve, session::Publisher};
+use moq_transport::{coding::Tuple, serve, session::Publisher};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
 
 	let cli = Cli::parse();
 
-	let (writer, _, reader) = serve::Tracks::new(cli.name).produce();
+	let (writer, _, reader) = serve::Tracks::new(Tuple::from_utf8_path(&cli.name)).produce();
 	let media = Media::new(writer)?;
 
 	let tls = cli.tls.load()?;

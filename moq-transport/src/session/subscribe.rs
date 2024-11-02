@@ -1,6 +1,7 @@
 use std::ops;
 
 use crate::{
+	coding::Tuple,
 	data,
 	message::{self, FilterType, GroupOrder, SubscribeLocation, SubscribePair},
 	serve::{self, ServeError, TrackWriter, TrackWriterMode},
@@ -12,7 +13,7 @@ use super::Subscriber;
 
 #[derive(Debug, Clone)]
 pub struct SubscribeInfo {
-	pub namespace: String,
+	pub namespace: Tuple,
 	pub name: String,
 }
 

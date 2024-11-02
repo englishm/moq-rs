@@ -1,9 +1,10 @@
 use super::{Publisher, SessionError};
+use crate::coding::Tuple;
 use crate::message;
 
 #[derive(Debug, Clone)]
 pub struct TrackStatusRequestedInfo {
-	pub namespace: String,
+	pub namespace: Tuple,
 	pub track: String,
 }
 

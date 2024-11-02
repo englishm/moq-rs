@@ -1,12 +1,11 @@
-use crate::coding::{Decode, DecodeError, Encode, EncodeError, Params};
+use crate::coding::{Decode, DecodeError, Encode, EncodeError, Params, Tuple};
 
 /// Subscribe Namespace
 /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-06.html#section-6.11
 #[derive(Clone, Debug)]
 pub struct SubscribeNamespace {
 	/// The track namespace
-	// TODO: convert this to tuple
-	pub namespace_prefix: String,
+	pub namespace_prefix: Tuple,
 
 	/// Optional parameters
 	pub params: Params,
@@ -14,7 +13,7 @@ pub struct SubscribeNamespace {
 
 impl Decode for SubscribeNamespace {
 	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-		let namespace_prefix = String::decode(r)?;
+		let namespace_prefix = Tuple::decode(r)?;
 		let params = Params::decode(r)?;
 
 		Ok(Self {

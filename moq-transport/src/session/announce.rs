@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, ops};
 
+use crate::coding::Tuple;
 use crate::watch::State;
 use crate::{message, serve::ServeError};
 
@@ -7,7 +8,7 @@ use super::{Publisher, Subscribed, TrackStatusRequested};
 
 #[derive(Debug, Clone)]
 pub struct AnnounceInfo {
-	pub namespace: String,
+	pub namespace: Tuple,
 }
 
 struct AnnounceState {
@@ -45,7 +46,7 @@ pub struct Announce {
 }
 
 impl Announce {
-	pub(super) fn new(mut publisher: Publisher, namespace: String) -> (Announce, AnnounceRecv) {
+	pub(super) fn new(mut publisher: Publisher, namespace: Tuple) -> (Announce, AnnounceRecv) {
 		let info = AnnounceInfo {
 			namespace: namespace.clone(),
 		};
@@ -148,7 +149,7 @@ impl Drop for Announce {
 		}
 
 		self.publisher.send_message(message::Unannounce {
-			namespace: self.namespace.to_string(),
+			namespace: self.namespace.clone(),
 		});
 	}
 }

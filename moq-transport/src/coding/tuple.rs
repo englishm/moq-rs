@@ -1,10 +1,24 @@
 //
 use super::{Decode, DecodeError, Encode, EncodeError};
-
+use core::hash::{Hash, Hasher};
 /// Tuple Field
 #[derive(Clone, Debug, Default)]
 pub struct TupleField {
 	pub value: Vec<u8>,
+}
+
+impl Eq for TupleField {}
+
+impl PartialEq for TupleField {
+	fn eq(&self, other: &Self) -> bool {
+		self.value.eq(&other.value)
+	}
+}
+
+impl Hash for TupleField {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.value.hash(state);
+	}
 }
 
 impl Decode for TupleField {
@@ -31,6 +45,12 @@ impl TupleField {
 		Self::default()
 	}
 
+	pub fn from_utf8(path: &str) -> Self {
+		let mut field = TupleField::new();
+		field.value = path.as_bytes().to_vec();
+		field
+	}
+
 	pub fn set<P: Encode>(&mut self, p: P) -> Result<(), EncodeError> {
 		let mut value = Vec::new();
 		p.encode(&mut value)?;
@@ -47,6 +67,20 @@ impl TupleField {
 #[derive(Clone, Debug, Default)]
 pub struct Tuple {
 	pub fields: Vec<TupleField>,
+}
+
+impl Hash for Tuple {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.fields.hash(state);
+	}
+}
+
+impl Eq for Tuple {}
+
+impl PartialEq for Tuple {
+	fn eq(&self, other: &Self) -> bool {
+		self.fields.eq(&other.fields)
+	}
 }
 
 impl Decode for Tuple {
@@ -89,5 +123,22 @@ impl Tuple {
 
 	pub fn clear(&mut self) {
 		self.fields.clear();
+	}
+
+	pub fn from_utf8_path(path: &str) -> Self {
+		let mut tuple = Tuple::new();
+		for part in path.split('/') {
+			tuple.add(TupleField::from_utf8(part));
+		}
+		tuple
+	}
+
+	pub fn to_utf8_path(&self) -> String {
+		let mut path = String::new();
+		for field in &self.fields {
+			path.push('/');
+			path.push_str(&String::from_utf8_lossy(&field.value));
+		}
+		path
 	}
 }

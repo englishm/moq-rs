@@ -1,16 +1,16 @@
-use crate::coding::{Decode, DecodeError, Encode, EncodeError};
+use crate::coding::{Decode, DecodeError, Encode, EncodeError, Tuple};
 
 #[derive(Clone, Debug)]
 pub struct TrackStatusRequest {
 	/// Track Namespace
-	pub track_namespace: String,
+	pub track_namespace: Tuple,
 	/// Track Name
 	pub track_name: String,
 }
 
 impl Decode for TrackStatusRequest {
 	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-		let track_namespace = String::decode(r)?;
+		let track_namespace = Tuple::decode(r)?;
 		let track_name = String::decode(r)?;
 
 		Ok(Self {

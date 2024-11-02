@@ -10,6 +10,7 @@ use futures::stream::FuturesUnordered;
 use futures::FutureExt;
 use futures::StreamExt;
 use moq_native_ietf::quic;
+use moq_transport::coding::Tuple;
 use moq_transport::serve::{Track, TrackReader, TrackWriter};
 use moq_transport::watch::State;
 use url::Url;
@@ -119,9 +120,9 @@ impl RemotesConsumer {
 		Self { info, state }
 	}
 
-	pub async fn route(&self, namespace: &str) -> anyhow::Result<Option<RemoteConsumer>> {
+	pub async fn route(&self, namespace: &Tuple) -> anyhow::Result<Option<RemoteConsumer>> {
 		// Always fetch the origin instead of using the (potentially invalid) cache.
-		let origin = match self.api.get_origin(namespace).await? {
+		let origin = match self.api.get_origin(&namespace.to_utf8_path()).await? {
 			None => return Ok(None),
 			Some(origin) => origin,
 		};
@@ -192,7 +193,7 @@ impl Remote {
 
 #[derive(Default)]
 struct RemoteState {
-	tracks: HashMap<(String, String), RemoteTrackWeak>,
+	tracks: HashMap<(Tuple, String), RemoteTrackWeak>,
 	requested: VecDeque<TrackWriter>,
 }
 
@@ -285,7 +286,7 @@ impl RemoteConsumer {
 	}
 
 	/// Request a track from the broadcast.
-	pub fn subscribe(&self, namespace: String, name: String) -> anyhow::Result<Option<RemoteTrackReader>> {
+	pub fn subscribe(&self, namespace: Tuple, name: String) -> anyhow::Result<Option<RemoteTrackReader>> {
 		let key = (namespace.clone(), name.clone());
 		let state = self.state.lock();
 		if let Some(track) = state.tracks.get(&key) {
@@ -372,7 +373,7 @@ impl RemoteTrackWeak {
 
 struct RemoteTrackDrop {
 	parent: State<RemoteState>,
-	key: (String, String),
+	key: (Tuple, String),
 }
 
 impl Drop for RemoteTrackDrop {

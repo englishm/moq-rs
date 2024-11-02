@@ -8,6 +8,7 @@ use clap::Parser;
 mod clock;
 
 use moq_transport::{
+	coding::Tuple,
 	serve,
 	session::{Publisher, Subscriber},
 };
@@ -64,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 			.context("failed to create MoQ Transport session")?;
 
 		let (mut writer, _, reader) = serve::Tracks {
-			namespace: config.namespace.clone(),
+			namespace: Tuple::from_utf8_path(&config.namespace),
 		}
 		.produce();
 
@@ -81,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
 			.await
 			.context("failed to create MoQ Transport session")?;
 
-		let (prod, sub) = serve::Track::new(config.namespace, config.track).produce();
+		let (prod, sub) = serve::Track::new(Tuple::from_utf8_path(&config.namespace), config.track).produce();
 
 		let clock = clock::Subscriber::new(sub);
 
