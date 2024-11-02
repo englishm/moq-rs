@@ -43,6 +43,9 @@ mod publisher;
 mod subscribe;
 mod subscribe_done;
 mod subscribe_error;
+mod subscribe_namespace;
+mod subscribe_namespace_error;
+mod subscribe_namespace_ok;
 mod subscribe_ok;
 mod subscribe_update;
 mod subscriber;
@@ -50,6 +53,7 @@ mod track_status;
 mod track_status_request;
 mod unannounce;
 mod unsubscribe;
+mod unsubscribe_namespace;
 
 pub use announce::*;
 pub use announce_cancel::*;
@@ -62,6 +66,9 @@ pub use publisher::*;
 pub use subscribe::*;
 pub use subscribe_done::*;
 pub use subscribe_error::*;
+pub use subscribe_namespace::*;
+pub use subscribe_namespace_error::*;
+pub use subscribe_namespace_ok::*;
 pub use subscribe_ok::*;
 pub use subscribe_update::*;
 pub use subscriber::*;
@@ -69,6 +76,7 @@ pub use track_status::*;
 pub use track_status_request::*;
 pub use unannounce::*;
 pub use unsubscribe::*;
+pub use unsubscribe_namespace::*;
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use std::fmt;
@@ -178,6 +186,12 @@ message_types! {
 
 	// Misc
 	GoAway = 0x10,
+
+	// NAMESPACE family, sent by subscriber
+	SubscribeNamespace = 0x11,
+	SubscribeNamespaceOk = 0x12,
+	SubscribeNamespaceError = 0x13,
+	UnsubscribeNamespace = 0x14,
 }
 
 /// Track Status Codes

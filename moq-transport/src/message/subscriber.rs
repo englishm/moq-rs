@@ -52,4 +52,8 @@ subscriber_msgs! {
 	Unsubscribe,
 	SubscribeUpdate,
 	TrackStatusRequest,
+	SubscribeNamespace,
+	SubscribeNamespaceOk,
+	SubscribeNamespaceError,
+	UnsubscribeNamespace,
 }

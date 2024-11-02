@@ -27,6 +27,9 @@ pub enum SessionError {
 	#[error("goaway timeout")]
 	GoawayTimeout,
 
+
+
+
 	#[error("unknown error: code={0}")]
 	Unknown(u64),
 	// Unofficial error codes

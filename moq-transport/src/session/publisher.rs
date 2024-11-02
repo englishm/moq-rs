@@ -162,6 +162,11 @@ impl Publisher {
 			message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg),
 			message::Subscriber::SubscribeUpdate(msg) => self.recv_subscribe_update(msg),
 			message::Subscriber::TrackStatusRequest(msg) => self.recv_track_status_request(msg),
+			// TODO: Implement namespace messages.
+			message::Subscriber::SubscribeNamespace(_msg) => unimplemented!(),
+			message::Subscriber::SubscribeNamespaceOk(_msg) => unimplemented!(),
+			message::Subscriber::SubscribeNamespaceError(_msg) => unimplemented!(),
+			message::Subscriber::UnsubscribeNamespace(_msg) => unimplemented!(),
 		};
 
 		if let Err(err) = res {
