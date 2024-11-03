@@ -25,6 +25,10 @@ impl Decode for Server {
 			return Err(DecodeError::InvalidMessage(typ));
 		}
 
+		let _len = u64::decode(r)?;
+
+		// TODO: Check the length of the message.
+
 		let version = Version::decode(r)?;
 		let mut params = Params::decode(r)?;
 
@@ -42,11 +46,23 @@ impl Decode for Server {
 impl Encode for Server {
 	fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
 		0x41_u64.encode(w)?;
-		self.version.encode(w)?;
+
+		// Find out the length of the message
+		// by encoding it into a buffer and then encoding the length.
+		// This is a bit wasteful, but it's the only way to know the length.
+		let mut buf = Vec::new();
+
+		self.version.encode(&mut buf).unwrap();
 
 		let mut params = self.params.clone();
 		params.set(0, self.role)?;
-		params.encode(w)?;
+		params.encode(&mut buf).unwrap();
+
+		(buf.len() as u64).encode(w)?;
+
+		// At least don't encode the message twice.
+		// Instead, write the buffer directly to the writer.
+		w.put_slice(&buf);
 
 		Ok(())
 	}
@@ -58,6 +74,7 @@ mod tests {
 	use crate::setup::Role;
 	use bytes::BytesMut;
 
+	// TODO: Update this test to use the draft 06 version
 	#[test]
 	fn encode_decode() {
 		let mut buf = BytesMut::new();

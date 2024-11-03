@@ -24,6 +24,10 @@ impl Decode for Client {
 			return Err(DecodeError::InvalidMessage(typ));
 		}
 
+		let _len = u64::decode(r)?;
+
+		// TODO: Check the length of the message.
+
 		let versions = Versions::decode(r)?;
 		let mut params = Params::decode(r)?;
 
@@ -43,12 +47,23 @@ impl Encode for Client {
 	/// Encode a server setup message.
 	fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
 		0x40_u64.encode(w)?;
-		self.versions.encode(w)?;
+
+		// Find out the length of the message
+		// by encoding it into a buffer and then encoding the length.
+		// This is a bit wasteful, but it's the only way to know the length.
+		let mut buf = Vec::new();
+
+		self.versions.encode(&mut buf).unwrap();
 
 		let mut params = self.params.clone();
 		params.set(0, self.role)?;
+		params.encode(&mut buf).unwrap();
 
-		params.encode(w)?;
+		(buf.len() as u64).encode(w)?;
+
+		// At least don't encode the message twice.
+		// Instead, write the buffer directly to the writer.
+		w.put_slice(&buf);
 
 		Ok(())
 	}
