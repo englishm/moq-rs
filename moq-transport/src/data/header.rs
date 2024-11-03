@@ -88,6 +88,6 @@ macro_rules! header_types {
 // https://www.ietf.org/archive/id/draft-ietf-moq-transport-06.html#section-7
 header_types! {
 	//Datagram = 0x1,
-	Subgroup = 0x51,
-	Track = 0x50,
+	Track = 0x2,
+	Subgroup = 0x4,
 }

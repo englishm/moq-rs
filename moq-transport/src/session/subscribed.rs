@@ -297,6 +297,7 @@ impl Subscribed {
 				object_id: datagram.object_id,
 				publisher_priority: datagram.priority,
 				object_status: datagram.status,
+				payload_len: datagram.payload.len() as u64,
 				payload: datagram.payload,
 			};
 
