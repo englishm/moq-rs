@@ -43,8 +43,8 @@ Requires:
 ./dev/pub
 ```
 
-Alternatively, you can use Gstreamer via [moq-gst](https://github.com/kixelated/moq-gst).
-The [run](https://github.com/kixelated/moq-gst/blob/main/run) script does the exact same thing.
+Alternatively, you can use Gstreamer via [moq-gst-ietf](../moq-gst-ietf).
+The [run](../moq-gst-ietf/run) script does the exact same thing.
 
 ## moq-sub
 

@@ -64,9 +64,8 @@ See [dev/pub](dev/pub) for the required ffmpeg flags.
 
 ### gstreamer
 
-moq-pub can also be run as a library, currently used for a [gstreamer plugin](https://github.com/kixelated/moq-gst).
-This is in a separate repository to avoid gstreamer being a hard requirement.
-See [run](https://github.com/kixelated/moq-gst/blob/main/run) for an example pipeline.
+moq-pub can also be run as a library, currently used for a [gstreamer plugin](moq-gst-ietf).
+See [run](moq-gst-ietf/run) for an example pipeline.
 
 ## moq-transport
 

@@ -19,7 +19,7 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      # We need gstreamer installed to compile moq-gst-ietf
+      # We need gstreamer installed to compile this repo
       - name: Setup GStreamer
         uses: blinemedical/setup-gstreamer@v1
 
@@ -27,6 +27,3 @@ jobs:
       - run: cargo test --verbose
       - run: cargo clippy --no-deps
       - run: cargo fmt --check
-
-      # Check for unused dependencies
-      - uses: bnjbvr/cargo-machete@main

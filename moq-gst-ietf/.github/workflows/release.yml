@@ -19,9 +19,6 @@ jobs:
           fetch-depth: 0
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      # We need gstreamer installed to compile moq-gst-ietf
-      - name: Setup GStreamer
-        uses: blinemedical/setup-gstreamer@v1
       - name: Run release-plz
         uses: MarcoIeni/release-plz-action@v0.5
         env:
