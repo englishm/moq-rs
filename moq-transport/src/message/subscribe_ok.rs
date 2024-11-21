@@ -35,6 +35,10 @@ impl Decode for SubscribeOk {
 			_ => return Err(DecodeError::InvalidValue),
 		};
 
+		// Skip the parameters.
+		// TODO: Implement parameters for SubscribeOk
+		let _ = u8::decode(r)?;
+
 		Ok(Self {
 			id,
 			expires,
@@ -63,6 +67,9 @@ impl Encode for SubscribeOk {
 				w.put_u8(0);
 			}
 		}
+
+		// Add 0 for the length of the parameters
+		w.put_u8(0);
 
 		Ok(())
 	}

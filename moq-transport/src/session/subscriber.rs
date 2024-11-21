@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-	coding::Decode,
+	coding::{Decode, Tuple},
 	data,
 	message::{self, Message},
 	serve::{self, ServeError},
@@ -19,7 +19,7 @@ use super::{Announced, AnnouncedRecv, Reader, Session, SessionError, Subscribe, 
 // TODO remove Clone.
 #[derive(Clone)]
 pub struct Subscriber {
-	announced: Arc<Mutex<HashMap<String, AnnouncedRecv>>>,
+	announced: Arc<Mutex<HashMap<Tuple, AnnouncedRecv>>>,
 	announced_queue: Queue<Announced>,
 
 	subscribes: Arc<Mutex<HashMap<u64, SubscribeRecv>>>,
@@ -102,7 +102,7 @@ impl Subscriber {
 			hash_map::Entry::Vacant(entry) => entry,
 		};
 
-		let (announced, recv) = Announced::new(self.clone(), msg.namespace.to_string());
+		let (announced, recv) = Announced::new(self.clone(), msg.namespace.clone());
 		if let Err(announced) = self.announced_queue.push(announced) {
 			announced.close(ServeError::Cancel)?;
 			return Ok(());
@@ -152,7 +152,7 @@ impl Subscriber {
 		Ok(())
 	}
 
-	fn drop_announce(&mut self, namespace: &str) {
+	fn drop_announce(&mut self, namespace: &Tuple) {
 		self.announced.lock().unwrap().remove(namespace);
 	}
 
@@ -180,8 +180,7 @@ impl Subscriber {
 		// This is super silly, but I couldn't figure out a way to avoid the mutex guard across awaits.
 		enum Writer {
 			Track(serve::StreamWriter),
-			Group(serve::GroupWriter),
-			Object(serve::ObjectWriter),
+			Subgroup(serve::SubgroupWriter),
 		}
 
 		let writer = {
@@ -190,15 +189,13 @@ impl Subscriber {
 
 			match header {
 				data::Header::Track(track) => Writer::Track(subscribe.track(track)?),
-				data::Header::Group(group) => Writer::Group(subscribe.group(group)?),
-				data::Header::Object(object) => Writer::Object(subscribe.object(object)?),
+				data::Header::Subgroup(subgroup) => Writer::Subgroup(subscribe.subgroup(subgroup)?),
 			}
 		};
 
 		match writer {
 			Writer::Track(track) => Self::recv_track(track, reader).await?,
-			Writer::Group(group) => Self::recv_group(group, reader).await?,
-			Writer::Object(object) => Self::recv_object(object, reader).await?,
+			Writer::Subgroup(group) => Self::recv_subgroup(group, reader).await?,
 		};
 
 		Ok(())
@@ -234,11 +231,11 @@ impl Subscriber {
 		Ok(())
 	}
 
-	async fn recv_group(mut group: serve::GroupWriter, mut reader: Reader) -> Result<(), SessionError> {
+	async fn recv_subgroup(mut group: serve::SubgroupWriter, mut reader: Reader) -> Result<(), SessionError> {
 		log::trace!("received group: {:?}", group.info);
 
 		while !reader.done().await? {
-			let object: data::GroupObject = reader.decode().await?;
+			let object: data::SubgroupObject = reader.decode().await?;
 
 			log::trace!("received group object: {:?}", object);
 			let mut remain = object.size;
@@ -250,17 +247,6 @@ impl Subscriber {
 				remain -= data.len();
 				object.write(data)?;
 			}
-		}
-
-		Ok(())
-	}
-
-	async fn recv_object(mut object: serve::ObjectWriter, mut reader: Reader) -> Result<(), SessionError> {
-		log::trace!("received object: {:?}", object.info);
-
-		while let Some(data) = reader.read_chunk(usize::MAX).await? {
-			log::trace!("received object payload: {:?}", data.len());
-			object.write(data)?;
 		}
 
 		Ok(())

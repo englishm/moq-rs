@@ -8,7 +8,7 @@ use tokio::io::AsyncReadExt;
 
 use moq_native_ietf::quic;
 use moq_pub::Media;
-use moq_transport::{serve, session::Publisher};
+use moq_transport::{coding::Tuple, serve, session::Publisher};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
 
 	let cli = Cli::parse();
 
-	let (writer, _, reader) = serve::Tracks::new(cli.name).produce();
+	let (writer, _, reader) = serve::Tracks::new(Tuple::from_utf8_path(&cli.name)).produce();
 	let media = Media::new(writer)?;
 
 	let tls = cli.tls.load()?;
@@ -70,7 +70,9 @@ async fn main() -> anyhow::Result<()> {
 
 	tokio::select! {
 		res = session.run() => res.context("session error")?,
-		res = run_media(media) => res.context("media error")?,
+		res = run_media(media) => {
+			res.context("media error")?
+		},
 		res = publisher.announce(reader) => res.context("publisher error")?,
 	}
 
@@ -80,7 +82,6 @@ async fn main() -> anyhow::Result<()> {
 async fn run_media(mut media: Media) -> anyhow::Result<()> {
 	let mut input = tokio::io::stdin();
 	let mut buf = BytesMut::new();
-
 	loop {
 		input.read_buf(&mut buf).await.context("failed to read from stdin")?;
 		media.parse(&mut buf).context("failed to parse media")?;

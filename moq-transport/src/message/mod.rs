@@ -39,10 +39,14 @@ mod announce_ok;
 mod filter_type;
 mod go_away;
 mod group_order;
+mod max_subscribe_id;
 mod publisher;
 mod subscribe;
 mod subscribe_done;
 mod subscribe_error;
+mod subscribe_namespace;
+mod subscribe_namespace_error;
+mod subscribe_namespace_ok;
 mod subscribe_ok;
 mod subscribe_update;
 mod subscriber;
@@ -50,6 +54,7 @@ mod track_status;
 mod track_status_request;
 mod unannounce;
 mod unsubscribe;
+mod unsubscribe_namespace;
 
 pub use announce::*;
 pub use announce_cancel::*;
@@ -58,10 +63,14 @@ pub use announce_ok::*;
 pub use filter_type::*;
 pub use go_away::*;
 pub use group_order::*;
+pub use max_subscribe_id::*;
 pub use publisher::*;
 pub use subscribe::*;
 pub use subscribe_done::*;
 pub use subscribe_error::*;
+pub use subscribe_namespace::*;
+pub use subscribe_namespace_error::*;
+pub use subscribe_namespace_ok::*;
 pub use subscribe_ok::*;
 pub use subscribe_update::*;
 pub use subscriber::*;
@@ -69,6 +78,7 @@ pub use track_status::*;
 pub use track_status_request::*;
 pub use unannounce::*;
 pub use unsubscribe::*;
+pub use unsubscribe_namespace::*;
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use std::fmt;
@@ -86,6 +96,9 @@ macro_rules! message_types {
 		impl Decode for Message {
 			fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
 				let t = u64::decode(r)?;
+				let _len = u64::decode(r)?;
+
+				// TODO: Check the length of the message.
 
 				match t {
 					$($val => {
@@ -102,7 +115,18 @@ macro_rules! message_types {
 				match self {
 					$(Self::$name(ref m) => {
 						self.id().encode(w)?;
-						m.encode(w)
+
+						// Find out the length of the message
+						// by encoding it into a buffer and then encoding the length.
+						// This is a bit wasteful, but it's the only way to know the length.
+						let mut buf = Vec::new();
+						m.encode(&mut buf).unwrap();
+						(buf.len() as u64).encode(w)?;
+
+						// At least don't encode the message twice.
+						// Instead, write the buffer directly to the writer.
+						w.put_slice(&buf);
+						Ok(())
 					},)*
 				}
 			}
@@ -160,6 +184,7 @@ message_types! {
 	SubscribeOk = 0x4,
 	SubscribeError = 0x5,
 	SubscribeDone = 0xb,
+	MaxSubscribeId = 0x15,
 
 	// ANNOUNCE family, sent by publisher
 	Announce = 0x6,
@@ -178,6 +203,12 @@ message_types! {
 
 	// Misc
 	GoAway = 0x10,
+
+	// NAMESPACE family, sent by subscriber
+	SubscribeNamespace = 0x11,
+	SubscribeNamespaceOk = 0x12,
+	SubscribeNamespaceError = 0x13,
+	UnsubscribeNamespace = 0x14,
 }
 
 /// Track Status Codes

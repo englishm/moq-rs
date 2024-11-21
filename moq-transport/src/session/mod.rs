@@ -79,7 +79,7 @@ impl Session {
 		let mut sender = Writer::new(control.0);
 		let mut recver = Reader::new(control.1);
 
-		let versions: setup::Versions = [setup::Version::DRAFT_05].into();
+		let versions: setup::Versions = [setup::Version::DRAFT_06].into();
 
 		let client = setup::Client {
 			role,
@@ -128,10 +128,10 @@ impl Session {
 		let client: setup::Client = recver.decode().await?;
 		log::debug!("received client SETUP: {:?}", client);
 
-		if !client.versions.contains(&setup::Version::DRAFT_05) {
+		if !client.versions.contains(&setup::Version::DRAFT_06) {
 			return Err(SessionError::Version(
 				client.versions,
-				[setup::Version::DRAFT_05].into(),
+				[setup::Version::DRAFT_06].into(),
 			));
 		}
 
@@ -152,7 +152,7 @@ impl Session {
 
 		let server = setup::Server {
 			role,
-			version: setup::Version::DRAFT_05,
+			version: setup::Version::DRAFT_06,
 			params: Default::default(),
 		};
 

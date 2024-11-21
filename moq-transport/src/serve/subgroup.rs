@@ -15,22 +15,22 @@ use crate::watch::State;
 
 use super::{ServeError, Track};
 
-pub struct Groups {
+pub struct Subgroups {
 	pub track: Arc<Track>,
 }
 
-impl Groups {
-	pub fn produce(self) -> (GroupsWriter, GroupsReader) {
+impl Subgroups {
+	pub fn produce(self) -> (SubgroupsWriter, SubgroupsReader) {
 		let (writer, reader) = State::default().split();
 
-		let writer = GroupsWriter::new(writer, self.track.clone());
-		let reader = GroupsReader::new(reader, self.track);
+		let writer = SubgroupsWriter::new(writer, self.track.clone());
+		let reader = SubgroupsReader::new(reader, self.track);
 
 		(writer, reader)
 	}
 }
 
-impl Deref for Groups {
+impl Deref for Subgroups {
 	type Target = Track;
 
 	fn deref(&self) -> &Self::Target {
@@ -39,13 +39,13 @@ impl Deref for Groups {
 }
 
 // State shared between the writer and reader.
-struct GroupsState {
-	latest: Option<GroupReader>,
+struct SubgroupsState {
+	latest: Option<SubgroupReader>,
 	epoch: u64, // Updated each time latest changes
 	closed: Result<(), ServeError>,
 }
 
-impl Default for GroupsState {
+impl Default for SubgroupsState {
 	fn default() -> Self {
 		Self {
 			latest: None,
@@ -55,50 +55,79 @@ impl Default for GroupsState {
 	}
 }
 
-pub struct GroupsWriter {
+pub struct SubgroupsWriter {
 	pub info: Arc<Track>,
-	state: State<GroupsState>,
-	next: u64, // Not in the state to avoid a lock
+	state: State<SubgroupsState>,
+	next: u64,          // Not in the state to avoid a lock
+	next_group_id: u64, // Not in the state to avoid a lock
+	last_group_id: u64, // Not in the state to avoid a lock
 }
 
-impl GroupsWriter {
-	fn new(state: State<GroupsState>, track: Arc<Track>) -> Self {
+impl SubgroupsWriter {
+	fn new(state: State<SubgroupsState>, track: Arc<Track>) -> Self {
 		Self {
 			info: track,
 			state,
 			next: 0,
+			next_group_id: 0,
+			last_group_id: 0,
 		}
 	}
 
 	// Helper to increment the group by one.
-	pub fn append(&mut self, priority: u8) -> Result<GroupWriter, ServeError> {
-		self.create(Group {
-			group_id: self.next,
+	pub fn append(&mut self, priority: u8) -> Result<SubgroupWriter, ServeError> {
+		let group_id;
+		let subgroup_id;
+
+		// TODO: refactor here... For now, every subgroup is mapped to a new group...
+		let start_new_group = true;
+
+		if start_new_group {
+			group_id = self.next_group_id;
+			subgroup_id = 0;
+		} else {
+			group_id = self.last_group_id;
+			subgroup_id = self.next;
+		}
+
+		self.create(Subgroup {
+			group_id,
+			subgroup_id,
 			priority,
 		})
 	}
 
-	pub fn create(&mut self, group: Group) -> Result<GroupWriter, ServeError> {
-		let group = GroupInfo {
+	pub fn create(&mut self, subgroup: Subgroup) -> Result<SubgroupWriter, ServeError> {
+		let subgroup = SubgroupInfo {
 			track: self.info.clone(),
-			group_id: group.group_id,
-			priority: group.priority,
+			group_id: subgroup.group_id,
+			subgroup_id: subgroup.subgroup_id,
+			priority: subgroup.priority,
 		};
-		let (writer, reader) = group.produce();
+		let (writer, reader) = subgroup.produce();
 
 		let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
 
 		if let Some(latest) = &state.latest {
-			match writer.group_id.cmp(&latest.group_id) {
-				cmp::Ordering::Less => return Ok(writer), // dropped immediately, lul
-				cmp::Ordering::Equal => return Err(ServeError::Duplicate),
-				cmp::Ordering::Greater => state.latest = Some(reader),
+			// TODO: Check this logic again
+			if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Equal {
+				match writer.subgroup_id.cmp(&latest.subgroup_id) {
+					cmp::Ordering::Less => return Ok(writer), // dropped immediately, lul
+					cmp::Ordering::Equal => return Err(ServeError::Duplicate),
+					cmp::Ordering::Greater => state.latest = Some(reader),
+				}
+			} else if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Greater {
+				state.latest = Some(reader);
+			} else {
+				return Ok(writer); // drop here as well
 			}
 		} else {
 			state.latest = Some(reader);
 		}
 
-		self.next = state.latest.as_ref().unwrap().group_id + 1;
+		self.next = state.latest.as_ref().unwrap().subgroup_id + 1;
+		self.next_group_id = state.latest.as_ref().unwrap().group_id + 1;
+		self.last_group_id = state.latest.as_ref().unwrap().group_id;
 		state.epoch += 1;
 
 		Ok(writer)
@@ -116,7 +145,7 @@ impl GroupsWriter {
 	}
 }
 
-impl Deref for GroupsWriter {
+impl Deref for SubgroupsWriter {
 	type Target = Track;
 
 	fn deref(&self) -> &Self::Target {
@@ -125,14 +154,14 @@ impl Deref for GroupsWriter {
 }
 
 #[derive(Clone)]
-pub struct GroupsReader {
+pub struct SubgroupsReader {
 	pub info: Arc<Track>,
-	state: State<GroupsState>,
+	state: State<SubgroupsState>,
 	epoch: u64,
 }
 
-impl GroupsReader {
-	fn new(state: State<GroupsState>, track: Arc<Track>) -> Self {
+impl SubgroupsReader {
+	fn new(state: State<SubgroupsState>, track: Arc<Track>) -> Self {
 		Self {
 			info: track,
 			state,
@@ -140,7 +169,7 @@ impl GroupsReader {
 		}
 	}
 
-	pub async fn next(&mut self) -> Result<Option<GroupReader>, ServeError> {
+	pub async fn next(&mut self) -> Result<Option<SubgroupReader>, ServeError> {
 		loop {
 			{
 				let state = self.state.lock();
@@ -167,7 +196,7 @@ impl GroupsReader {
 	}
 }
 
-impl Deref for GroupsReader {
+impl Deref for SubgroupsReader {
 	type Target = Track;
 
 	fn deref(&self) -> &Self::Target {
@@ -177,10 +206,14 @@ impl Deref for GroupsReader {
 
 /// Parameters that can be specified by the user
 #[derive(Debug, Clone, PartialEq)]
-pub struct Group {
+pub struct Subgroup {
 	// The sequence number of the group within the track.
 	// NOTE: These may be received out of order or with gaps.
 	pub group_id: u64,
+
+	// The sequence number of the subgroup within the group.
+	// NOTE: These may be received out of order or with gaps.
+	pub subgroup_id: u64,
 
 	// The priority of the group within the track.
 	pub priority: u8,
@@ -188,30 +221,34 @@ pub struct Group {
 
 /// Static information about the group
 #[derive(Debug, Clone, PartialEq)]
-pub struct GroupInfo {
+pub struct SubgroupInfo {
 	pub track: Arc<Track>,
 
 	// The sequence number of the group within the track.
 	// NOTE: These may be received out of order or with gaps.
 	pub group_id: u64,
 
+	// The sequence number of the subgroup within the group.
+	// NOTE: These may be received out of order or with gaps.
+	pub subgroup_id: u64,
+
 	// The priority of the group within the track.
 	pub priority: u8,
 }
 
-impl GroupInfo {
-	pub fn produce(self) -> (GroupWriter, GroupReader) {
+impl SubgroupInfo {
+	pub fn produce(self) -> (SubgroupWriter, SubgroupReader) {
 		let (writer, reader) = State::default().split();
 		let info = Arc::new(self);
 
-		let writer = GroupWriter::new(writer, info.clone());
-		let reader = GroupReader::new(reader, info);
+		let writer = SubgroupWriter::new(writer, info.clone());
+		let reader = SubgroupReader::new(reader, info);
 
 		(writer, reader)
 	}
 }
 
-impl Deref for GroupInfo {
+impl Deref for SubgroupInfo {
 	type Target = Track;
 
 	fn deref(&self) -> &Self::Target {
@@ -219,15 +256,15 @@ impl Deref for GroupInfo {
 	}
 }
 
-struct GroupState {
+struct SubgroupState {
 	// The data that has been received thus far.
-	objects: Vec<GroupObjectReader>,
+	objects: Vec<SubgroupObjectReader>,
 
 	// Set when the writer or all readers are dropped.
 	closed: Result<(), ServeError>,
 }
 
-impl Default for GroupState {
+impl Default for SubgroupState {
 	fn default() -> Self {
 		Self {
 			objects: Vec::new(),
@@ -237,19 +274,19 @@ impl Default for GroupState {
 }
 
 /// Used to write data to a stream and notify readers.
-pub struct GroupWriter {
+pub struct SubgroupWriter {
 	// Mutable stream state.
-	state: State<GroupState>,
+	state: State<SubgroupState>,
 
 	// Immutable stream state.
-	pub info: Arc<GroupInfo>,
+	pub info: Arc<SubgroupInfo>,
 
 	// The next object sequence number to use.
 	next: u64,
 }
 
-impl GroupWriter {
-	fn new(state: State<GroupState>, group: Arc<GroupInfo>) -> Self {
+impl SubgroupWriter {
+	fn new(state: State<SubgroupState>, group: Arc<SubgroupInfo>) -> Self {
 		Self {
 			state,
 			info: group,
@@ -267,8 +304,8 @@ impl GroupWriter {
 	/// Write an object over multiple writes.
 	///
 	/// BAD STUFF will happen if the size is wrong; this is an advanced feature.
-	pub fn create(&mut self, size: usize) -> Result<GroupObjectWriter, ServeError> {
-		let (writer, reader) = GroupObject {
+	pub fn create(&mut self, size: usize) -> Result<SubgroupObjectWriter, ServeError> {
+		let (writer, reader) = SubgroupObject {
 			group: self.info.clone(),
 			object_id: self.next,
 			status: ObjectStatus::Object,
@@ -303,8 +340,8 @@ impl GroupWriter {
 	}
 }
 
-impl Deref for GroupWriter {
-	type Target = GroupInfo;
+impl Deref for SubgroupWriter {
+	type Target = SubgroupInfo;
 
 	fn deref(&self) -> &Self::Target {
 		&self.info
@@ -313,23 +350,23 @@ impl Deref for GroupWriter {
 
 /// Notified when a stream has new data available.
 #[derive(Clone)]
-pub struct GroupReader {
+pub struct SubgroupReader {
 	// Modify the stream state.
-	state: State<GroupState>,
+	state: State<SubgroupState>,
 
 	// Immutable stream state.
-	pub info: Arc<GroupInfo>,
+	pub info: Arc<SubgroupInfo>,
 
 	// The number of chunks that we've read.
 	// NOTE: Cloned readers inherit this index, but then run in parallel.
 	index: usize,
 }
 
-impl GroupReader {
-	fn new(state: State<GroupState>, group: Arc<GroupInfo>) -> Self {
+impl SubgroupReader {
+	fn new(state: State<SubgroupState>, subgroup: Arc<SubgroupInfo>) -> Self {
 		Self {
 			state,
-			info: group,
+			info: subgroup,
 			index: 0,
 		}
 	}
@@ -347,7 +384,7 @@ impl GroupReader {
 		}
 	}
 
-	pub async fn next(&mut self) -> Result<Option<GroupObjectReader>, ServeError> {
+	pub async fn next(&mut self) -> Result<Option<SubgroupObjectReader>, ServeError> {
 		loop {
 			{
 				let state = self.state.lock();
@@ -381,8 +418,8 @@ impl GroupReader {
 	}
 }
 
-impl Deref for GroupReader {
-	type Target = GroupInfo;
+impl Deref for SubgroupReader {
+	type Target = SubgroupInfo;
 
 	fn deref(&self) -> &Self::Target {
 		&self.info
@@ -391,8 +428,8 @@ impl Deref for GroupReader {
 
 /// A subset of Object, since we use the group's info.
 #[derive(Clone, PartialEq, Debug)]
-pub struct GroupObject {
-	pub group: Arc<GroupInfo>,
+pub struct SubgroupObject {
+	pub group: Arc<SubgroupInfo>,
 
 	pub object_id: u64,
 
@@ -403,27 +440,27 @@ pub struct GroupObject {
 	pub status: ObjectStatus,
 }
 
-impl GroupObject {
-	pub fn produce(self) -> (GroupObjectWriter, GroupObjectReader) {
+impl SubgroupObject {
+	pub fn produce(self) -> (SubgroupObjectWriter, SubgroupObjectReader) {
 		let (writer, reader) = State::default().split();
 		let info = Arc::new(self);
 
-		let writer = GroupObjectWriter::new(writer, info.clone());
-		let reader = GroupObjectReader::new(reader, info);
+		let writer = SubgroupObjectWriter::new(writer, info.clone());
+		let reader = SubgroupObjectReader::new(reader, info);
 
 		(writer, reader)
 	}
 }
 
-impl Deref for GroupObject {
-	type Target = GroupInfo;
+impl Deref for SubgroupObject {
+	type Target = SubgroupInfo;
 
 	fn deref(&self) -> &Self::Target {
 		&self.group
 	}
 }
 
-struct GroupObjectState {
+struct SubgroupObjectState {
 	// The data that has been received thus far.
 	chunks: Vec<Bytes>,
 
@@ -431,7 +468,7 @@ struct GroupObjectState {
 	closed: Result<(), ServeError>,
 }
 
-impl Default for GroupObjectState {
+impl Default for SubgroupObjectState {
 	fn default() -> Self {
 		Self {
 			chunks: Vec::new(),
@@ -441,20 +478,20 @@ impl Default for GroupObjectState {
 }
 
 /// Used to write data to a segment and notify readers.
-pub struct GroupObjectWriter {
+pub struct SubgroupObjectWriter {
 	// Mutable segment state.
-	state: State<GroupObjectState>,
+	state: State<SubgroupObjectState>,
 
 	// Immutable segment state.
-	pub info: Arc<GroupObject>,
+	pub info: Arc<SubgroupObject>,
 
 	// The amount of promised data that has yet to be written.
 	remain: usize,
 }
 
-impl GroupObjectWriter {
+impl SubgroupObjectWriter {
 	/// Create a new segment with the given info.
-	fn new(state: State<GroupObjectState>, object: Arc<GroupObject>) -> Self {
+	fn new(state: State<SubgroupObjectState>, object: Arc<SubgroupObject>) -> Self {
 		Self {
 			state,
 			remain: object.size,
@@ -491,7 +528,7 @@ impl GroupObjectWriter {
 	}
 }
 
-impl Drop for GroupObjectWriter {
+impl Drop for SubgroupObjectWriter {
 	fn drop(&mut self) {
 		if self.remain == 0 {
 			return;
@@ -503,8 +540,8 @@ impl Drop for GroupObjectWriter {
 	}
 }
 
-impl Deref for GroupObjectWriter {
-	type Target = GroupObject;
+impl Deref for SubgroupObjectWriter {
+	type Target = SubgroupObject;
 
 	fn deref(&self) -> &Self::Target {
 		&self.info
@@ -513,20 +550,20 @@ impl Deref for GroupObjectWriter {
 
 /// Notified when a segment has new data available.
 #[derive(Clone)]
-pub struct GroupObjectReader {
+pub struct SubgroupObjectReader {
 	// Modify the segment state.
-	state: State<GroupObjectState>,
+	state: State<SubgroupObjectState>,
 
 	// Immutable segment state.
-	pub info: Arc<GroupObject>,
+	pub info: Arc<SubgroupObject>,
 
 	// The number of chunks that we've read.
 	// NOTE: Cloned readers inherit this index, but then run in parallel.
 	index: usize,
 }
 
-impl GroupObjectReader {
-	fn new(state: State<GroupObjectState>, object: Arc<GroupObject>) -> Self {
+impl SubgroupObjectReader {
+	fn new(state: State<SubgroupObjectState>, object: Arc<SubgroupObject>) -> Self {
 		Self {
 			state,
 			info: object,
@@ -566,8 +603,8 @@ impl GroupObjectReader {
 	}
 }
 
-impl Deref for GroupObjectReader {
-	type Target = GroupObject;
+impl Deref for SubgroupObjectReader {
+	type Target = SubgroupObject;
 
 	fn deref(&self) -> &Self::Target {
 		&self.info

@@ -4,9 +4,9 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 pub enum ObjectStatus {
 	Object = 0x0,
 	ObjectDoesNotExist = 0x1,
-	GroupDoesNotExist = 0x2,
 	EndOfGroup = 0x3,
 	EndOfTrack = 0x4,
+	EndOfSubgroup = 0x5,
 }
 
 impl Decode for ObjectStatus {
@@ -14,9 +14,9 @@ impl Decode for ObjectStatus {
 		match u64::decode(r)? {
 			0x0 => Ok(Self::Object),
 			0x1 => Ok(Self::ObjectDoesNotExist),
-			0x2 => Ok(Self::GroupDoesNotExist),
 			0x3 => Ok(Self::EndOfGroup),
 			0x4 => Ok(Self::EndOfTrack),
+			0x5 => Ok(Self::EndOfSubgroup),
 			_ => Err(DecodeError::InvalidObjectStatus),
 		}
 	}
@@ -27,9 +27,9 @@ impl Encode for ObjectStatus {
 		match self {
 			Self::Object => (0x0_u64).encode(w),
 			Self::ObjectDoesNotExist => (0x1_u64).encode(w),
-			Self::GroupDoesNotExist => (0x2_u64).encode(w),
 			Self::EndOfGroup => (0x3_u64).encode(w),
 			Self::EndOfTrack => (0x4_u64).encode(w),
+			Self::EndOfSubgroup => (0x5_u64).encode(w),
 		}
 	}
 }

@@ -1,10 +1,11 @@
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, Tuple};
 
-/// Sent by the subscriber to reject an Announce.
+/// Subscribe Namespace Error
+/// https://www.ietf.org/archive/id/draft-ietf-moq-transport-06.html#name-subscribe_namespace_error
 #[derive(Clone, Debug)]
-pub struct AnnounceError {
+pub struct SubscribeNamespaceError {
 	// Echo back the namespace that was reset
-	pub namespace: Tuple,
+	pub namespace_prefix: Tuple,
 
 	// An error code.
 	pub code: u64,
@@ -13,23 +14,23 @@ pub struct AnnounceError {
 	pub reason: String,
 }
 
-impl Decode for AnnounceError {
+impl Decode for SubscribeNamespaceError {
 	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-		let namespace = Tuple::decode(r)?;
+		let namespace_prefix = Tuple::decode(r)?;
 		let code = u64::decode(r)?;
 		let reason = String::decode(r)?;
 
 		Ok(Self {
-			namespace,
+			namespace_prefix,
 			code,
 			reason,
 		})
 	}
 }
 
-impl Encode for AnnounceError {
+impl Encode for SubscribeNamespaceError {
 	fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-		self.namespace.encode(w)?;
+		self.namespace_prefix.encode(w)?;
 		self.code.encode(w)?;
 		self.reason.encode(w)?;
 

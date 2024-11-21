@@ -2,7 +2,7 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use crate::data::ObjectStatus;
 
 #[derive(Clone, Debug)]
-pub struct GroupHeader {
+pub struct SubgroupHeader {
 	// The subscribe ID.
 	pub subscribe_id: u64,
 
@@ -12,26 +12,31 @@ pub struct GroupHeader {
 	// The group sequence number
 	pub group_id: u64,
 
+	// The subgroup sequence number
+	pub subgroup_id: u64,
+
 	// Publisher priority, where **smaller** values are sent first.
 	pub publisher_priority: u8,
 }
 
-impl Decode for GroupHeader {
+impl Decode for SubgroupHeader {
 	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
 		Ok(Self {
 			subscribe_id: u64::decode(r)?,
 			track_alias: u64::decode(r)?,
 			group_id: u64::decode(r)?,
+			subgroup_id: u64::decode(r)?,
 			publisher_priority: u8::decode(r)?,
 		})
 	}
 }
 
-impl Encode for GroupHeader {
+impl Encode for SubgroupHeader {
 	fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
 		self.subscribe_id.encode(w)?;
 		self.track_alias.encode(w)?;
 		self.group_id.encode(w)?;
+		self.subgroup_id.encode(w)?;
 		self.publisher_priority.encode(w)?;
 
 		Ok(())
@@ -39,13 +44,13 @@ impl Encode for GroupHeader {
 }
 
 #[derive(Clone, Debug)]
-pub struct GroupObject {
+pub struct SubgroupObject {
 	pub object_id: u64,
 	pub size: usize,
 	pub status: ObjectStatus,
 }
 
-impl Decode for GroupObject {
+impl Decode for SubgroupObject {
 	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
 		let object_id = u64::decode(r)?;
 		let size = usize::decode(r)?;
@@ -66,7 +71,7 @@ impl Decode for GroupObject {
 	}
 }
 
-impl Encode for GroupObject {
+impl Encode for SubgroupObject {
 	fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
 		self.object_id.encode(w)?;
 		self.size.encode(w)?;

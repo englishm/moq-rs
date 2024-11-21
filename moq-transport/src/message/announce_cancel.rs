@@ -1,10 +1,10 @@
-use crate::coding::{Decode, DecodeError, Encode, EncodeError};
+use crate::coding::{Decode, DecodeError, Encode, EncodeError, Tuple};
 
 /// Sent by the subscriber to reject an Announce after ANNOUNCE_OK
 #[derive(Clone, Debug)]
 pub struct AnnounceCancel {
 	// Echo back the namespace that was reset
-	pub namespace: String,
+	pub namespace: Tuple,
 	// An error code.
 	//pub code: u64,
 
@@ -14,7 +14,7 @@ pub struct AnnounceCancel {
 
 impl Decode for AnnounceCancel {
 	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-		let namespace = String::decode(r)?;
+		let namespace = Tuple::decode(r)?;
 		//let code = u64::decode(r)?;
 		//let reason = String::decode(r)?;
 

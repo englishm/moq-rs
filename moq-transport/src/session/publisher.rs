@@ -6,6 +6,7 @@ use std::{
 use futures::{stream::FuturesUnordered, StreamExt};
 
 use crate::{
+	coding::Tuple,
 	message::{self, Message},
 	serve::{ServeError, TracksReader},
 	setup,
@@ -20,7 +21,7 @@ use super::{Announce, AnnounceRecv, Session, SessionError, Subscribed, Subscribe
 pub struct Publisher {
 	webtransport: web_transport::Session,
 
-	announces: Arc<Mutex<HashMap<String, AnnounceRecv>>>,
+	announces: Arc<Mutex<HashMap<Tuple, AnnounceRecv>>>,
 	subscribed: Arc<Mutex<HashMap<u64, SubscribedRecv>>>,
 	unknown: Queue<Subscribed>,
 
@@ -162,6 +163,11 @@ impl Publisher {
 			message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg),
 			message::Subscriber::SubscribeUpdate(msg) => self.recv_subscribe_update(msg),
 			message::Subscriber::TrackStatusRequest(msg) => self.recv_track_status_request(msg),
+			// TODO: Implement namespace messages.
+			message::Subscriber::SubscribeNamespace(_msg) => unimplemented!(),
+			message::Subscriber::SubscribeNamespaceOk(_msg) => unimplemented!(),
+			message::Subscriber::SubscribeNamespaceError(_msg) => unimplemented!(),
+			message::Subscriber::UnsubscribeNamespace(_msg) => unimplemented!(),
 		};
 
 		if let Err(err) = res {
@@ -259,7 +265,7 @@ impl Publisher {
 		match &msg {
 			message::Publisher::SubscribeDone(msg) => self.drop_subscribe(msg.id),
 			message::Publisher::SubscribeError(msg) => self.drop_subscribe(msg.id),
-			message::Publisher::Unannounce(msg) => self.drop_announce(msg.namespace.as_str()),
+			message::Publisher::Unannounce(msg) => self.drop_announce(&msg.namespace),
 			_ => (),
 		};
 
@@ -270,7 +276,7 @@ impl Publisher {
 		self.subscribed.lock().unwrap().remove(&id);
 	}
 
-	fn drop_announce(&mut self, namespace: &str) {
+	fn drop_announce(&mut self, namespace: &Tuple) {
 		self.announces.lock().unwrap().remove(namespace);
 	}
 

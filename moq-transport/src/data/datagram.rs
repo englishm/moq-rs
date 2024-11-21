@@ -21,6 +21,9 @@ pub struct Datagram {
 	// Object status
 	pub object_status: ObjectStatus,
 
+	// The payload length.
+	pub payload_len: u64,
+
 	// The payload.
 	pub payload: bytes::Bytes,
 }
@@ -33,6 +36,10 @@ impl Decode for Datagram {
 		let object_id = u64::decode(r)?;
 		let publisher_priority = u8::decode(r)?;
 		let object_status = ObjectStatus::decode(r)?;
+		let payload_len = u64::decode(r)?;
+		if payload_len != r.remaining() as u64 {
+			return Err(DecodeError::InvalidLength(payload_len as usize, r.remaining()));
+		}
 		let payload = r.copy_to_bytes(r.remaining());
 
 		Ok(Self {
@@ -42,6 +49,7 @@ impl Decode for Datagram {
 			object_id,
 			publisher_priority,
 			object_status,
+			payload_len,
 			payload,
 		})
 	}
@@ -55,6 +63,7 @@ impl Encode for Datagram {
 		self.object_id.encode(w)?;
 		self.publisher_priority.encode(w)?;
 		self.object_status.encode(w)?;
+		self.payload_len.encode(w)?;
 		Self::encode_remaining(w, self.payload.len())?;
 		w.put_slice(&self.payload);
 

@@ -1,6 +1,7 @@
 use std::ops;
 
 use crate::{
+	coding::Tuple,
 	data,
 	message::{self, FilterType, GroupOrder, SubscribeLocation, SubscribePair},
 	serve::{self, ServeError, TrackWriter, TrackWriterMode},
@@ -12,7 +13,7 @@ use super::Subscriber;
 
 #[derive(Debug, Clone)]
 pub struct SubscribeInfo {
-	pub namespace: String,
+	pub namespace: Tuple,
 	pub name: String,
 }
 
@@ -161,41 +162,22 @@ impl SubscribeRecv {
 		Ok(stream)
 	}
 
-	pub fn group(&mut self, header: data::GroupHeader) -> Result<serve::GroupWriter, ServeError> {
+	pub fn subgroup(&mut self, header: data::SubgroupHeader) -> Result<serve::SubgroupWriter, ServeError> {
 		let writer = self.writer.take().ok_or(ServeError::Done)?;
 
-		let mut groups = match writer {
+		let mut subgroups = match writer {
 			TrackWriterMode::Track(init) => init.groups()?,
-			TrackWriterMode::Groups(groups) => groups,
+			TrackWriterMode::Subgroups(subgroups) => subgroups,
 			_ => return Err(ServeError::Mode),
 		};
 
-		let writer = groups.create(serve::Group {
+		let writer = subgroups.create(serve::Subgroup {
 			group_id: header.group_id,
+			subgroup_id: header.subgroup_id,
 			priority: header.publisher_priority,
 		})?;
 
-		self.writer = Some(groups.into());
-
-		Ok(writer)
-	}
-
-	pub fn object(&mut self, header: data::ObjectHeader) -> Result<serve::ObjectWriter, ServeError> {
-		let writer = self.writer.take().ok_or(ServeError::Done)?;
-
-		let mut objects = match writer {
-			TrackWriterMode::Track(init) => init.objects()?,
-			TrackWriterMode::Objects(objects) => objects,
-			_ => return Err(ServeError::Mode),
-		};
-
-		let writer = objects.create(serve::Object {
-			group_id: header.group_id,
-			object_id: header.object_id,
-			priority: header.publisher_priority,
-		})?;
-
-		self.writer = Some(objects.into());
+		self.writer = Some(subgroups.into());
 
 		Ok(writer)
 	}

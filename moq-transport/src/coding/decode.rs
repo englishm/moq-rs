@@ -22,6 +22,9 @@ pub enum DecodeError {
 	#[error("fill buffer")]
 	More(usize),
 
+	#[error("invalid payload length {0} got {1}")]
+	InvalidLength(usize, usize),
+
 	#[error("invalid string")]
 	InvalidString(#[from] FromUtf8Error),
 

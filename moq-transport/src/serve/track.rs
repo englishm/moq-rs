@@ -15,21 +15,22 @@
 use crate::watch::State;
 
 use super::{
-	Datagrams, DatagramsReader, DatagramsWriter, Groups, GroupsReader, GroupsWriter, Objects, ObjectsReader,
-	ObjectsWriter, ServeError, Stream, StreamReader, StreamWriter,
+	Datagrams, DatagramsReader, DatagramsWriter, ObjectsWriter, ServeError, Stream, StreamReader, StreamWriter,
+	Subgroups, SubgroupsReader, SubgroupsWriter,
 };
+use crate::coding::Tuple;
 use paste::paste;
 use std::{ops::Deref, sync::Arc};
 
 /// Static information about a track.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Track {
-	pub namespace: String,
+	pub namespace: Tuple,
 	pub name: String,
 }
 
 impl Track {
-	pub fn new(namespace: String, name: String) -> Self {
+	pub fn new(namespace: Tuple, name: String) -> Self {
 		Self { namespace, name }
 	}
 
@@ -82,19 +83,9 @@ impl TrackWriter {
 		Ok(writer)
 	}
 
-	pub fn groups(self) -> Result<GroupsWriter, ServeError> {
-		let (writer, reader) = Groups {
-			track: self.info.clone(),
-		}
-		.produce();
-
-		let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
-		state.mode = Some(reader.into());
-		Ok(writer)
-	}
-
-	pub fn objects(self) -> Result<ObjectsWriter, ServeError> {
-		let (writer, reader) = Objects {
+	// TODO: rework this whole interface for clarity?
+	pub fn groups(self) -> Result<SubgroupsWriter, ServeError> {
+		let (writer, reader) = Subgroups {
 			track: self.info.clone(),
 		}
 		.produce();
@@ -220,7 +211,7 @@ macro_rules! track_readers {
 	}
 }
 
-track_readers!(Stream, Groups, Objects, Datagrams,);
+track_readers!(Stream, Subgroups, Datagrams,);
 
 macro_rules! track_writers {
     {$($name:ident,)*} => {
@@ -246,4 +237,4 @@ macro_rules! track_writers {
 	}
 }
 
-track_writers!(Track, Stream, Groups, Objects, Datagrams,);
+track_writers!(Track, Stream, Subgroups, Objects, Datagrams,);

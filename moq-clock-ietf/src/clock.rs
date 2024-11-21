@@ -1,17 +1,17 @@
 use anyhow::Context;
 use moq_transport::serve::{
-	DatagramsReader, Group, GroupWriter, GroupsReader, GroupsWriter, ObjectsReader, StreamReader, TrackReader,
+	DatagramsReader, StreamReader, Subgroup, SubgroupWriter, SubgroupsReader, SubgroupsWriter, TrackReader,
 	TrackReaderMode,
 };
 
 use chrono::prelude::*;
 
 pub struct Publisher {
-	track: GroupsWriter,
+	track: SubgroupsWriter,
 }
 
 impl Publisher {
-	pub fn new(track: GroupsWriter) -> Self {
+	pub fn new(track: SubgroupsWriter) -> Self {
 		Self { track }
 	}
 
@@ -25,8 +25,9 @@ impl Publisher {
 		loop {
 			let segment = self
 				.track
-				.create(Group {
+				.create(Subgroup {
 					group_id: sequence as u64,
+					subgroup_id: 0,
 					priority: 0,
 				})
 				.context("failed to create minute segment")?;
@@ -49,7 +50,7 @@ impl Publisher {
 		}
 	}
 
-	async fn send_segment(mut segment: GroupWriter, mut now: DateTime<Utc>) -> anyhow::Result<()> {
+	async fn send_segment(mut segment: SubgroupWriter, mut now: DateTime<Utc>) -> anyhow::Result<()> {
 		// Everything but the second.
 		let base = now.format("%Y-%m-%d %H:%M:").to_string();
 
@@ -89,15 +90,14 @@ impl Subscriber {
 	pub async fn run(self) -> anyhow::Result<()> {
 		match self.track.mode().await.context("failed to get mode")? {
 			TrackReaderMode::Stream(stream) => Self::recv_stream(stream).await,
-			TrackReaderMode::Groups(groups) => Self::recv_groups(groups).await,
-			TrackReaderMode::Objects(objects) => Self::recv_objects(objects).await,
+			TrackReaderMode::Subgroups(subgroups) => Self::recv_subgroups(subgroups).await,
 			TrackReaderMode::Datagrams(datagrams) => Self::recv_datagrams(datagrams).await,
 		}
 	}
 
 	async fn recv_stream(mut track: StreamReader) -> anyhow::Result<()> {
-		while let Some(mut group) = track.next().await? {
-			while let Some(object) = group.read_next().await? {
+		while let Some(mut subgroup) = track.next().await? {
+			while let Some(object) = subgroup.read_next().await? {
 				let str = String::from_utf8_lossy(&object);
 				println!("{}", str);
 			}
@@ -106,30 +106,20 @@ impl Subscriber {
 		Ok(())
 	}
 
-	async fn recv_groups(mut groups: GroupsReader) -> anyhow::Result<()> {
-		while let Some(mut group) = groups.next().await? {
-			let base = group
+	async fn recv_subgroups(mut subgroups: SubgroupsReader) -> anyhow::Result<()> {
+		while let Some(mut subgroup) = subgroups.next().await? {
+			let base = subgroup
 				.read_next()
 				.await
 				.context("failed to get first object")?
-				.context("empty group")?;
+				.context("empty subgroup")?;
 
 			let base = String::from_utf8_lossy(&base);
 
-			while let Some(object) = group.read_next().await? {
+			while let Some(object) = subgroup.read_next().await? {
 				let str = String::from_utf8_lossy(&object);
 				println!("{}{}", base, str);
 			}
-		}
-
-		Ok(())
-	}
-
-	async fn recv_objects(mut objects: ObjectsReader) -> anyhow::Result<()> {
-		while let Some(mut object) = objects.next().await? {
-			let payload = object.read_all().await?;
-			let str = String::from_utf8_lossy(&payload);
-			println!("{}", str);
 		}
 
 		Ok(())

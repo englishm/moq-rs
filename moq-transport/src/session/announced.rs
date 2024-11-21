@@ -1,5 +1,6 @@
 use std::ops;
 
+use crate::coding::Tuple;
 use crate::watch::State;
 use crate::{message, serve::ServeError};
 
@@ -21,7 +22,7 @@ pub struct Announced {
 }
 
 impl Announced {
-	pub(super) fn new(session: Subscriber, namespace: String) -> (Announced, AnnouncedRecv) {
+	pub(super) fn new(session: Subscriber, namespace: Tuple) -> (Announced, AnnouncedRecv) {
 		let info = AnnounceInfo { namespace };
 
 		let (send, recv) = State::default().split();

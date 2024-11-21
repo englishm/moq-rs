@@ -3,13 +3,14 @@ use bytes::BytesMut;
 use std::collections::{HashSet, VecDeque};
 
 use moq_transport::serve::{
-	GroupReader, GroupWriter, GroupsReader, GroupsWriter, ServeError, TrackReader, TrackReaderMode, TrackWriter,
+	ServeError, SubgroupReader, SubgroupWriter, SubgroupsReader, SubgroupsWriter, TrackReader, TrackReaderMode,
+	TrackWriter,
 };
 
 pub struct ListingWriter {
 	track: Option<TrackWriter>,
-	groups: Option<GroupsWriter>,
-	group: Option<GroupWriter>,
+	subgroups: Option<SubgroupsWriter>,
+	subgroup: Option<SubgroupWriter>,
 
 	current: HashSet<String>,
 }
@@ -18,8 +19,8 @@ impl ListingWriter {
 	pub fn new(track: TrackWriter) -> Self {
 		Self {
 			track: Some(track),
-			groups: None,
-			group: None,
+			subgroups: None,
+			subgroup: None,
 			current: HashSet::new(),
 		}
 	}
@@ -29,14 +30,14 @@ impl ListingWriter {
 			return Err(ServeError::Duplicate);
 		}
 
-		match self.group {
-			// Create a delta if the current group is small enough.
-			Some(ref mut group) if self.current.len() < 2 * group.len() => {
+		match self.subgroup {
+			// Create a delta if the current subgroup is small enough.
+			Some(ref mut subgroup) if self.current.len() < 2 * subgroup.len() => {
 				let msg = format!("+{}", name);
-				group.write(msg.into())?;
+				subgroup.write(msg.into())?;
 			}
 			// Otherwise create a snapshot with every element.
-			_ => self.group = Some(self.snapshot()?),
+			_ => self.subgroup = Some(self.snapshot()?),
 		}
 
 		Ok(())
@@ -47,27 +48,27 @@ impl ListingWriter {
 			return Err(ServeError::NotFound);
 		}
 
-		match self.group {
-			// Create a delta if the current group is small enough.
-			Some(ref mut group) if self.current.len() < 2 * group.len() => {
+		match self.subgroup {
+			// Create a delta if the current subgroup is small enough.
+			Some(ref mut subgroup) if self.current.len() < 2 * subgroup.len() => {
 				let msg = format!("-{}", name);
-				group.write(msg.into())?;
+				subgroup.write(msg.into())?;
 			}
 			// Otherwise create a snapshot with every element.
-			_ => self.group = Some(self.snapshot()?),
+			_ => self.subgroup = Some(self.snapshot()?),
 		}
 
 		Ok(())
 	}
 
-	fn snapshot(&mut self) -> Result<GroupWriter, ServeError> {
-		let mut groups = match self.groups.take() {
-			Some(groups) => groups,
+	fn snapshot(&mut self) -> Result<SubgroupWriter, ServeError> {
+		let mut subgroups = match self.subgroups.take() {
+			Some(subgroups) => subgroups,
 			None => self.track.take().unwrap().groups()?,
 		};
 
 		let priority = 127;
-		let mut group = groups.append(priority)?;
+		let mut subgroup = subgroups.append(priority)?;
 
 		let mut msg = BytesMut::new();
 		for name in &self.current {
@@ -75,10 +76,10 @@ impl ListingWriter {
 			msg.extend_from_slice(b"\n");
 		}
 
-		group.write(msg.freeze())?;
-		self.groups = Some(groups);
+		subgroup.write(msg.freeze())?;
+		self.subgroups = Some(subgroups);
 
-		Ok(group)
+		Ok(subgroup)
 	}
 
 	pub fn len(&self) -> usize {
@@ -100,9 +101,9 @@ pub enum ListingDelta {
 pub struct ListingReader {
 	track: TrackReader,
 
-	// Keep track of the current group.
-	groups: Option<GroupsReader>,
-	group: Option<GroupReader>,
+	// Keep track of the current subgroup.
+	subgroups: Option<SubgroupsReader>,
+	subgroup: Option<SubgroupReader>,
 
 	// The current state of the listing.
 	current: HashSet<String>,
@@ -115,8 +116,8 @@ impl ListingReader {
 	pub fn new(track: TrackReader) -> Self {
 		Self {
 			track,
-			groups: None,
-			group: None,
+			subgroups: None,
+			subgroup: None,
 
 			current: HashSet::new(),
 			deltas: VecDeque::new(),
@@ -128,42 +129,42 @@ impl ListingReader {
 			return Ok(Some(delta));
 		}
 
-		if self.groups.is_none() {
-			self.groups = match self.track.mode().await? {
-				TrackReaderMode::Groups(groups) => Some(groups),
-				_ => anyhow::bail!("expected groups mode"),
+		if self.subgroups.is_none() {
+			self.subgroups = match self.track.mode().await? {
+				TrackReaderMode::Subgroups(subgroups) => Some(subgroups),
+				_ => anyhow::bail!("expected subgroups mode"),
 			};
 		};
 
-		if self.group.is_none() {
-			self.group = Some(self.groups.as_mut().unwrap().next().await?.context("empty track")?);
+		if self.subgroup.is_none() {
+			self.subgroup = Some(self.subgroups.as_mut().unwrap().next().await?.context("empty track")?);
 		}
 
-		let mut group_done = false;
-		let mut groups_done = false;
+		let mut subgroup_done = false;
+		let mut subgroups_done = false;
 
 		loop {
 			tokio::select! {
-				next = self.groups.as_mut().unwrap().next(), if !groups_done => {
+				next = self.subgroups.as_mut().unwrap().next(), if !subgroups_done => {
 					if let Some(next) = next? {
-						self.group = Some(next);
-						group_done = false;
+						self.subgroup = Some(next);
+						subgroup_done = false;
 					} else {
-						groups_done = true;
+						subgroups_done = true;
 					}
 				},
-				object = self.group.as_mut().unwrap().read_next(), if !group_done => {
+				object = self.subgroup.as_mut().unwrap().read_next(), if !subgroup_done => {
 					let payload = match object? {
 						Some(object) => object,
 						None => {
-							group_done = true;
+							subgroup_done = true;
 							continue;
 						}
 					};
 
 					if payload.is_empty() {
 						anyhow::bail!("empty payload");
-					} else if self.group.as_mut().unwrap().pos() == 1 {
+					} else if self.subgroup.as_mut().unwrap().pos() == 1 {
 						// This is a full snapshot, not a delta
 						let set = HashSet::from_iter(payload.split(|&b| b == b'\n').map(|s| String::from_utf8_lossy(s).to_string()));
 
