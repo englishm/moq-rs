@@ -8,7 +8,13 @@ cd "$(dirname "$0")/.."
 if [ ! -f dev/bbb.fmp4 ]; then
 	if [ ! -f dev/bbb.mp4 ]; then
 		echo "Downloading ya boye Big Buck Bunny..."
-		wget http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4 -O dev/bbb.mp4
+		wget https://download.blender.org/demo/movies/BBB/bbb_sunflower_1080p_60fps_normal.mp4.zip -O dev/compress.zip
+		unzip dev/compress.zip -d dev
+		rm dev/compress.zip
+		echo "Formatting the audio..."
+		ffmpeg -i dev/bbb_sunflower_1080p_60fps_normal.mp4 -map 0:v -map 0:a:0 -c:v copy -c:a aac -b:a 125k -ar 44100 dev/bbb.mp4
+		rm dev/bbb_sunflower_1080p_60fps_normal.mp4
+		
 	fi
 
 	echo "Converting to a (properly) fragmented MP4..."
@@ -75,7 +81,7 @@ if [ "$#" -gt 0 ]; then
 fi
 
 #Common param
-videofps=25
+videofps=60
 gopduration=1
 
 # Extract resolution and bitrate from the first argument and calculate other related parameters
@@ -189,13 +195,14 @@ codec_v2="-c:v:2 $COMMON_X264_PARAMS \
 #overlayed at top left corner and video resolution-bitrate overlayed at bottom right corner
 
 ffmpeg -hide_banner -v quiet \
-	-stream_loop -1 -re \
-	-i "$INPUT" -r ${videofps} \
-	-filter_complex "[0:v]split=3[v0][v1][v2]; ${filter_complex}" \
-	-map "[v0final]" -map "[v1final]" -map "[v2final]" -map 0:a \
-	$codec_v0 \
-	$codec_v1 \
-	$codec_v2 \
-	-c:a copy \
-	-f mp4 -movflags cmaf+separate_moof+delay_moov+skip_trailer+frag_every_frame \
-	- | cargo run --bin moq-pub -- --name "$NAME" "$URL" $additional_args
+  -stream_loop -1 -re \
+  -r "$videofps" \
+  -i "$INPUT" \
+  -filter_complex "[0:v]split=3[v0][v1][v2]; ${filter_complex}" \
+  -map "[v0final]" -map "[v1final]" -map "[v2final]" -map 0:a \
+  $codec_v0 \
+  $codec_v1 \
+  $codec_v2 \
+  -c:a copy \
+  -f mp4 -movflags cmaf+separate_moof+delay_moov+skip_trailer+frag_every_frame \
+  - | cargo run --bin moq-pub -- --name "$NAME" "$URL" $additional_args
