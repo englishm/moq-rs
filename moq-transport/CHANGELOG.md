@@ -6,6 +6,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/englishm/moq-rs/compare/moq-transport-v0.8.1...moq-transport-v0.9.0) - 2025-01-16
+
+### Fixed
+
+- fixes to moq-transport, relay compiles
+
+### Other
+
+- Fix some clippy warnings
+- MaxSubscribeId message coding
+- Update SETUP message tests
+- Add length of params to SubscribeOk
+- Add length field to client and server setup
+- Add lengths to control messages
+- Renumber stream type ids
+- Add payload length to datagrams
+- Change type of namespace to tuple
+- Add Tuple type
+- first stab at subscribe namespace messages
+- Add new error type
+- Remove object/stream (gone in -06)
+- remove comment
+- more fixes
+- rename groups to subgroups
+- Bump target draft version to 06
+
 ## [0.8.1](https://github.com/englishm/moq-rs/compare/moq-transport-v0.8.0...moq-transport-v0.8.1) - 2024-11-14
 
 ### Other

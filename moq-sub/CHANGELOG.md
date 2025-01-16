@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/englishm/moq-rs/compare/moq-sub-v0.3.1...moq-sub-v0.3.2) - 2025-01-16
+
+### Other
+
+- Change type of namespace to tuple
+- s/group/subgroup/g
+
 ## [0.3.1](https://github.com/englishm/moq-rs/compare/moq-sub-v0.3.0...moq-sub-v0.3.1) - 2024-10-31
 
 ### Other

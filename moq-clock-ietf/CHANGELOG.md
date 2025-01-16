@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/englishm/moq-rs/compare/moq-clock-ietf-v0.6.2...moq-clock-ietf-v0.6.3) - 2025-01-16
+
+### Other
+
+- Change type of namespace to tuple
+- Remove object/stream (gone in -06)
+- cargo fmt
+- s/group/subgroup/g
+
 ## [0.6.2](https://github.com/englishm/moq-rs/compare/moq-clock-ietf-v0.6.1...moq-clock-ietf-v0.6.2) - 2024-10-31
 
 ### Other
