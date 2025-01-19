@@ -86,6 +86,9 @@ impl Subscriber {
             message::Publisher::SubscribeError(msg) => self.recv_subscribe_error(msg),
             message::Publisher::SubscribeDone(msg) => self.recv_subscribe_done(msg),
             message::Publisher::TrackStatus(msg) => self.recv_track_status(msg),
+            // TODO: Implement fetch messages
+            message::Publisher::FetchOk(_msg) => todo!(),
+            message::Publisher::FetchError(_msg) => todo!(),
         };
 
         if let Err(SessionError::Serve(err)) = res {

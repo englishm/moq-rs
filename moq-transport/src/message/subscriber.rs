@@ -56,4 +56,6 @@ subscriber_msgs! {
     SubscribeNamespaceOk,
     SubscribeNamespaceError,
     UnsubscribeNamespace,
+    Fetch,
+    FetchCancel,
 }

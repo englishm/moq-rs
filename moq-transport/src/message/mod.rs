@@ -36,6 +36,10 @@ mod announce;
 mod announce_cancel;
 mod announce_error;
 mod announce_ok;
+mod fetch;
+mod fetch_cancel;
+mod fetch_error;
+mod fetch_ok;
 mod filter_type;
 mod go_away;
 mod group_order;
@@ -60,6 +64,10 @@ pub use announce::*;
 pub use announce_cancel::*;
 pub use announce_error::*;
 pub use announce_ok::*;
+pub use fetch::*;
+pub use fetch_cancel::*;
+pub use fetch_error::*;
+pub use fetch_ok::*;
 pub use filter_type::*;
 pub use go_away::*;
 pub use group_order::*;
@@ -209,6 +217,12 @@ message_types! {
     SubscribeNamespaceOk = 0x12,
     SubscribeNamespaceError = 0x13,
     UnsubscribeNamespace = 0x14,
+
+    // FETCH family, sent by subscriber
+    Fetch = 0x16,
+    FetchCancel = 0x17,
+    FetchOk = 0x18,
+    FetchError = 0x19,
 }
 
 /// Track Status Codes

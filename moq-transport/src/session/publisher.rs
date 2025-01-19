@@ -183,6 +183,9 @@ impl Publisher {
             message::Subscriber::SubscribeNamespaceOk(_msg) => unimplemented!(),
             message::Subscriber::SubscribeNamespaceError(_msg) => unimplemented!(),
             message::Subscriber::UnsubscribeNamespace(_msg) => unimplemented!(),
+            // TODO: Implement fetch messages
+            message::Subscriber::Fetch(_msg) => todo!(),
+            message::Subscriber::FetchCancel(_msg) => todo!(),
         };
 
         if let Err(err) = res {
