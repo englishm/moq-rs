@@ -15,7 +15,7 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    Announce, AnnounceRecv, Session, SessionError, Subscribed, SubscribedRecv, TrackStatusRequested,
+    Announce, AnnounceRecv, Fetched, FetchedRecv, Session, SessionError, Subscribed, SubscribedRecv, TrackStatusRequested
 };
 
 // TODO remove Clone.
@@ -25,7 +25,9 @@ pub struct Publisher {
 
     announces: Arc<Mutex<HashMap<Tuple, AnnounceRecv>>>,
     subscribed: Arc<Mutex<HashMap<u64, SubscribedRecv>>>,
+    fetched: Arc<Mutex<HashMap<u64, FetchedRecv>>>,
     unknown: Queue<Subscribed>,
+    unknown_fetch: Queue<Fetched>,
 
     outgoing: Queue<Message>,
 }
@@ -36,7 +38,9 @@ impl Publisher {
             webtransport,
             announces: Default::default(),
             subscribed: Default::default(),
+            fetched: Default::default(),
             unknown: Default::default(),
+            unknown_fetch: Default::default(),
             outgoing,
         }
     }
@@ -223,7 +227,7 @@ impl Publisher {
         let namespace = msg.track_namespace.clone();
 
         let fetch = {
-            let mut fetches = self.subscribed.lock().unwrap();
+            let mut fetches = self.fetched.lock().unwrap();
 
             let entry = match fetches.entry(msg.id) {
                 hash_map::Entry::Occupied(_) => return Err(SessionError::Duplicate),
@@ -240,7 +244,7 @@ impl Publisher {
             return announce.recv_fetch(fetch).map_err(Into::into);
         }
 
-        if let Err(err) = self.unknown.push(fetch) {
+        if let Err(err) = self.unknown_fetch.push(fetch) {
             err.close(ServeError::NotFound)?;
         }
 

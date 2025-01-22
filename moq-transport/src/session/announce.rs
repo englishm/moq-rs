@@ -4,7 +4,7 @@ use crate::coding::Tuple;
 use crate::watch::State;
 use crate::{message, serve::ServeError};
 
-use super::{Publisher, Subscribed, TrackStatusRequested};
+use super::{Fetched, Publisher, Subscribed, TrackStatusRequested};
 
 #[derive(Debug, Clone)]
 pub struct AnnounceInfo {
@@ -13,6 +13,7 @@ pub struct AnnounceInfo {
 
 struct AnnounceState {
     subscribers: VecDeque<Subscribed>,
+    fetchers: VecDeque<Fetched>,
     track_statuses_requested: VecDeque<TrackStatusRequested>,
     ok: bool,
     closed: Result<(), ServeError>,
@@ -22,6 +23,7 @@ impl Default for AnnounceState {
     fn default() -> Self {
         Self {
             subscribers: Default::default(),
+            fetchers: Default::default(),
             track_statuses_requested: Default::default(),
             ok: false,
             closed: Ok(()),
@@ -188,6 +190,12 @@ impl AnnounceRecv {
         let mut state = state.into_mut().ok_or(ServeError::Done)?;
         state.closed = Err(err);
 
+        Ok(())
+    }
+
+    pub fn recv_fetch(&mut self, fetcher: Fetched) -> Result<(), ServeError> {
+        let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
+        state.fetchers.push_back(fetcher);
         Ok(())
     }
 
