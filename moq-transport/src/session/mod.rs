@@ -1,6 +1,8 @@
 mod announce;
 mod announced;
 mod error;
+mod fetch;
+mod fetched;
 mod publisher;
 mod reader;
 mod subscribe;
@@ -12,6 +14,8 @@ mod writer;
 pub use announce::*;
 pub use announced::*;
 pub use error::*;
+pub use fetch::*;
+pub use fetched::*;
 pub use publisher::*;
 pub use subscribe::*;
 pub use subscribed::*;

@@ -8,7 +8,7 @@ members = [
 	"moq-clock-ietf",
 	"moq-dir",
 	"moq-native-ietf",
-	"moq-catalog",
+	"moq-catalog", "moq-fetch",
 ]
 resolver = "2"
 

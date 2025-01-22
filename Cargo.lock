@@ -1117,6 +1117,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "moq-fetch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "log",
+ "moq-native-ietf",
+ "moq-transport",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "moq-native-ietf"
 version = "0.5.3"
 dependencies = [

@@ -14,7 +14,7 @@ use crate::{
 
 use crate::watch::Queue;
 
-use super::{Announced, AnnouncedRecv, Reader, Session, SessionError, Subscribe, SubscribeRecv};
+use super::{Announced, AnnouncedRecv, Fetch, FetchRecv, Reader, Session, SessionError, Subscribe, SubscribeRecv};
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -24,6 +24,8 @@ pub struct Subscriber {
 
     subscribes: Arc<Mutex<HashMap<u64, SubscribeRecv>>>,
     subscribe_next: Arc<atomic::AtomicU64>,
+
+    fetches: Arc<Mutex<HashMap<u64, FetchRecv>>>,
 
     outgoing: Queue<Message>,
 }
@@ -35,6 +37,7 @@ impl Subscriber {
             announced_queue: Default::default(),
             subscribes: Default::default(),
             subscribe_next: Default::default(),
+            fetches: Default::default(),
             outgoing,
         }
     }
@@ -62,6 +65,14 @@ impl Subscriber {
         self.subscribes.lock().unwrap().insert(id, recv);
 
         send.closed().await
+    }
+
+    pub async fn fetch(&mut self, track: serve::TrackWriter) -> Result<(), ServeError> {
+        let id = self.subscribe_next.fetch_add(1, atomic::Ordering::Relaxed);
+        let (fetch, recv) = Fetch::new(self.clone(), id, track);
+        self.fetches.lock().unwrap().insert(id, recv);
+
+        fetch.closed().await
     }
 
     pub(super) fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {

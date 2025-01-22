@@ -184,7 +184,7 @@ impl Publisher {
             message::Subscriber::SubscribeNamespaceError(_msg) => unimplemented!(),
             message::Subscriber::UnsubscribeNamespace(_msg) => unimplemented!(),
             // TODO: Implement fetch messages
-            message::Subscriber::Fetch(_msg) => todo!(),
+            message::Subscriber::Fetch(msg) => self.recv_fetch(msg),
             message::Subscriber::FetchCancel(_msg) => todo!(),
         };
 
@@ -214,6 +214,34 @@ impl Publisher {
     fn recv_announce_cancel(&mut self, msg: message::AnnounceCancel) -> Result<(), SessionError> {
         if let Some(announce) = self.announces.lock().unwrap().remove(&msg.namespace) {
             announce.recv_error(ServeError::Cancel)?;
+        }
+
+        Ok(())
+    }
+
+    fn recv_fetch(&mut self, msg: message::Fetch) -> Result<(), SessionError> {
+        let namespace = msg.track_namespace.clone();
+
+        let fetch = {
+            let mut fetches = self.subscribed.lock().unwrap();
+
+            let entry = match fetches.entry(msg.id) {
+                hash_map::Entry::Occupied(_) => return Err(SessionError::Duplicate),
+                hash_map::Entry::Vacant(entry) => entry,
+            };
+
+            let (send, recv) = Fetched::new(self.clone(), msg);
+            entry.insert(recv);
+
+            send
+        };
+
+        if let Some(announce) = self.announces.lock().unwrap().get_mut(&namespace) {
+            return announce.recv_fetch(fetch).map_err(Into::into);
+        }
+
+        if let Err(err) = self.unknown.push(fetch) {
+            err.close(ServeError::NotFound)?;
         }
 
         Ok(())
