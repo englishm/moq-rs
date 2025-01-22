@@ -1,5 +1,7 @@
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, Params};
 
+use super::GroupOrder;
+
 /// A publisher sends a FETCH_OK control message in response to successful fetches.
 #[derive(Clone, Debug)]
 pub struct FetchOk {
@@ -7,7 +9,7 @@ pub struct FetchOk {
     pub id: u64,
 
     /// Order groups will be delivered in
-    pub group_order: u8,
+    pub group_order: GroupOrder,
 
     /// True if all objects have been published on this track
     pub end_of_track: u8,
@@ -25,8 +27,9 @@ impl Decode for FetchOk {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
 
-        let group_order = u8::decode(r)?;
+        let group_order = GroupOrder::decode(r)?;
 
+        // TODO: create enum and reject invalid values
         let end_of_track = u8::decode(r)?;
 
         let largest_group_id = u64::decode(r)?;

@@ -29,6 +29,7 @@ pub struct FetchInfo {
     pub name: String,
 }
 
+#[must_use = "unsubscribe on drop"]
 pub struct Fetch {
     state: State<FetchState>,
     subscriber: Subscriber,
@@ -37,7 +38,6 @@ pub struct Fetch {
     pub info: FetchInfo,
 }
 
-#[must_use = "unsubscribe on drop"]
 impl Fetch {
     pub(super) fn new(
         mut subscriber: Subscriber,

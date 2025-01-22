@@ -78,8 +78,10 @@ impl Publisher {
         };
 
         let mut subscribe_tasks = FuturesUnordered::new();
+        let mut fetch_tasks = FuturesUnordered::new();
         let mut status_tasks = FuturesUnordered::new();
         let mut subscribe_done = false;
+        let mut fetch_done = false;
         let mut status_done = false;
 
         loop {
@@ -97,6 +99,22 @@ impl Publisher {
                             });
                         },
                         None => subscribe_done = true,
+                    }
+
+                },
+                res = announce.fetched(), if !fetch_done => {
+                    match res? {
+                        Some(fetched) => {
+                            let tracks = tracks.clone();
+
+                            fetch_tasks.push(async move {
+                                let info = fetched.info.clone();
+                                if let Err(err) = Self::serve_fetch(fetched, tracks).await {
+                                    log::warn!("failed serving subscribe: {:?}, error: {}", info, err)
+                                }
+                            });
+                        },
+                        None => fetch_done = true,
                     }
 
                 },
@@ -130,6 +148,19 @@ impl Publisher {
             subscribe.serve(track).await?;
         } else {
             subscribe.close(ServeError::NotFound)?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn serve_fetch(
+        fetch: Fetched,
+        mut tracks: TracksReader,
+    ) -> Result<(), SessionError> {
+        if let Some(track) = tracks.subscribe(&fetch.name) {
+            fetch.serve(track).await?;
+        } else {
+            fetch.close(ServeError::NotFound)?;
         }
 
         Ok(())
