@@ -36,6 +36,9 @@ impl Drop for AnnounceState {
         for subscriber in self.subscribers.drain(..) {
             subscriber.close(ServeError::NotFound).ok();
         }
+        for fetcher in self.fetchers.drain(..) {
+            fetcher.close(ServeError::NotFound).ok();
+        }
     }
 }
 
@@ -80,6 +83,24 @@ impl Announce {
                 match state.modified() {
                     Some(notified) => notified,
                     None => return Ok(()),
+                }
+            }
+            .await;
+        }
+    }
+
+    pub async fn fetched(&self) -> Result<Option<Fetched>, ServeError> {
+        loop {
+            {
+                let state = self.state.lock();
+                if !state.fetchers.is_empty() {
+                    return Ok(state.into_mut().and_then(|mut state| state.fetchers.pop_front()));
+                }
+
+                state.closed.clone()?;
+                match state.modified() {
+                    Some(notified) => notified,
+                    None => return Ok(None),
                 }
             }
             .await;
