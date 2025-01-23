@@ -2,8 +2,9 @@ use std::{
     collections::{hash_map, HashMap},
     sync::{Arc, Mutex},
 };
-
 use futures::{stream::FuturesUnordered, StreamExt};
+use futures::executor::block_on;
+
 
 use crate::{
     coding::Tuple,
@@ -26,8 +27,8 @@ pub struct Publisher {
     announces: Arc<Mutex<HashMap<Tuple, AnnounceRecv>>>,
     subscribed: Arc<Mutex<HashMap<u64, SubscribedRecv>>>,
     fetched: Arc<Mutex<HashMap<u64, FetchedRecv>>>,
-    unknown: Arc<Mutex<Queue<Subscribed>>>,
-    unknown_fetch: Arc<Mutex<Queue<Fetched>>>,
+    unknown: Arc<tokio::sync::Mutex<Queue<Subscribed>>>,
+    unknown_fetch: Arc<tokio::sync::Mutex<Queue<Fetched>>>,
 
     outgoing: Queue<Message>,
 }
@@ -63,6 +64,7 @@ impl Publisher {
     /// Announce a namespace and serve tracks using the provided [serve::TracksReader].
     /// The caller uses [serve::TracksWriter] for static tracks and [serve::TracksRequest] for dynamic tracks.
     pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+        log::debug!("announcing namespace: {:?}", tracks.namespace.clone());
         let announce = match self
             .announces
             .lock()
@@ -202,24 +204,12 @@ impl Publisher {
 
     // Returns subscriptions that do not map to an active announce.
     pub async fn subscribed(&self) -> Option<Subscribed> {
-        match self.unknown.lock() {
-            Ok(mut queue) => queue.pop().await,
-            Err(err) => {
-                log::error!("Failed to lock unknown: {}", err);
-                None
-            }
-        }
+        self.unknown.lock().await.pop().await
     }
 
     // Returns fetches that do not map to an active announce.
     pub async fn fetched(&self) -> Option<Fetched> {
-        match self.unknown_fetch.lock() {
-            Ok(mut queue) => queue.pop().await,
-            Err(err) => {
-                log::error!("Failed to lock unknown_fetch: {}", err);
-                None
-            }
-        }
+        self.unknown_fetch.lock().await.pop().await
     }
 
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
@@ -301,19 +291,15 @@ impl Publisher {
 
 
         log::debug!("no announce for this fetch");
-        match self.unknown_fetch.lock() {
-            Ok(mut unknown_fetch) => {
-                if let Err(err) = unknown_fetch.push(fetch) {
+        block_on(async {
+                if let Err(err) = self.unknown_fetch.lock().await.push(fetch) {
                     log::debug!("close with not found");
                     err.close(ServeError::NotFound)?;
                 }
-            },
-            Err(err) => {
-                log::error!("Failed to lock unknown_fetch: {}", err)
-            }
+                Result::<(), SessionError>::Ok(())
         }
+        )
 
-        Ok(())
     }
 
     fn recv_subscribe(&mut self, msg: message::Subscribe) -> Result<(), SessionError> {
@@ -341,19 +327,15 @@ impl Publisher {
 
         // Otherwise, put it in the unknown queue.
         // TODO Have some way to detect if the application is not reading from the unknown queue.
-        match self.unknown.lock() {
-            Ok(mut unknown) => {
-                if let Err(err) = unknown.push(subscribe) {
-                    // Default to closing with a not found error I guess.
-                    err.close(ServeError::NotFound)?;
-                }
-            },
-            Err(err) => {
-                log::error!("error locking unknown: {}", err);
-            }
-        }
 
-        Ok(())
+        block_on(async {
+            if let Err(err) = self.unknown.lock().await.push(subscribe) {
+                // Default to closing with a not found error I guess.
+                err.close(ServeError::NotFound)?;
+            }
+            Result::<(), SessionError>::Ok(())
+        })
+
     }
 
     fn recv_subscribe_update(
