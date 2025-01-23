@@ -26,8 +26,8 @@ pub struct Publisher {
     announces: Arc<Mutex<HashMap<Tuple, AnnounceRecv>>>,
     subscribed: Arc<Mutex<HashMap<u64, SubscribedRecv>>>,
     fetched: Arc<Mutex<HashMap<u64, FetchedRecv>>>,
-    unknown: Queue<Subscribed>,
-    unknown_fetch: Queue<Fetched>,
+    unknown: Arc<Mutex<Queue<Subscribed>>>,
+    unknown_fetch: Arc<Mutex<Queue<Fetched>>>,
 
     outgoing: Queue<Message>,
 }
@@ -134,6 +134,7 @@ impl Publisher {
                     }
                 },
                 Some(res) = subscribe_tasks.next() => res,
+                Some(res) = fetch_tasks.next() => res,
                 Some(res) = status_tasks.next() => res,
                 else => return Ok(())
             }
@@ -200,8 +201,25 @@ impl Publisher {
     }
 
     // Returns subscriptions that do not map to an active announce.
-    pub async fn subscribed(&mut self) -> Option<Subscribed> {
-        self.unknown.pop().await
+    pub async fn subscribed(&self) -> Option<Subscribed> {
+        match self.unknown.lock() {
+            Ok(mut queue) => queue.pop().await,
+            Err(err) => {
+                log::error!("Failed to lock unknown: {}", err);
+                None
+            }
+        }
+    }
+
+    // Returns fetches that do not map to an active announce.
+    pub async fn fetched(&self) -> Option<Fetched> {
+        match self.unknown_fetch.lock() {
+            Ok(mut queue) => queue.pop().await,
+            Err(err) => {
+                log::error!("Failed to lock unknown_fetch: {}", err);
+                None
+            }
+        }
     }
 
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
@@ -256,6 +274,7 @@ impl Publisher {
 
     fn recv_fetch(&mut self, msg: message::Fetch) -> Result<(), SessionError> {
         let namespace = msg.track_namespace.clone();
+        log::debug!("received fetch for namespace: {:?}", namespace);
 
         let fetch = {
             let mut fetches = self.fetched.lock().unwrap();
@@ -271,12 +290,27 @@ impl Publisher {
             send
         };
 
+        let announces = self.announces.lock().unwrap();
+        log::debug!("announces: {:?}", announces.keys());
+        drop(announces);
+
         if let Some(announce) = self.announces.lock().unwrap().get_mut(&namespace) {
+            log::debug!("routing fetch to an announce");
             return announce.recv_fetch(fetch).map_err(Into::into);
         }
 
-        if let Err(err) = self.unknown_fetch.push(fetch) {
-            err.close(ServeError::NotFound)?;
+
+        log::debug!("no announce for this fetch");
+        match self.unknown_fetch.lock() {
+            Ok(mut unknown_fetch) => {
+                if let Err(err) = unknown_fetch.push(fetch) {
+                    log::debug!("close with not found");
+                    err.close(ServeError::NotFound)?;
+                }
+            },
+            Err(err) => {
+                log::error!("Failed to lock unknown_fetch: {}", err)
+            }
         }
 
         Ok(())
@@ -307,9 +341,16 @@ impl Publisher {
 
         // Otherwise, put it in the unknown queue.
         // TODO Have some way to detect if the application is not reading from the unknown queue.
-        if let Err(err) = self.unknown.push(subscribe) {
-            // Default to closing with a not found error I guess.
-            err.close(ServeError::NotFound)?;
+        match self.unknown.lock() {
+            Ok(mut unknown) => {
+                if let Err(err) = unknown.push(subscribe) {
+                    // Default to closing with a not found error I guess.
+                    err.close(ServeError::NotFound)?;
+                }
+            },
+            Err(err) => {
+                log::error!("error locking unknown: {}", err);
+            }
         }
 
         Ok(())

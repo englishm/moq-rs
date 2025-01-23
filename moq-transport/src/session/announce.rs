@@ -90,6 +90,7 @@ impl Announce {
     }
 
     pub async fn fetched(&self) -> Result<Option<Fetched>, ServeError> {
+        log::debug!("waiting for fetched");
         loop {
             {
                 let state = self.state.lock();
