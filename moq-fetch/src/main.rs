@@ -64,8 +64,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Fetch a specific range of data from a known track
     //
-    let track_namespace = moq_transport::coding::Tuple::from_utf8_path("demo/bbb");
-    let track_name = "1.mp4".to_string();
+    let track_namespace = moq_transport::coding::Tuple::from_utf8_path("bbb");
+    let track_name = ".catalog".to_string();
 
     let fetch_msg = moq_transport::message::Fetch {
         id: 1,
