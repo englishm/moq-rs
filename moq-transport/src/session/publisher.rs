@@ -15,7 +15,8 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    Announce, AnnounceRecv, Fetched, FetchedRecv, Session, SessionError, Subscribed, SubscribedRecv, TrackStatusRequested
+    Announce, AnnounceRecv, Fetched, FetchedRecv, Session, SessionError, Subscribed,
+    SubscribedRecv, TrackStatusRequested,
 };
 
 // TODO remove Clone.
@@ -153,10 +154,7 @@ impl Publisher {
         Ok(())
     }
 
-    pub async fn serve_fetch(
-        fetch: Fetched,
-        mut tracks: TracksReader,
-    ) -> Result<(), SessionError> {
+    pub async fn serve_fetch(fetch: Fetched, mut tracks: TracksReader) -> Result<(), SessionError> {
         if let Some(track) = tracks.subscribe(&fetch.name) {
             fetch.serve(track).await?;
         } else {

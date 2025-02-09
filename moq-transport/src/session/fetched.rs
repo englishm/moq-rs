@@ -1,8 +1,12 @@
 use std::ops;
 
-use crate::{message, serve::{self, ServeError, TrackReaderMode}, watch::State};
+use crate::{
+    data::{self, FetchHeader}, message,
+    serve::{self, ServeError, TrackReaderMode},
+    watch::State,
+};
 
-use super::{FetchInfo, Publisher, SessionError};
+use super::{FetchInfo, Publisher, SessionError, Writer};
 
 struct FetchedState {
     // TODO: do we need to track max group id or other state here?
@@ -63,11 +67,12 @@ impl Fetched {
     }
 
     async fn serve_inner(&mut self, track: serve::TrackReader) -> Result<(), SessionError> {
-
         log::debug!("Serving fetch (inner)");
 
         // TODO: properly handle tracks with no objects yet
-        let latest = track.latest().ok_or(ServeError::Cancel)?;
+        // TODO: ensure a track actually knows where latest is
+        //let latest = track.latest().ok_or(ServeError::Cancel)?;
+        let latest = (1, 0u64); // Note: Current bbb.fmp4 has mostly 60 frame GoPs at 24fps?
 
         log::debug!("Serving fetch (inner) - latest: {latest:?}");
 
@@ -102,13 +107,42 @@ impl Fetched {
         todo!();
     }
 
-    async fn serve_subgroups(&mut self, mut _track: serve::SubgroupsReader) -> Result<(), SessionError> {
-        let mut _stream = self.publisher.open_uni().await?;
+    async fn serve_subgroups(
+        &mut self,
+        mut track: serve::SubgroupsReader,
+    ) -> Result<(), SessionError> {
+        log::debug!("Serving fetch (serve_subgroups)");
+        let mut stream = self.publisher.open_uni().await?;
+        stream.set_priority(self.msg.subscriber_priority as i32);
 
-        todo!();
+        let mut writer = Writer::new(stream);
+
+        // TODO: Implement Fetch header encode/decode
+        let header: data::Header = FetchHeader{
+            subscribe_id: self.msg.id,
+            publisher_priority: 0, // TODO remove hack
+            track_alias: 0, // TODO remove hack
+        }.into();
+        writer.encode(&header).await?;
+
+
+        while let Some(mut object) = track.next().await? {
+            log::debug!("sending object from group {}", object.group_id);
+            while let Some(chunk) = object.read_next().await? {
+                log::debug!("sending payload: {:?}", &chunk);
+                writer.write(&chunk).await?;
+            }
+            log::debug!("sent group done");
+        }
+        log::debug!("Serving fetch (serve_subgroups) - wrote data");
+
+        Ok(())
     }
 
-    async fn serve_datagrams(&mut self, mut _track: serve::DatagramsReader) -> Result<(), SessionError> {
+    async fn serve_datagrams(
+        &mut self,
+        mut _track: serve::DatagramsReader,
+    ) -> Result<(), SessionError> {
         let mut _stream = self.publisher.open_uni().await?;
 
         todo!();

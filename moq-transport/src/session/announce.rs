@@ -94,7 +94,9 @@ impl Announce {
             {
                 let state = self.state.lock();
                 if !state.fetchers.is_empty() {
-                    return Ok(state.into_mut().and_then(|mut state| state.fetchers.pop_front()));
+                    return Ok(state
+                        .into_mut()
+                        .and_then(|mut state| state.fetchers.pop_front()));
                 }
 
                 state.closed.clone()?;

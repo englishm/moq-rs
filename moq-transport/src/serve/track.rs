@@ -138,6 +138,7 @@ impl TrackReader {
     }
 
     pub async fn mode(&self) -> Result<TrackReaderMode, ServeError> {
+        log::debug!("TrackReader::mode");
         loop {
             {
                 let state = self.state.lock();

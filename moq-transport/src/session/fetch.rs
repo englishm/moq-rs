@@ -3,10 +3,10 @@ use std::ops;
 use super::Subscriber;
 use crate::{
     coding::Tuple,
-    message,
-    message::GroupOrder,
-    serve::{ServeError, TrackWriter, TrackWriterMode},
-    watch::State
+    data::FetchHeader,
+    message::{self, GroupOrder},
+    serve::{ServeError, StreamWriter, TrackWriter, TrackWriterMode},
+    watch::State,
 };
 
 struct FetchState {
@@ -81,13 +81,16 @@ impl Fetch {
 
     pub async fn closed(&self) -> Result<(), ServeError> {
         loop {
-            let state = self.state.lock();
-            state.closed.clone()?;
+            {
+                let state = self.state.lock();
+                state.closed.clone()?;
 
-            match state.modified() {
-                Some(notify) => notify,
-                None => return Ok(()),
-            }.await;
+                match state.modified() {
+                    Some(notify) => notify,
+                    None => return Ok(()),
+                }
+            }
+            .await;
         }
     }
 }
@@ -110,4 +113,42 @@ impl ops::Deref for Fetch {
 pub(super) struct FetchRecv {
     state: State<FetchState>,
     writer: Option<TrackWriterMode>,
+}
+
+impl FetchRecv {
+    pub fn ok(&mut self) -> Result<(), ServeError> {
+        let state = self.state.lock();
+        if state.ok {
+            return Err(ServeError::Duplicate);
+        }
+
+        if let Some(mut state) = state.into_mut() {
+            state.ok = true;
+        }
+
+        Ok(())
+    }
+
+    pub fn stream(&mut self, header: FetchHeader) -> Result<StreamWriter, ServeError> {
+        // TODO: rework all this silliness
+        // (Fetches break a lot of assumptions in this code and doing this right is a lot of work)
+
+        let writer = self.writer.take().ok_or(ServeError::Done)?;
+
+        let stream = match writer {
+            TrackWriterMode::Track(init) => init.stream(0)?,
+            TrackWriterMode::Stream(stream) => stream,
+            _ => {
+                log::debug!("here: {}:{}", file!(), line!());
+                log::debug!("writer type: {}", std::any::type_name_of_val(&writer));
+                return Err(ServeError::Mode)
+            },
+        };
+
+        let writer = stream.clone();
+
+        self.writer = Some(stream.into());
+
+        Ok(writer)
+    }
 }

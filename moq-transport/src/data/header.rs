@@ -2,7 +2,7 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use paste::paste;
 use std::fmt;
 
-use super::{SubgroupHeader, TrackHeader};
+use super::{FetchHeader, SubgroupHeader, TrackHeader};
 
 // Use a macro to generate the message types rather than copy-paste.
 // This implements a decode/encode method that uses the specified type.
@@ -90,4 +90,5 @@ header_types! {
     //Datagram = 0x1,
     Track = 0x2,
     Subgroup = 0x4,
+    Fetch = 0x5,
 }

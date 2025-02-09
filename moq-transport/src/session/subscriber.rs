@@ -14,7 +14,10 @@ use crate::{
 
 use crate::watch::Queue;
 
-use super::{Announced, AnnouncedRecv, Fetch, FetchRecv, Reader, Session, SessionError, Subscribe, SubscribeRecv};
+use super::{
+    Announced, AnnouncedRecv, Fetch, FetchRecv, Reader, Session, SessionError, Subscribe,
+    SubscribeRecv,
+};
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -69,10 +72,10 @@ impl Subscriber {
 
     pub async fn fetch(&mut self, track: serve::TrackWriter) -> Result<(), ServeError> {
         let id = self.subscribe_next.fetch_add(1, atomic::Ordering::Relaxed);
-        let (fetch, recv) = Fetch::new(self.clone(), id, track);
+        let (send, recv) = Fetch::new(self.clone(), id, track);
         self.fetches.lock().unwrap().insert(id, recv);
 
-        fetch.closed().await
+        send.closed().await
     }
 
     pub(super) fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
@@ -98,7 +101,7 @@ impl Subscriber {
             message::Publisher::SubscribeDone(msg) => self.recv_subscribe_done(msg),
             message::Publisher::TrackStatus(msg) => self.recv_track_status(msg),
             // TODO: Implement fetch messages
-            message::Publisher::FetchOk(_msg) => todo!(),
+            message::Publisher::FetchOk(msg) => self.recv_fetch_ok(msg),
             message::Publisher::FetchError(_msg) => todo!(),
         };
 
@@ -146,6 +149,14 @@ impl Subscriber {
         Ok(())
     }
 
+    fn recv_fetch_ok(&mut self, msg: &message::FetchOk) -> Result<(), SessionError> {
+        if let Some(fetch) = self.fetches.lock().unwrap().get_mut(&msg.id) {
+            fetch.ok()?;
+        }
+
+        Ok(())
+    }
+
     fn recv_subscribe_error(&mut self, msg: &message::SubscribeError) -> Result<(), SessionError> {
         if let Some(subscribe) = self.subscribes.lock().unwrap().remove(&msg.id) {
             subscribe.error(ServeError::Closed(msg.code))?;
@@ -177,6 +188,7 @@ impl Subscriber {
         mut self,
         stream: web_transport::RecvStream,
     ) -> Result<(), SessionError> {
+        log::trace!("recv stream");
         let mut reader = Reader::new(stream);
         let header: data::Header = reader.decode().await?;
 
@@ -201,25 +213,45 @@ impl Subscriber {
     ) -> Result<(), SessionError> {
         let id = header.subscribe_id();
 
+        // TODO: real Fetch handling
+        // This just shortcircuits everything for fetch.
+
         // This is super silly, but I couldn't figure out a way to avoid the mutex guard across awaits.
         enum Writer {
             Track(serve::StreamWriter),
             Subgroup(serve::SubgroupWriter),
+            Stream(serve::StreamWriter),
         }
 
         let writer = {
-            let mut subscribes = self.subscribes.lock().unwrap();
-            let subscribe = subscribes.get_mut(&id).ok_or(ServeError::NotFound)?;
-
             match header {
-                data::Header::Track(track) => Writer::Track(subscribe.track(track)?),
-                data::Header::Subgroup(subgroup) => Writer::Subgroup(subscribe.subgroup(subgroup)?),
+                data::Header::Fetch(stream) => {
+                    let mut fetches = self.fetches.lock().unwrap();
+                    let fetch = fetches.get_mut(&id).ok_or(ServeError::NotFound)?;
+                    Writer::Stream(fetch.stream(stream)?)
+                }
+                header @ _ => {
+                    let mut subscribes = self.subscribes.lock().unwrap();
+                    let subscribe = subscribes.get_mut(&id).ok_or(ServeError::NotFound)?;
+
+                    match header {
+                        data::Header::Track(track) => Writer::Track(subscribe.track(track)?),
+                        data::Header::Subgroup(subgroup) => {
+                            Writer::Subgroup(subscribe.subgroup(subgroup)?)
+                        }
+                        _ => {
+                            log::debug!("here: {}:{}", file!(), line!());
+                            return Err(SessionError::Serve(ServeError::Mode))
+                        },
+                    }
+                }
             }
         };
 
         match writer {
             Writer::Track(track) => Self::recv_track(track, reader).await?,
             Writer::Subgroup(group) => Self::recv_subgroup(group, reader).await?,
+            Writer::Stream(stream) => Self::recv_fetch_stream(stream, reader).await?,
         };
 
         Ok(())
@@ -301,6 +333,32 @@ impl Subscriber {
             subscribe.datagram(datagram)?;
         }
 
+        Ok(())
+    }
+
+    async fn recv_fetch_stream(
+        mut stream: serve::StreamWriter,
+        mut reader: Reader,
+    ) -> Result<(), SessionError> {
+        log::trace!("received fetch stream: {:?}", stream.info);
+
+        while !reader.done().await? {
+            let chunk: data::FetchObject = reader.decode().await?;
+
+            // TODO: rework this to not abuse the old stream writer
+            let mut object = stream.create(chunk.group_id)?;
+
+            let mut remain = chunk.size;
+            while remain > 0 {
+                let chunk = reader
+                    .read_chunk(remain.try_into().unwrap())
+                    .await?
+                    .ok_or(SessionError::WrongSize)?;
+                log::trace!("received fetch payload: {:?}", chunk.len());
+                remain -= chunk.len() as u64;
+                object.write(chunk)?;
+            }
+        }
         Ok(())
     }
 }

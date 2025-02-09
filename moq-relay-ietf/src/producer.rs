@@ -108,5 +108,4 @@ impl Producer {
 
         Err(ServeError::NotFound.into())
     }
-
 }
