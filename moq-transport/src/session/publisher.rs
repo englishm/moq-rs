@@ -204,6 +204,10 @@ impl Publisher {
         self.unknown.pop().await
     }
 
+    pub async fn fetched(&mut self) -> Option<Fetched> {
+        self.unknown_fetch.pop().await
+    }
+
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
         let res = match msg {
             message::Subscriber::AnnounceOk(msg) => self.recv_announce_ok(msg),

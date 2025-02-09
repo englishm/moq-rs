@@ -53,6 +53,7 @@ impl Fetched {
     }
 
     pub async fn serve(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
+        log::debug!("Serving fetch request");
         let res = self.serve_inner(track).await;
         if let Err(err) = &res {
             self.close(err.clone().into())?;
@@ -63,8 +64,12 @@ impl Fetched {
 
     async fn serve_inner(&mut self, track: serve::TrackReader) -> Result<(), SessionError> {
 
+        log::debug!("Serving fetch (inner)");
+
         // TODO: properly handle tracks with no objects yet
         let latest = track.latest().ok_or(ServeError::Cancel)?;
+
+        log::debug!("Serving fetch (inner) - latest: {latest:?}");
 
         //TODO:
         // - determine if end of track
@@ -77,6 +82,8 @@ impl Fetched {
             largest_object_id: latest.1,
             params: self.msg.params.clone(),
         });
+
+        log::debug!("Serving fetch (inner) - sent ok");
 
         self.ok = true;
 

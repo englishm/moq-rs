@@ -138,6 +138,7 @@ impl Subscriber {
     }
 
     fn recv_subscribe_ok(&mut self, msg: &message::SubscribeOk) -> Result<(), SessionError> {
+        // TODO: extract latest group, latest object
         if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&msg.id) {
             subscribe.ok()?;
         }

@@ -128,6 +128,7 @@ pub(super) struct SubscribeRecv {
 
 impl SubscribeRecv {
     pub fn ok(&mut self) -> Result<(), ServeError> {
+        // TODO: set latest
         let state = self.state.lock();
         if state.ok {
             return Err(ServeError::Duplicate);
