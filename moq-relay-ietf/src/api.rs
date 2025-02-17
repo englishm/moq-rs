@@ -24,7 +24,9 @@ impl Api {
         &self,
         namespace: &str,
     ) -> Result<Option<moq_api::Origin>, moq_api::ApiError> {
-        self.client.get_origin(namespace).await
+        self.client
+            .get_origin(namespace, Some(self.origin.url.as_str()))
+            .await
     }
 }
 
