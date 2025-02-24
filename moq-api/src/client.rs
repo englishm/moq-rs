@@ -16,8 +16,16 @@ impl Client {
         Self { url, client }
     }
 
-    pub async fn get_origin(&self, namespace: &str) -> Result<Option<Origin>, ApiError> {
-        let url = self.url.join(&format!("origin/{namespace}"))?;
+    pub async fn get_origin(
+        &self,
+        namespace: &str,
+        requester: Option<&str>,
+    ) -> Result<Option<Origin>, ApiError> {
+        let mut url = self.url.join(&format!("origin/{namespace}"))?;
+        if let Some(requester) = requester {
+            url.query_pairs_mut().append_pair("requester", requester);
+        }
+
         let resp = self.client.get(url).send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
