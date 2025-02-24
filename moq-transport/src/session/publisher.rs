@@ -155,11 +155,17 @@ impl Publisher {
     }
 
     pub async fn serve_fetch(fetch: Fetched, mut tracks: TracksReader) -> Result<(), SessionError> {
-        if let Some(track) = tracks.subscribe(&fetch.name) {
-            fetch.serve(track).await?;
-        } else {
-            fetch.close(ServeError::NotFound)?;
-        }
+
+        // If our Tracks allowed random access, we could probably just do something like this:
+        // if let Some(track) = tracks.subscribe(&fetch.name) {
+        //     fetch.serve(track).await?;
+        // } else {
+        //     fetch.close(ServeError::NotFound)?;
+        // }
+
+        // For now, make every fetch return the same stub data by creating a new track to serve
+
+
 
         Ok(())
     }
