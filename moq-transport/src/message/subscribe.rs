@@ -113,14 +113,18 @@ impl Encode for Subscribe {
         if self.filter_type == FilterType::AbsoluteStart
             || self.filter_type == FilterType::AbsoluteRange
         {
-            if self.start.is_none() || self.end.is_none() {
-                return Err(EncodeError::MissingField);
-            }
             if let Some(start) = &self.start {
                 start.encode(w)?;
+            } else {
+                return Err(EncodeError::MissingField);
             }
+        }
+
+        if self.filter_type == FilterType::AbsoluteRange {
             if let Some(end) = &self.end {
                 end.encode(w)?;
+            } else {
+                return Err(EncodeError::MissingField);
             }
         }
 
