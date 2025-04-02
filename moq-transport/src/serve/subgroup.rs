@@ -310,7 +310,11 @@ impl SubgroupWriter {
     /// is invoked at the original publisher and the GroupIDs are sequential).
     ///
     /// BAD STUFF will happen if the size is wrong; this is an advanced feature.
-    pub fn create(&mut self, size: usize, id: Option<u64>) -> Result<SubgroupObjectWriter, ServeError> {
+    pub fn create(
+        &mut self,
+        size: usize,
+        id: Option<u64>,
+    ) -> Result<SubgroupObjectWriter, ServeError> {
         let (writer, reader) = SubgroupObject {
             group: self.info.clone(),
             object_id: id.unwrap_or(self.next),

@@ -59,12 +59,11 @@ pub struct Subscribed {
 
 impl Subscribed {
     pub(super) fn new(publisher: Publisher, msg: message::Subscribe) -> (Self, SubscribedRecv) {
-        let (send, recv) = State::new(
-            SubscribedState {
-                filter: SubscribeFilter::from(&msg),
-                ..Default::default()
-            }
-        ).split();
+        let (send, recv) = State::new(SubscribedState {
+            filter: SubscribeFilter::from(&msg),
+            ..Default::default()
+        })
+        .split();
 
         let info = SubscribeInfo {
             id: msg.id,
@@ -106,9 +105,9 @@ impl Subscribed {
             .lock_mut()
             .ok_or(ServeError::Cancel)?
             .max_group_id = match latest {
-                None => None,
-                Some(latest) => Some(latest.0),
-            };
+            None => None,
+            Some(latest) => Some(latest.0),
+        };
 
         self.publisher.send_message(message::SubscribeOk {
             id: self.info.id,
@@ -194,7 +193,10 @@ impl Drop for Subscribed {
 impl Subscribed {
     async fn serve_track(&mut self, mut track: serve::StreamReader) -> Result<(), SessionError> {
         let mut stream = self.publisher.open_uni().await?;
-        self.state.lock_mut().ok_or(ServeError::Done)?.increment_stream_count()?;
+        self.state
+            .lock_mut()
+            .ok_or(ServeError::Done)?
+            .increment_stream_count()?;
 
         // TODO figure out u32 vs u64 priority
         stream.set_priority(track.priority as i32);
@@ -313,8 +315,10 @@ impl Subscribed {
         }
 
         let mut stream = publisher.open_uni().await?;
-        state.lock_mut().ok_or(ServeError::Done)?.increment_stream_count()?;
-
+        state
+            .lock_mut()
+            .ok_or(ServeError::Done)?
+            .increment_stream_count()?;
 
         // TODO figure out u32 vs u64 priority
         stream.set_priority(subgroup.priority as i32);
@@ -405,21 +409,43 @@ impl SubscribedRecv {
             //    if the SUBSCRIBE_UPDATE violates either rule [...]
             use SubscribeFilter::*;
             match (&state.filter, &filter) {
-                (AbsoluteStart(start_old), AbsoluteStart(start_new))
-                    if start_old <= start_new => state.filter = filter,
+                (AbsoluteStart(start_old), AbsoluteStart(start_new)) if start_old <= start_new => {
+                    state.filter = filter
+                }
                 (AbsoluteStart(start_old), AbsoluteRange(start_new, end_group_new))
-                    if start_old <= start_new && start_new.group <= *end_group_new => state.filter = filter,
+                    if start_old <= start_new && start_new.group <= *end_group_new =>
+                {
+                    state.filter = filter
+                }
                 (AbsoluteStart(_), LatestObject) => state.filter = filter,
-                (AbsoluteRange(start_old, end_group_old), AbsoluteRange(start_new, end_group_new))
-                    if start_old <= start_new && start_new.group <= *end_group_new && end_group_new <= end_group_old => state.filter = filter,
+                (
+                    AbsoluteRange(start_old, end_group_old),
+                    AbsoluteRange(start_new, end_group_new),
+                ) if start_old <= start_new
+                    && start_new.group <= *end_group_new
+                    && end_group_new <= end_group_old =>
+                {
+                    state.filter = filter
+                }
                 (LatestObject, AbsoluteStart(start_new))
-                    if state.max_group_id.is_none() || start_new.group >= state.max_group_id.unwrap() => state.filter = filter,
+                    if state.max_group_id.is_none()
+                        || start_new.group >= state.max_group_id.unwrap() =>
+                {
+                    state.filter = filter
+                }
                 (LatestObject, AbsoluteRange(start_new, end_group_new))
-                    if (state.max_group_id.is_none() || start_new.group >= state.max_group_id.unwrap()) && start_new.group <= *end_group_new => state.filter = filter,
+                    if (state.max_group_id.is_none()
+                        || start_new.group >= state.max_group_id.unwrap())
+                        && start_new.group <= *end_group_new =>
+                {
+                    state.filter = filter
+                }
                 (LatestObject, LatestObject) => state.filter = filter,
                 _ => {
-                    return Err(ServeError::Internal("narrowing subscribe update".to_string()));
-                },
+                    return Err(ServeError::Internal(
+                        "narrowing subscribe update".to_string(),
+                    ));
+                }
             };
 
             if !msg.params.is_empty() {

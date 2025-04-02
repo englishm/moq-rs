@@ -254,10 +254,7 @@ impl Publisher {
         Ok(())
     }
 
-    fn recv_subscribe_update(
-        &mut self,
-        msg: message::SubscribeUpdate,
-    ) -> Result<(), SessionError> {
+    fn recv_subscribe_update(&mut self, msg: message::SubscribeUpdate) -> Result<(), SessionError> {
         if let Some(subscribed) = self.subscribed.lock().unwrap().get_mut(&msg.id) {
             subscribed.recv_subscribe_update(msg)?;
             Ok(())

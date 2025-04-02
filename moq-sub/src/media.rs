@@ -43,9 +43,12 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 
             let mut subscriber = self.subscriber.clone();
             tokio::task::spawn(async move {
-                subscriber.subscribe(track, SubscribeFilter::LatestObject).await.unwrap_or_else(|err| {
-                    warn!("failed to subscribe to init track: {err:?}");
-                });
+                subscriber
+                    .subscribe(track, SubscribeFilter::LatestObject)
+                    .await
+                    .unwrap_or_else(|err| {
+                        warn!("failed to subscribe to init track: {err:?}");
+                    });
             });
 
             let track = self
@@ -101,10 +104,12 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 
                 let mut subscriber = self.subscriber.clone();
                 tokio::task::spawn(async move {
-                    subscriber.subscribe(track, SubscribeFilter::LatestObject)
-                        .await.unwrap_or_else(|err| {
-                        warn!("failed to subscribe to track: {err:?}");
-                    });
+                    subscriber
+                        .subscribe(track, SubscribeFilter::LatestObject)
+                        .await
+                        .unwrap_or_else(|err| {
+                            warn!("failed to subscribe to track: {err:?}");
+                        });
                 });
 
                 tracks.push(self.broadcast.subscribe(&name).context("no track")?);

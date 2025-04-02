@@ -1,5 +1,7 @@
 use std::{
-    collections::{hash_map, HashMap}, io, sync::{atomic, Arc, Mutex}
+    collections::{hash_map, HashMap},
+    io,
+    sync::{atomic, Arc, Mutex},
 };
 
 use crate::{
@@ -12,7 +14,10 @@ use crate::{
 
 use crate::watch::Queue;
 
-use super::{Announced, AnnouncedRecv, Reader, Session, SessionError, Subscribe, SubscribeFilter, SubscribeRecv};
+use super::{
+    Announced, AnnouncedRecv, Reader, Session, SessionError, Subscribe, SubscribeFilter,
+    SubscribeRecv,
+};
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -53,7 +58,11 @@ impl Subscriber {
         self.announced_queue.pop().await
     }
 
-    pub async fn subscribe(&mut self, track: serve::TrackWriter, filter: SubscribeFilter) -> Result<(), ServeError> {
+    pub async fn subscribe(
+        &mut self,
+        track: serve::TrackWriter,
+        filter: SubscribeFilter,
+    ) -> Result<(), ServeError> {
         let id = self.subscribe_next.fetch_add(1, atomic::Ordering::Relaxed);
 
         let (send, recv) = Subscribe::new(self.clone(), id, track, filter);
@@ -62,7 +71,12 @@ impl Subscriber {
         send.closed().await
     }
 
-    pub fn subscribe_update(&mut self, id: u64, filter: SubscribeFilter, priority: u8) -> Result<(), ServeError> {
+    pub fn subscribe_update(
+        &mut self,
+        id: u64,
+        filter: SubscribeFilter,
+        priority: u8,
+    ) -> Result<(), ServeError> {
         let _update = SubscribeUpdate::new(self.clone(), id, filter, priority);
         log::trace!("sent subscribe update");
 

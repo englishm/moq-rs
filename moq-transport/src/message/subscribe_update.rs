@@ -26,7 +26,13 @@ impl SubscribeUpdate {
         let (start, end_group) = match filter {
             SubscribeFilter::AbsoluteStart(start) => (start, 0),
             SubscribeFilter::AbsoluteRange(start, end_group) => (start, end_group),
-            SubscribeFilter::LatestObject => (SubscribePair { group: 0, object: 0 }, 0),
+            SubscribeFilter::LatestObject => (
+                SubscribePair {
+                    group: 0,
+                    object: 0,
+                },
+                0,
+            ),
         };
 
         let update = SubscribeUpdate {

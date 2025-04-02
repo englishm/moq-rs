@@ -46,14 +46,16 @@ pub struct Subscribe {
 pub enum SubscribeFilter {
     AbsoluteStart(SubscribePair),
     AbsoluteRange(SubscribePair, u64),
-    LatestObject
+    LatestObject,
 }
 
 impl SubscribeFilter {
-    fn unwrap(self) -> (FilterType, Option<SubscribePair>, Option<u64>)  {
+    fn unwrap(self) -> (FilterType, Option<SubscribePair>, Option<u64>) {
         match self {
             SubscribeFilter::AbsoluteStart(start) => (FilterType::AbsoluteStart, Some(start), None),
-            SubscribeFilter::AbsoluteRange(start, end_group) => (FilterType::AbsoluteRange, Some(start), Some(end_group)),
+            SubscribeFilter::AbsoluteRange(start, end_group) => {
+                (FilterType::AbsoluteRange, Some(start), Some(end_group))
+            }
             SubscribeFilter::LatestObject => (FilterType::LatestObject, None, None),
         }
     }
@@ -63,11 +65,20 @@ impl From<&message::Subscribe> for SubscribeFilter {
     fn from(subscribe: &message::Subscribe) -> Self {
         match subscribe.filter_type {
             FilterType::AbsoluteStart => Self::AbsoluteStart(
-                subscribe.start.clone().expect("AbsoluteStart, but no StartGroup nor StartObject")
+                subscribe
+                    .start
+                    .clone()
+                    .expect("AbsoluteStart, but no StartGroup nor StartObject"),
             ),
             FilterType::AbsoluteRange => Self::AbsoluteRange(
-                subscribe.start.clone().expect("AbsoluteRange, but no StartGroup nor StartObject"),
-                subscribe.end_group.clone().expect("AbsoluteRange, but no EndGroup"),
+                subscribe
+                    .start
+                    .clone()
+                    .expect("AbsoluteRange, but no StartGroup nor StartObject"),
+                subscribe
+                    .end_group
+                    .clone()
+                    .expect("AbsoluteRange, but no EndGroup"),
             ),
             FilterType::LatestObject => Self::LatestObject,
         }
