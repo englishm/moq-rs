@@ -4,6 +4,7 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
 use crate::coding::Encode;
+use crate::message::{SubscribePair, SubscribeUpdate};
 use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
@@ -64,6 +65,7 @@ impl Subscribed {
                 ..Default::default()
             }
         ).split();
+
         let info = SubscribeInfo {
             id: msg.id,
             namespace: msg.track_namespace.clone(),
@@ -383,6 +385,42 @@ pub(super) struct SubscribedRecv {
 }
 
 impl SubscribedRecv {
+    pub fn recv_subscribe_update(&mut self, msg: SubscribeUpdate) -> Result<(), ServeError> {
+        let state = self.state.lock();
+
+        if let Some(mut state) = state.into_mut() {
+            log::trace!("received subscribe update");
+
+            state.priority = msg.subscriber_priority;
+
+            let filter = SubscribeFilter::from(&msg);
+            // Check for assumptions:
+            //  - Subscriptions can only become more narrow, not wider
+            //  - A publisher SHOULD close the Session as a 'Protocol Violation'
+            //    if the SUBSCRIBE_UPDATE violates either rule [...]
+            use SubscribeFilter::*;
+            match (&state.filter, &filter) {
+                (AbsoluteStart(start_old), AbsoluteStart(start_new))
+                    if start_old <= start_new => state.filter = filter,
+                (AbsoluteStart(start_old), AbsoluteRange(start_new, end_group_new))
+                    if start_old <= start_new && start_new.group <= *end_group_new => state.filter = filter,
+                (AbsoluteStart(_), LatestObject) => state.filter = filter,
+                (AbsoluteRange(start_old, end_group_old), AbsoluteRange(start_new, end_group_new))
+                    if start_old <= start_new && start_new.group <= *end_group_new && end_group_new <= end_group_old => state.filter = filter,
+                (LatestObject, AbsoluteStart(start_new))
+                    if state.max_group_id.is_none() || start_new.group >= state.max_group_id.unwrap() => state.filter = filter,
+                (LatestObject, AbsoluteRange(start_new, end_group_new))
+                    if (state.max_group_id.is_none() || start_new.group >= state.max_group_id.unwrap()) && start_new.group <= *end_group_new => state.filter = filter,
+                (LatestObject, LatestObject) => state.filter = filter,
+                _ => {
+                    return Err(ServeError::Internal("narrowing subscribe update".to_string()));
+                },
+            };
+
+        }
+
+        Ok(())
+    }
     pub fn recv_unsubscribe(&mut self) -> Result<(), ServeError> {
         let state = self.state.lock();
         state.closed.clone()?;

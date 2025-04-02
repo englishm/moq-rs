@@ -62,6 +62,13 @@ impl Subscriber {
         send.closed().await
     }
 
+    pub fn subscribe_update(&mut self, id: u64, filter: SubscribeFilter, priority: u8) -> Result<(), ServeError> {
+        let _update = SubscribeUpdate::new(self.clone(), id, filter, priority);
+        log::trace!("sent subscribe update");
+
+        Ok(())
+    }
+
     pub fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
         let msg = msg.into();
 

@@ -256,10 +256,12 @@ impl Publisher {
 
     fn recv_subscribe_update(
         &mut self,
-        _msg: message::SubscribeUpdate,
+        msg: message::SubscribeUpdate,
     ) -> Result<(), SessionError> {
-        // TODO: Implement updating subscriptions.
-        Err(SessionError::Internal)
+        if let Some(subscribed) = self.subscribed.lock().unwrap().get_mut(&msg.id) {
+            subscribed.recv_subscribe_update(msg)?;
+            Ok(())
+        } else {
     }
 
     fn recv_track_status_request(
