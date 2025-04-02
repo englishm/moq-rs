@@ -7,14 +7,17 @@ use std::{
 use crate::{
     coding::{Decode, Tuple},
     data,
-    message::{self, Message},
+    message::{self, Message, SubscribeUpdate},
     serve::{self, ServeError},
     setup,
 };
 
 use crate::watch::Queue;
 
-use super::{Announced, AnnouncedRecv, Reader, Session, SessionError, Subscribe, SubscribeRecv};
+use super::{
+    Announced, AnnouncedRecv, Reader, Session, SessionError, Subscribe, SubscribeFilter,
+    SubscribeRecv,
+};
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -55,16 +58,32 @@ impl Subscriber {
         self.announced_queue.pop().await
     }
 
-    pub async fn subscribe(&mut self, track: serve::TrackWriter) -> Result<(), ServeError> {
+    pub async fn subscribe(
+        &mut self,
+        track: serve::TrackWriter,
+        filter: SubscribeFilter,
+    ) -> Result<(), ServeError> {
         let id = self.subscribe_next.fetch_add(1, atomic::Ordering::Relaxed);
 
-        let (send, recv) = Subscribe::new(self.clone(), id, track);
+        let (send, recv) = Subscribe::new(self.clone(), id, track, filter);
         self.subscribes.lock().unwrap().insert(id, recv);
 
         send.closed().await
     }
 
-    pub(super) fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
+    pub fn subscribe_update(
+        &mut self,
+        id: u64,
+        filter: SubscribeFilter,
+        priority: u8,
+    ) -> Result<(), ServeError> {
+        let _update = SubscribeUpdate::new(self.clone(), id, filter, priority);
+        log::trace!("sent subscribe update");
+
+        Ok(())
+    }
+
+    pub fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
         let msg = msg.into();
 
         // Remove our entry on terminal state.
@@ -272,7 +291,7 @@ impl Subscriber {
 
             log::trace!("received group object: {:?}", object);
             let mut remain = object.size;
-            let mut object = group.create(object.size)?;
+            let mut object = group.create(object.size, Some(object.object_id))?;
 
             while remain > 0 {
                 let data = reader

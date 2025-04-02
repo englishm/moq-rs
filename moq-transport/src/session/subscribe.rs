@@ -3,7 +3,7 @@ use std::ops;
 use crate::{
     coding::Tuple,
     data,
-    message::{self, FilterType, GroupOrder, SubscribeLocation, SubscribePair},
+    message::{self, FilterType, GroupOrder, SubscribePair},
     serve::{self, ServeError, TrackWriter, TrackWriterMode},
 };
 
@@ -13,8 +13,10 @@ use super::Subscriber;
 
 #[derive(Debug, Clone)]
 pub struct SubscribeInfo {
+    pub id: u64,
     pub namespace: Tuple,
     pub name: String,
+    pub alias: u64,
 }
 
 struct SubscribeState {
@@ -36,9 +38,63 @@ impl Default for SubscribeState {
 pub struct Subscribe {
     state: State<SubscribeState>,
     subscriber: Subscriber,
-    id: u64,
 
     pub info: SubscribeInfo,
+}
+
+#[derive(Debug, Clone)]
+pub enum SubscribeFilter {
+    AbsoluteStart(SubscribePair),
+    AbsoluteRange(SubscribePair, u64),
+    LatestObject,
+}
+
+impl SubscribeFilter {
+    fn unwrap(self) -> (FilterType, Option<SubscribePair>, Option<u64>) {
+        match self {
+            SubscribeFilter::AbsoluteStart(start) => (FilterType::AbsoluteStart, Some(start), None),
+            SubscribeFilter::AbsoluteRange(start, end_group) => {
+                (FilterType::AbsoluteRange, Some(start), Some(end_group))
+            }
+            SubscribeFilter::LatestObject => (FilterType::LatestObject, None, None),
+        }
+    }
+}
+
+impl From<&message::Subscribe> for SubscribeFilter {
+    fn from(subscribe: &message::Subscribe) -> Self {
+        match subscribe.filter_type {
+            FilterType::AbsoluteStart => Self::AbsoluteStart(
+                subscribe
+                    .start
+                    .clone()
+                    .expect("AbsoluteStart, but no StartGroup nor StartObject"),
+            ),
+            FilterType::AbsoluteRange => Self::AbsoluteRange(
+                subscribe
+                    .start
+                    .clone()
+                    .expect("AbsoluteRange, but no StartGroup nor StartObject"),
+                subscribe
+                    .end_group
+                    .clone()
+                    .expect("AbsoluteRange, but no EndGroup"),
+            ),
+            FilterType::LatestObject => Self::LatestObject,
+        }
+    }
+}
+
+impl From<&message::SubscribeUpdate> for SubscribeFilter {
+    fn from(update: &message::SubscribeUpdate) -> Self {
+        if update.end_group != 0 {
+            Self::AbsoluteRange(update.start.clone(), update.end_group - 1)
+        } else if !(update.start.group == 0 && update.start.object == 0) {
+            Self::AbsoluteStart(update.start.clone()) // A value of 0 means the subscription is open-ended.
+        } else {
+            Self::LatestObject // If starts from the beginning and is open-ended, it must be LatestObject.
+        }
+    }
 }
 
 impl Subscribe {
@@ -46,7 +102,9 @@ impl Subscribe {
         mut subscriber: Subscriber,
         id: u64,
         track: TrackWriter,
+        filter: SubscribeFilter,
     ) -> (Subscribe, SubscribeRecv) {
+        let (filter_type, start, end_group) = filter.clone().unwrap();
         subscriber.send_message(message::Subscribe {
             id,
             track_alias: id,
@@ -55,22 +113,17 @@ impl Subscribe {
             // TODO add prioritization logic on the publisher side
             subscriber_priority: 127, // default to mid value, see: https://github.com/moq-wg/moq-transport/issues/504
             group_order: GroupOrder::Publisher, // defer to publisher send order
-            filter_type: FilterType::LatestGroup,
-            // TODO add these to the publisher.
-            start: Some(SubscribePair {
-                group: SubscribeLocation::Latest(0),
-                object: SubscribeLocation::Absolute(0),
-            }),
-            end: Some(SubscribePair {
-                group: SubscribeLocation::None,
-                object: SubscribeLocation::None,
-            }),
+            filter_type,
+            start,
+            end_group,
             params: Default::default(),
         });
 
         let info = SubscribeInfo {
+            id,
             namespace: track.namespace.clone(),
             name: track.name.clone(),
+            alias: id,
         };
 
         let (send, recv) = State::default().split();
@@ -78,7 +131,6 @@ impl Subscribe {
         let send = Subscribe {
             state: send,
             subscriber,
-            id,
             info,
         };
 
@@ -109,7 +161,7 @@ impl Subscribe {
 impl Drop for Subscribe {
     fn drop(&mut self) {
         self.subscriber
-            .send_message(message::Unsubscribe { id: self.id });
+            .send_message(message::Unsubscribe { id: self.info.id });
     }
 }
 

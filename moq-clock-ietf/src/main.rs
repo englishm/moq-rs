@@ -10,7 +10,7 @@ mod clock;
 use moq_transport::{
     coding::Tuple,
     serve,
-    session::{Publisher, Subscriber},
+    session::{Publisher, SubscribeFilter, Subscriber},
 };
 
 #[derive(Parser, Clone)]
@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             res = session.run() => res.context("session error")?,
             res = clock.run() => res.context("clock error")?,
-            res = subscriber.subscribe(prod) => res.context("failed to subscribe to track")?,
+            res = subscriber.subscribe(prod, SubscribeFilter::LatestObject) => res.context("failed to subscribe to track")?,
         }
     }
 

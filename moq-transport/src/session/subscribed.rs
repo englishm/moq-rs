@@ -4,25 +4,34 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
 use crate::coding::Encode;
+use crate::message::{SubscribePair, SubscribeUpdate};
 use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
 
-use super::{Publisher, SessionError, SubscribeInfo, Writer};
+use super::{Publisher, SessionError, SubscribeFilter, SubscribeInfo, Writer};
 
 #[derive(Debug)]
 struct SubscribedState {
-    max_group_id: Option<(u64, u64)>,
+    max_group_id: Option<u64>,
+    stream_count: u64,
+    filter: SubscribeFilter,
+    priority: u8,
     closed: Result<(), ServeError>,
 }
 
 impl SubscribedState {
-    fn update_max_group_id(&mut self, group_id: u64, object_id: u64) -> Result<(), ServeError> {
-        if let Some((max_group, max_object)) = self.max_group_id {
-            if group_id >= max_group && object_id >= max_object {
-                self.max_group_id = Some((group_id, object_id));
+    fn update_max_group_id(&mut self, group_id: u64) -> Result<(), ServeError> {
+        if let Some(max_group_id) = self.max_group_id {
+            if group_id > max_group_id {
+                self.max_group_id = Some(group_id);
             }
         }
+
+        Ok(())
+    }
+    fn increment_stream_count(&mut self) -> Result<(), ServeError> {
+        self.stream_count += 1;
 
         Ok(())
     }
@@ -32,6 +41,9 @@ impl Default for SubscribedState {
     fn default() -> Self {
         Self {
             max_group_id: None,
+            stream_count: 0,
+            filter: SubscribeFilter::LatestObject,
+            priority: 127,
             closed: Ok(()),
         }
     }
@@ -40,7 +52,6 @@ impl Default for SubscribedState {
 pub struct Subscribed {
     publisher: Publisher,
     state: State<SubscribedState>,
-    msg: message::Subscribe,
     ok: bool,
 
     pub info: SubscribeInfo,
@@ -48,16 +59,27 @@ pub struct Subscribed {
 
 impl Subscribed {
     pub(super) fn new(publisher: Publisher, msg: message::Subscribe) -> (Self, SubscribedRecv) {
-        let (send, recv) = State::default().split();
+        let (send, recv) = State::new(SubscribedState {
+            filter: SubscribeFilter::from(&msg),
+            ..Default::default()
+        })
+        .split();
+
         let info = SubscribeInfo {
+            id: msg.id,
             namespace: msg.track_namespace.clone(),
             name: msg.track_name.clone(),
+            alias: msg.track_alias,
         };
+
+        if !msg.params.is_empty() {
+            // TODO: handle subscribe parameters
+            log::warn!("subscription parameters are not supported");
+        }
 
         let send = Self {
             publisher,
             state: send,
-            msg,
             info,
             ok: false,
         };
@@ -82,10 +104,13 @@ impl Subscribed {
         self.state
             .lock_mut()
             .ok_or(ServeError::Cancel)?
-            .max_group_id = latest;
+            .max_group_id = match latest {
+            None => None,
+            Some(latest) => Some(latest.0),
+        };
 
         self.publisher.send_message(message::SubscribeOk {
-            id: self.msg.id,
+            id: self.info.id,
             expires: None,
             group_order: message::GroupOrder::Descending, // TODO: resolve correct value from publisher / subscriber prefs
             latest,
@@ -144,19 +169,19 @@ impl Drop for Subscribed {
             .err()
             .cloned()
             .unwrap_or(ServeError::Done);
-        let max_group_id = state.max_group_id;
+        let stream_count = state.stream_count;
         drop(state); // Important to avoid a deadlock
 
         if self.ok {
             self.publisher.send_message(message::SubscribeDone {
-                id: self.msg.id,
-                last: max_group_id,
+                id: self.info.id,
                 code: err.code(),
+                count: stream_count,
                 reason: err.to_string(),
             });
         } else {
             self.publisher.send_message(message::SubscribeError {
-                id: self.msg.id,
+                id: self.info.id,
                 alias: 0,
                 code: err.code(),
                 reason: err.to_string(),
@@ -168,6 +193,10 @@ impl Drop for Subscribed {
 impl Subscribed {
     async fn serve_track(&mut self, mut track: serve::StreamReader) -> Result<(), SessionError> {
         let mut stream = self.publisher.open_uni().await?;
+        self.state
+            .lock_mut()
+            .ok_or(ServeError::Done)?
+            .increment_stream_count()?;
 
         // TODO figure out u32 vs u64 priority
         stream.set_priority(track.priority as i32);
@@ -175,8 +204,8 @@ impl Subscribed {
         let mut writer = Writer::new(stream);
 
         let header: data::Header = data::TrackHeader {
-            subscribe_id: self.msg.id,
-            track_alias: self.msg.track_alias,
+            subscribe_id: self.info.id,
+            track_alias: self.info.alias,
             publisher_priority: track.priority,
         }
         .into();
@@ -193,11 +222,10 @@ impl Subscribed {
                     size: object.size,
                     status: object.status,
                 };
-
                 self.state
                     .lock_mut()
                     .ok_or(ServeError::Done)?
-                    .update_max_group_id(object.group_id, object.object_id)?;
+                    .update_max_group_id(object.group_id)?;
 
                 writer.encode(&header).await?;
 
@@ -227,8 +255,8 @@ impl Subscribed {
                 res = subgroups.next(), if done.is_none() => match res {
                     Ok(Some(subgroup)) => {
                         let header = data::SubgroupHeader {
-                            subscribe_id: self.msg.id,
-                            track_alias: self.msg.track_alias,
+                            subscribe_id: self.info.id,
+                            track_alias: self.info.alias,
                             group_id: subgroup.group_id,
                             subgroup_id: subgroup.subgroup_id,
                             publisher_priority: subgroup.priority,
@@ -260,7 +288,37 @@ impl Subscribed {
         mut publisher: Publisher,
         state: State<SubscribedState>,
     ) -> Result<(), SessionError> {
+        log::trace!("serving group {}", subgroup.group_id);
+
+        let filter = state.lock().filter.clone();
+        if let SubscribeFilter::AbsoluteStart(SubscribePair {
+            group: group_id,
+            object: object_id,
+        }) = filter
+        {
+            if subgroup.group_id < group_id {
+                log::trace!("skipping group {}", subgroup.group_id);
+                return Ok(());
+            } else if subgroup.group_id == group_id {
+                while let Some(object) = subgroup.peek().await? {
+                    if object.object_id >= object_id {
+                        break;
+                    }
+                    log::trace!(
+                        "skipping object {} of group {}",
+                        object.object_id,
+                        subgroup.group_id
+                    );
+                    subgroup.next().await?;
+                }
+            }
+        }
+
         let mut stream = publisher.open_uni().await?;
+        state
+            .lock_mut()
+            .ok_or(ServeError::Done)?
+            .increment_stream_count()?;
 
         // TODO figure out u32 vs u64 priority
         stream.set_priority(subgroup.priority as i32);
@@ -284,7 +342,7 @@ impl Subscribed {
             state
                 .lock_mut()
                 .ok_or(ServeError::Done)?
-                .update_max_group_id(subgroup.group_id, object.object_id)?;
+                .update_max_group_id(subgroup.group_id)?;
 
             log::trace!("sent group object: {:?}", header);
 
@@ -305,8 +363,8 @@ impl Subscribed {
     ) -> Result<(), SessionError> {
         while let Some(datagram) = datagrams.read().await? {
             let datagram = data::Datagram {
-                subscribe_id: self.msg.id,
-                track_alias: self.msg.track_alias,
+                subscribe_id: self.info.id,
+                track_alias: self.info.alias,
                 group_id: datagram.group_id,
                 object_id: datagram.object_id,
                 publisher_priority: datagram.priority,
@@ -324,7 +382,7 @@ impl Subscribed {
             self.state
                 .lock_mut()
                 .ok_or(ServeError::Done)?
-                .update_max_group_id(datagram.group_id, datagram.object_id)?;
+                .update_max_group_id(datagram.group_id)?;
         }
 
         Ok(())
@@ -336,6 +394,68 @@ pub(super) struct SubscribedRecv {
 }
 
 impl SubscribedRecv {
+    pub fn recv_subscribe_update(&mut self, msg: SubscribeUpdate) -> Result<(), ServeError> {
+        let state = self.state.lock();
+
+        if let Some(mut state) = state.into_mut() {
+            log::trace!("received subscribe update");
+
+            state.priority = msg.subscriber_priority;
+
+            let filter = SubscribeFilter::from(&msg);
+            // Check for assumptions:
+            //  - Subscriptions can only become more narrow, not wider
+            //  - A publisher SHOULD close the Session as a 'Protocol Violation'
+            //    if the SUBSCRIBE_UPDATE violates either rule [...]
+            use SubscribeFilter::*;
+            match (&state.filter, &filter) {
+                (AbsoluteStart(start_old), AbsoluteStart(start_new)) if start_old <= start_new => {
+                    state.filter = filter
+                }
+                (AbsoluteStart(start_old), AbsoluteRange(start_new, end_group_new))
+                    if start_old <= start_new && start_new.group <= *end_group_new =>
+                {
+                    state.filter = filter
+                }
+                (AbsoluteStart(_), LatestObject) => state.filter = filter,
+                (
+                    AbsoluteRange(start_old, end_group_old),
+                    AbsoluteRange(start_new, end_group_new),
+                ) if start_old <= start_new
+                    && start_new.group <= *end_group_new
+                    && end_group_new <= end_group_old =>
+                {
+                    state.filter = filter
+                }
+                (LatestObject, AbsoluteStart(start_new))
+                    if state.max_group_id.is_none()
+                        || start_new.group >= state.max_group_id.unwrap() =>
+                {
+                    state.filter = filter
+                }
+                (LatestObject, AbsoluteRange(start_new, end_group_new))
+                    if (state.max_group_id.is_none()
+                        || start_new.group >= state.max_group_id.unwrap())
+                        && start_new.group <= *end_group_new =>
+                {
+                    state.filter = filter
+                }
+                (LatestObject, LatestObject) => state.filter = filter,
+                _ => {
+                    return Err(ServeError::Internal(
+                        "narrowing subscribe update".to_string(),
+                    ));
+                }
+            };
+
+            if !msg.params.is_empty() {
+                // TODO: handle subscribe parameters
+                log::warn!("subscription parameters are not supported");
+            }
+        }
+
+        Ok(())
+    }
     pub fn recv_unsubscribe(&mut self) -> Result<(), ServeError> {
         let state = self.state.lock();
         state.closed.clone()?;

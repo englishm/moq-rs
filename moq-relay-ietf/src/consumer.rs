@@ -2,7 +2,7 @@ use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     serve::Tracks,
-    session::{Announced, SessionError, Subscriber},
+    session::{Announced, SessionError, SubscribeFilter, Subscriber},
 };
 
 use crate::{Api, Locals, Producer};
@@ -96,7 +96,7 @@ impl Consumer {
                         let info = track.clone();
                         log::info!("forwarding subscribe: {:?}", info);
 
-                        if let Err(err) = remote.subscribe(track).await {
+                        if let Err(err) = remote.subscribe(track, SubscribeFilter::LatestObject).await {
                             log::warn!("failed forwarding subscribe: {:?}, error: {}", info, err)
                         }
 

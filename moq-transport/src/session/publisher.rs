@@ -254,12 +254,16 @@ impl Publisher {
         Ok(())
     }
 
-    fn recv_subscribe_update(
-        &mut self,
-        _msg: message::SubscribeUpdate,
-    ) -> Result<(), SessionError> {
-        // TODO: Implement updating subscriptions.
-        Err(SessionError::Internal)
+    fn recv_subscribe_update(&mut self, msg: message::SubscribeUpdate) -> Result<(), SessionError> {
+        if let Some(subscribed) = self.subscribed.lock().unwrap().get_mut(&msg.id) {
+            subscribed.recv_subscribe_update(msg)?;
+            Ok(())
+        } else {
+            // Non-existent Subscribe ID, we should close the Session as a
+            // 'Protocol Violation'; however, it is not implemented yet,
+            // thus we are sending an internal session error instead.
+            Err(SessionError::Internal)
+        }
     }
 
     fn recv_track_status_request(
