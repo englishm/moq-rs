@@ -13,8 +13,10 @@ use super::Subscriber;
 
 #[derive(Debug, Clone)]
 pub struct SubscribeInfo {
+    pub id: u64,
     pub namespace: Tuple,
     pub name: String,
+    pub alias: u64,
 }
 
 struct SubscribeState {
@@ -36,7 +38,6 @@ impl Default for SubscribeState {
 pub struct Subscribe {
     state: State<SubscribeState>,
     subscriber: Subscriber,
-    id: u64,
 
     pub info: SubscribeInfo,
 }
@@ -108,8 +109,10 @@ impl Subscribe {
         });
 
         let info = SubscribeInfo {
+            id,
             namespace: track.namespace.clone(),
             name: track.name.clone(),
+            alias: id,
         };
 
         let (send, recv) = State::default().split();
@@ -117,7 +120,6 @@ impl Subscribe {
         let send = Subscribe {
             state: send,
             subscriber,
-            id,
             info,
         };
 
@@ -148,7 +150,7 @@ impl Subscribe {
 impl Drop for Subscribe {
     fn drop(&mut self) {
         self.subscriber
-            .send_message(message::Unsubscribe { id: self.id });
+            .send_message(message::Unsubscribe { id: self.info.id });
     }
 }
 

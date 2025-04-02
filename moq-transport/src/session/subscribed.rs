@@ -13,7 +13,9 @@ use super::{Publisher, SessionError, SubscribeFilter, SubscribeInfo, Writer};
 #[derive(Debug)]
 struct SubscribedState {
     max_group_id: Option<u64>,
+    stream_count: u64,
     filter: SubscribeFilter,
+    priority: u8,
     closed: Result<(), ServeError>,
 }
 
@@ -27,6 +29,9 @@ impl SubscribedState {
 
         Ok(())
     }
+    fn increment_stream_count(&mut self) -> Result<(), ServeError> {
+        self.stream_count += 1;
+
         Ok(())
     }
 }
@@ -35,7 +40,9 @@ impl Default for SubscribedState {
     fn default() -> Self {
         Self {
             max_group_id: None,
+            stream_count: 0,
             filter: SubscribeFilter::LatestObject,
+            priority: 127,
             closed: Ok(()),
         }
     }
@@ -44,7 +51,6 @@ impl Default for SubscribedState {
 pub struct Subscribed {
     publisher: Publisher,
     state: State<SubscribedState>,
-    msg: message::Subscribe,
     ok: bool,
 
     pub info: SubscribeInfo,
@@ -59,14 +65,15 @@ impl Subscribed {
             }
         ).split();
         let info = SubscribeInfo {
+            id: msg.id,
             namespace: msg.track_namespace.clone(),
             name: msg.track_name.clone(),
+            alias: msg.track_alias,
         };
 
         let send = Self {
             publisher,
             state: send,
-            msg,
             info,
             ok: false,
         };
@@ -97,7 +104,7 @@ impl Subscribed {
             };
 
         self.publisher.send_message(message::SubscribeOk {
-            id: self.msg.id,
+            id: self.info.id,
             expires: None,
             group_order: message::GroupOrder::Descending, // TODO: resolve correct value from publisher / subscriber prefs
             latest,
@@ -156,19 +163,19 @@ impl Drop for Subscribed {
             .err()
             .cloned()
             .unwrap_or(ServeError::Done);
-        let max_group_id = state.max_group_id;
+        let stream_count = state.stream_count;
         drop(state); // Important to avoid a deadlock
 
         if self.ok {
             self.publisher.send_message(message::SubscribeDone {
-                id: self.msg.id,
-                last: max_group_id,
+                id: self.info.id,
                 code: err.code(),
+                count: stream_count,
                 reason: err.to_string(),
             });
         } else {
             self.publisher.send_message(message::SubscribeError {
-                id: self.msg.id,
+                id: self.info.id,
                 alias: 0,
                 code: err.code(),
                 reason: err.to_string(),
@@ -180,6 +187,7 @@ impl Drop for Subscribed {
 impl Subscribed {
     async fn serve_track(&mut self, mut track: serve::StreamReader) -> Result<(), SessionError> {
         let mut stream = self.publisher.open_uni().await?;
+        self.state.lock_mut().ok_or(ServeError::Done)?.increment_stream_count()?;
 
         // TODO figure out u32 vs u64 priority
         stream.set_priority(track.priority as i32);
@@ -187,8 +195,8 @@ impl Subscribed {
         let mut writer = Writer::new(stream);
 
         let header: data::Header = data::TrackHeader {
-            subscribe_id: self.msg.id,
-            track_alias: self.msg.track_alias,
+            subscribe_id: self.info.id,
+            track_alias: self.info.alias,
             publisher_priority: track.priority,
         }
         .into();
@@ -205,7 +213,6 @@ impl Subscribed {
                     size: object.size,
                     status: object.status,
                 };
-
                 self.state
                     .lock_mut()
                     .ok_or(ServeError::Done)?
@@ -239,8 +246,8 @@ impl Subscribed {
                 res = subgroups.next(), if done.is_none() => match res {
                     Ok(Some(subgroup)) => {
                         let header = data::SubgroupHeader {
-                            subscribe_id: self.msg.id,
-                            track_alias: self.msg.track_alias,
+                            subscribe_id: self.info.id,
+                            track_alias: self.info.alias,
                             group_id: subgroup.group_id,
                             subgroup_id: subgroup.subgroup_id,
                             publisher_priority: subgroup.priority,
@@ -299,6 +306,8 @@ impl Subscribed {
         }
 
         let mut stream = publisher.open_uni().await?;
+        state.lock_mut().ok_or(ServeError::Done)?.increment_stream_count()?;
+
 
         // TODO figure out u32 vs u64 priority
         stream.set_priority(subgroup.priority as i32);
@@ -343,8 +352,8 @@ impl Subscribed {
     ) -> Result<(), SessionError> {
         while let Some(datagram) = datagrams.read().await? {
             let datagram = data::Datagram {
-                subscribe_id: self.msg.id,
-                track_alias: self.msg.track_alias,
+                subscribe_id: self.info.id,
+                track_alias: self.info.alias,
                 group_id: datagram.group_id,
                 object_id: datagram.object_id,
                 publisher_priority: datagram.priority,
