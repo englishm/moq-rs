@@ -15,14 +15,16 @@ pub struct Subscribe {
     pub track_namespace: Tuple,
     pub track_name: String,
 
-    // Subscriber Priority
+    /// Subscriber Priority
     pub subscriber_priority: u8,
+
+    /// Group Order
     pub group_order: GroupOrder,
 
     /// Filter type
     pub filter_type: FilterType,
 
-    /// The start/end group/object
+    /// Start and End depending on the Filter Type set
     pub start: Option<SubscribePair>,
     pub end_group: Option<u64>,
 
