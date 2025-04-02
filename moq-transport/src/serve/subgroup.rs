@@ -299,24 +299,29 @@ impl SubgroupWriter {
 
     /// Create the next object ID with the given payload.
     pub fn write(&mut self, payload: bytes::Bytes) -> Result<(), ServeError> {
-        let mut object = self.create(payload.len())?;
+        let mut object = self.create(payload.len(), None)?;
         object.write(payload)?;
         Ok(())
     }
 
     /// Write an object over multiple writes.
     ///
+    /// The argument id is optional for convenience (e.g., when the function
+    /// is invoked at the original publisher and the GroupIDs are sequential).
+    ///
     /// BAD STUFF will happen if the size is wrong; this is an advanced feature.
-    pub fn create(&mut self, size: usize) -> Result<SubgroupObjectWriter, ServeError> {
+    pub fn create(&mut self, size: usize, id: Option<u64>) -> Result<SubgroupObjectWriter, ServeError> {
         let (writer, reader) = SubgroupObject {
             group: self.info.clone(),
-            object_id: self.next,
+            object_id: id.unwrap_or(self.next),
             status: ObjectStatus::Object,
             size,
         }
         .produce();
 
-        self.next += 1;
+        if id.is_none() {
+            self.next += 1;
+        }
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
         state.objects.push(reader);
@@ -392,13 +397,23 @@ impl SubgroupReader {
     }
 
     pub async fn next(&mut self) -> Result<Option<SubgroupObjectReader>, ServeError> {
+        self._next(true).await
+    }
+
+    pub async fn peek(&mut self) -> Result<Option<SubgroupObjectReader>, ServeError> {
+        self._next(false).await
+    }
+
+    async fn _next(&mut self, inc: bool) -> Result<Option<SubgroupObjectReader>, ServeError> {
         loop {
             {
                 let state = self.state.lock();
 
                 if self.index < state.objects.len() {
                     let object = state.objects[self.index].clone();
-                    self.index += 1;
+                    if inc {
+                        self.index += 1;
+                    }
                     return Ok(Some(object));
                 }
 

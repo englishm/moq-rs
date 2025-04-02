@@ -19,8 +19,8 @@ impl Publisher {
         let start = Utc::now();
         let mut now = start;
 
-        // Just for fun, don't start at zero.
-        let mut sequence = start.minute();
+        // For better reproducibility and easier testing, start at 0.
+        let mut sequence = 0;
 
         loop {
             let segment = self

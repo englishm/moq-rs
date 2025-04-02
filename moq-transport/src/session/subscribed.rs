@@ -8,22 +8,25 @@ use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
 
-use super::{Publisher, SessionError, SubscribeInfo, Writer};
+use super::{Publisher, SessionError, SubscribeFilter, SubscribeInfo, Writer};
 
 #[derive(Debug)]
 struct SubscribedState {
-    max_group_id: Option<(u64, u64)>,
+    max_group_id: Option<u64>,
+    filter: SubscribeFilter,
     closed: Result<(), ServeError>,
 }
 
 impl SubscribedState {
-    fn update_max_group_id(&mut self, group_id: u64, object_id: u64) -> Result<(), ServeError> {
-        if let Some((max_group, max_object)) = self.max_group_id {
-            if group_id >= max_group && object_id >= max_object {
-                self.max_group_id = Some((group_id, object_id));
+    fn update_max_group_id(&mut self, group_id: u64) -> Result<(), ServeError> {
+        if let Some(max_group_id) = self.max_group_id {
+            if group_id > max_group_id {
+                self.max_group_id = Some(group_id);
             }
         }
 
+        Ok(())
+    }
         Ok(())
     }
 }
@@ -32,6 +35,7 @@ impl Default for SubscribedState {
     fn default() -> Self {
         Self {
             max_group_id: None,
+            filter: SubscribeFilter::LatestObject,
             closed: Ok(()),
         }
     }
@@ -48,7 +52,12 @@ pub struct Subscribed {
 
 impl Subscribed {
     pub(super) fn new(publisher: Publisher, msg: message::Subscribe) -> (Self, SubscribedRecv) {
-        let (send, recv) = State::default().split();
+        let (send, recv) = State::new(
+            SubscribedState {
+                filter: SubscribeFilter::from(&msg),
+                ..Default::default()
+            }
+        ).split();
         let info = SubscribeInfo {
             namespace: msg.track_namespace.clone(),
             name: msg.track_name.clone(),
@@ -82,7 +91,10 @@ impl Subscribed {
         self.state
             .lock_mut()
             .ok_or(ServeError::Cancel)?
-            .max_group_id = latest;
+            .max_group_id = match latest {
+                None => None,
+                Some(latest) => Some(latest.0),
+            };
 
         self.publisher.send_message(message::SubscribeOk {
             id: self.msg.id,
@@ -197,7 +209,7 @@ impl Subscribed {
                 self.state
                     .lock_mut()
                     .ok_or(ServeError::Done)?
-                    .update_max_group_id(object.group_id, object.object_id)?;
+                    .update_max_group_id(object.group_id)?;
 
                 writer.encode(&header).await?;
 
@@ -260,6 +272,32 @@ impl Subscribed {
         mut publisher: Publisher,
         state: State<SubscribedState>,
     ) -> Result<(), SessionError> {
+        log::trace!("serving group {}", subgroup.group_id);
+
+        let filter = state.lock().filter.clone();
+        if let SubscribeFilter::AbsoluteStart(SubscribePair {
+            group: group_id,
+            object: object_id,
+        }) = filter
+        {
+            if subgroup.group_id < group_id {
+                log::trace!("skipping group {}", subgroup.group_id);
+                return Ok(());
+            } else if subgroup.group_id == group_id {
+                while let Some(object) = subgroup.peek().await? {
+                    if object.object_id >= object_id {
+                        break;
+                    }
+                    log::trace!(
+                        "skipping object {} of group {}",
+                        object.object_id,
+                        subgroup.group_id
+                    );
+                    subgroup.next().await?;
+                }
+            }
+        }
+
         let mut stream = publisher.open_uni().await?;
 
         // TODO figure out u32 vs u64 priority
@@ -284,7 +322,7 @@ impl Subscribed {
             state
                 .lock_mut()
                 .ok_or(ServeError::Done)?
-                .update_max_group_id(subgroup.group_id, object.object_id)?;
+                .update_max_group_id(subgroup.group_id)?;
 
             log::trace!("sent group object: {:?}", header);
 
@@ -324,7 +362,7 @@ impl Subscribed {
             self.state
                 .lock_mut()
                 .ok_or(ServeError::Done)?
-                .update_max_group_id(datagram.group_id, datagram.object_id)?;
+                .update_max_group_id(datagram.group_id)?;
         }
 
         Ok(())

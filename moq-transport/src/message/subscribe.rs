@@ -22,9 +22,9 @@ pub struct Subscribe {
     /// Filter type
     pub filter_type: FilterType,
 
-    /// The start/end group/object. (TODO: Make optional)
-    pub start: Option<SubscribePair>, // TODO: Make optional
-    pub end: Option<SubscribePair>, // TODO: Make optional
+    /// The start/end group/object
+    pub start: Option<SubscribePair>,
+    pub end_group: Option<u64>,
 
     /// Optional parameters
     pub params: Params,
@@ -43,42 +43,27 @@ impl Decode for Subscribe {
         let filter_type = FilterType::decode(r)?;
 
         let start: Option<SubscribePair>;
-        let end: Option<SubscribePair>;
+        let end_group: Option<u64>;
         match filter_type {
             FilterType::AbsoluteStart => {
                 if r.remaining() < 2 {
                     return Err(DecodeError::MissingField);
                 }
                 start = Some(SubscribePair::decode(r)?);
-                end = None;
+                end_group = None;
             }
             FilterType::AbsoluteRange => {
                 if r.remaining() < 4 {
                     return Err(DecodeError::MissingField);
                 }
                 start = Some(SubscribePair::decode(r)?);
-                end = Some(SubscribePair::decode(r)?);
+                end_group = Some(u64::decode(r)?);
             }
             _ => {
                 start = None;
-                end = None;
+                end_group = None;
             }
         }
-
-        if let Some(s) = &start {
-            // You can't have a start object without a start group.
-            if s.group == SubscribeLocation::None && s.object != SubscribeLocation::None {
-                return Err(DecodeError::InvalidSubscribeLocation);
-            }
-        }
-        if let Some(e) = &end {
-            // You can't have an end object without an end group.
-            if e.group == SubscribeLocation::None && e.object != SubscribeLocation::None {
-                return Err(DecodeError::InvalidSubscribeLocation);
-            }
-        }
-
-        // NOTE: There's some more location restrictions in the draft, but they're enforced at a higher level.
 
         let params = Params::decode(r)?;
 
@@ -91,7 +76,7 @@ impl Decode for Subscribe {
             group_order,
             filter_type,
             start,
-            end,
+            end_group,
             params,
         })
     }
@@ -113,14 +98,18 @@ impl Encode for Subscribe {
         if self.filter_type == FilterType::AbsoluteStart
             || self.filter_type == FilterType::AbsoluteRange
         {
-            if self.start.is_none() || self.end.is_none() {
-                return Err(EncodeError::MissingField);
-            }
             if let Some(start) = &self.start {
                 start.encode(w)?;
+            } else {
+                return Err(EncodeError::MissingField);
             }
-            if let Some(end) = &self.end {
-                end.encode(w)?;
+        }
+
+        if self.filter_type == FilterType::AbsoluteRange {
+            if let Some(end_group) = &self.end_group {
+                end_group.encode(w)?;
+            } else {
+                return Err(EncodeError::MissingField);
             }
         }
 
@@ -130,17 +119,20 @@ impl Encode for Subscribe {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+// Note: When derived on structs, it will produce a lexicographic ordering
+//       based on the top-to-bottom declaration order of the struct’s members.
+//       Therefore, it will work just as expected.
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub struct SubscribePair {
-    pub group: SubscribeLocation,
-    pub object: SubscribeLocation,
+    pub group: u64,
+    pub object: u64,
 }
 
 impl Decode for SubscribePair {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         Ok(Self {
-            group: SubscribeLocation::decode(r)?,
-            object: SubscribeLocation::decode(r)?,
+            group: u64::decode(r)?,
+            object: u64::decode(r)?,
         })
     }
 }
@@ -150,52 +142,5 @@ impl Encode for SubscribePair {
         self.group.encode(w)?;
         self.object.encode(w)?;
         Ok(())
-    }
-}
-
-/// Signal where the subscription should begin, relative to the current cache.
-#[derive(Clone, Debug, PartialEq)]
-pub enum SubscribeLocation {
-    None,
-    Absolute(u64),
-    Latest(u64),
-    Future(u64),
-}
-
-impl Decode for SubscribeLocation {
-    fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        let kind = u64::decode(r)?;
-
-        match kind {
-            0 => Ok(Self::None),
-            1 => Ok(Self::Absolute(u64::decode(r)?)),
-            2 => Ok(Self::Latest(u64::decode(r)?)),
-            3 => Ok(Self::Future(u64::decode(r)?)),
-            _ => Err(DecodeError::InvalidSubscribeLocation),
-        }
-    }
-}
-
-impl Encode for SubscribeLocation {
-    fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        self.id().encode(w)?;
-
-        match self {
-            Self::None => Ok(()),
-            Self::Absolute(val) => val.encode(w),
-            Self::Latest(val) => val.encode(w),
-            Self::Future(val) => val.encode(w),
-        }
-    }
-}
-
-impl SubscribeLocation {
-    fn id(&self) -> u64 {
-        match self {
-            Self::None => 0,
-            Self::Absolute(_) => 1,
-            Self::Latest(_) => 2,
-            Self::Future(_) => 3,
-        }
     }
 }

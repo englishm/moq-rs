@@ -12,6 +12,7 @@ use futures::StreamExt;
 use moq_native_ietf::quic;
 use moq_transport::coding::Tuple;
 use moq_transport::serve::{Track, TrackReader, TrackWriter};
+use moq_transport::session::SubscribeFilter;
 use moq_transport::watch::State;
 use url::Url;
 
@@ -233,7 +234,7 @@ impl RemoteProducer {
                     let mut subscriber = subscriber.clone();
 
                     tasks.push(async move {
-                        if let Err(err) = subscriber.subscribe(track).await {
+                        if let Err(err) = subscriber.subscribe(track, SubscribeFilter::LatestObject).await {
                             log::warn!("failed serving track: {:?}, error: {}", info, err);
                         }
                     });
