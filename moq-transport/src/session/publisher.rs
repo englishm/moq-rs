@@ -262,6 +262,11 @@ impl Publisher {
             subscribed.recv_subscribe_update(msg)?;
             Ok(())
         } else {
+            // Non-existent Subscribe ID, we should close the Session as a
+            // 'Protocol Violation'; however, it is not implemented yet,
+            // thus we are sending an internal session error instead.
+            Err(SessionError::Internal)
+        }
     }
 
     fn recv_track_status_request(

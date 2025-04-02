@@ -73,6 +73,11 @@ impl Subscribed {
             alias: msg.track_alias,
         };
 
+        if !msg.params.is_empty() {
+            // TODO: handle subscribe parameters
+            log::warn!("subscription parameters are not supported");
+        }
+
         let send = Self {
             publisher,
             state: send,
@@ -417,6 +422,10 @@ impl SubscribedRecv {
                 },
             };
 
+            if !msg.params.is_empty() {
+                // TODO: handle subscribe parameters
+                log::warn!("subscription parameters are not supported");
+            }
         }
 
         Ok(())
