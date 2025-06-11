@@ -20,7 +20,7 @@ impl Decode for Client {
     /// Decode a client setup message.
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let typ = u64::decode(r)?;
-        if typ != 0x40 {
+        if typ != 0x20 {
             return Err(DecodeError::InvalidMessage(typ));
         }
 
@@ -52,7 +52,7 @@ impl Decode for Client {
 impl Encode for Client {
     /// Encode a server setup message.
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        0x40_u64.encode(w)?;
+        0x20_u64.encode(w)?;
 
         // Find out the length of the message
         // by encoding it into a buffer and then encoding the length.
@@ -94,8 +94,8 @@ mod tests {
         assert_eq!(
             buf.to_vec(),
             vec![
-                0x40, 0x40, 0x0D, 0x01, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0B, 0x01, 0x00,
-                0x01, 0x03
+                0x20, 0x0D, 0x01, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0B, 0x01, 0x00, 0x01,
+                0x03
             ]
         );
 
