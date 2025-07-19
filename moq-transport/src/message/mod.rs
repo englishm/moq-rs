@@ -104,7 +104,7 @@ macro_rules! message_types {
 		impl Decode for Message {
 			fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
 				let t = u64::decode(r)?;
-				let _len = u64::decode(r)?;
+				let _len = u16::decode(r)?;
 
 				// TODO: Check the length of the message.
 
@@ -129,7 +129,7 @@ macro_rules! message_types {
 						// This is a bit wasteful, but it's the only way to know the length.
 						let mut buf = Vec::new();
 						m.encode(&mut buf).unwrap();
-						(buf.len() as u64).encode(w)?;
+						(buf.len() as u16).encode(w)?;
 
 						// At least don't encode the message twice.
 						// Instead, write the buffer directly to the writer.
