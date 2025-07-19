@@ -1,4 +1,4 @@
-use super::{Role, Version};
+use super::Version;
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, Params};
 
 /// Sent by the server in response to a client setup.
@@ -8,10 +8,6 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError, Params};
 pub struct Server {
     /// The list of supported versions in preferred order.
     pub version: Version,
-
-    /// Indicate if the server is a publisher, a subscriber, or both.
-    // Proposal: moq-wg/moq-transport#151
-    pub role: Role,
 
     /// Unknown parameters.
     pub params: Params,
@@ -30,22 +26,14 @@ impl Decode for Server {
         // TODO: Check the length of the message.
 
         let version = Version::decode(r)?;
-        let mut params = Params::decode(r)?;
-
-        let role = params
-            .get::<Role>(0)?
-            .ok_or(DecodeError::MissingParameter)?;
+        let params = Params::decode(r)?;
 
         // Make sure the PATH parameter isn't used
         if params.has(1) {
             return Err(DecodeError::InvalidParameter);
         }
 
-        Ok(Self {
-            version,
-            role,
-            params,
-        })
+        Ok(Self { version, params })
     }
 }
 
@@ -60,9 +48,7 @@ impl Encode for Server {
 
         self.version.encode(&mut buf).unwrap();
 
-        let mut params = self.params.clone();
-        params.set(0, self.role)?;
-        params.encode(&mut buf).unwrap();
+        self.params.encode(&mut buf).unwrap();
 
         (buf.len() as u64).encode(w)?;
 
@@ -77,7 +63,6 @@ impl Encode for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::setup::Role;
     use bytes::BytesMut;
 
     #[test]
@@ -85,7 +70,6 @@ mod tests {
         let mut buf = BytesMut::new();
         let client = Server {
             version: Version::DRAFT_12,
-            role: Role::Both,
             params: Params::default(),
         };
 
@@ -93,12 +77,11 @@ mod tests {
         assert_eq!(
             buf.to_vec(),
             vec![
-                0x21, 0x0C, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0C, 0x01, 0x00, 0x01, 0x03
+                0x21, 0x09, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0C, 0x00
             ]
         );
 
         let decoded = Server::decode(&mut buf).unwrap();
         assert_eq!(decoded.version, client.version);
-        assert_eq!(decoded.role, client.role);
     }
 }

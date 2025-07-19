@@ -9,7 +9,6 @@ use crate::{
     coding::Tuple,
     message::{self, Message},
     serve::{ServeError, TracksReader},
-    setup,
 };
 
 use crate::watch::Queue;
@@ -44,15 +43,14 @@ impl Publisher {
     pub async fn accept(
         session: web_transport::Session,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::accept_role(session, setup::Role::Publisher).await?;
+        let (session, publisher, _) = Session::accept_role(session).await?;
         Ok((session, publisher.unwrap()))
     }
 
     pub async fn connect(
         session: web_transport::Session,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) =
-            Session::connect_role(session, setup::Role::Publisher).await?;
+        let (session, publisher, _) = Session::connect_role(session).await?;
         Ok((session, publisher.unwrap()))
     }
 

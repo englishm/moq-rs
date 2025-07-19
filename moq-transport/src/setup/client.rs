@@ -1,4 +1,4 @@
-use super::{Role, Versions};
+use super::Versions;
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, Params};
 
 /// Sent by the client to setup the session.
@@ -8,9 +8,6 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError, Params};
 pub struct Client {
     /// The list of supported versions in preferred order.
     pub versions: Versions,
-
-    /// Indicate if the client is a publisher, a subscriber, or both.
-    pub role: Role,
 
     /// Unknown parameters.
     pub params: Params,
@@ -29,11 +26,7 @@ impl Decode for Client {
         // TODO: Check the length of the message.
 
         let versions = Versions::decode(r)?;
-        let mut params = Params::decode(r)?;
-
-        let role = params
-            .get::<Role>(0)?
-            .ok_or(DecodeError::MissingParameter)?;
+        let params = Params::decode(r)?;
 
         // Make sure the PATH parameter isn't used
         // TODO: This assumes WebTransport support only
@@ -41,11 +34,7 @@ impl Decode for Client {
             return Err(DecodeError::InvalidParameter);
         }
 
-        Ok(Self {
-            versions,
-            role,
-            params,
-        })
+        Ok(Self { versions, params })
     }
 }
 
@@ -61,9 +50,7 @@ impl Encode for Client {
 
         self.versions.encode(&mut buf).unwrap();
 
-        let mut params = self.params.clone();
-        params.set(0, self.role)?;
-        params.encode(&mut buf).unwrap();
+        self.params.encode(&mut buf).unwrap();
 
         (buf.len() as u64).encode(w)?;
 
@@ -86,7 +73,6 @@ mod tests {
         let mut buf = BytesMut::new();
         let client = Client {
             versions: [Version::DRAFT_12].into(),
-            role: Role::Both,
             params: Params::default(),
         };
 
@@ -94,14 +80,12 @@ mod tests {
         assert_eq!(
             buf.to_vec(),
             vec![
-                0x20, 0x0D, 0x01, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0C, 0x01, 0x00, 0x01,
-                0x03
+                0x20, 0x0A, 0x01, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0C, 0x00
             ]
         );
 
         let decoded = Client::decode(&mut buf).unwrap();
         assert_eq!(decoded.versions, client.versions);
-        assert_eq!(decoded.role, client.role);
         //assert_eq!(decoded.params, client.params);
     }
 }

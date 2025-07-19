@@ -45,13 +45,10 @@ impl Session {
         webtransport: web_transport::Session,
         sender: Writer,
         recver: Reader,
-        role: setup::Role,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let outgoing = Queue::default().split();
-        let publisher = role
-            .is_publisher()
-            .then(|| Publisher::new(outgoing.0.clone(), webtransport.clone()));
-        let subscriber = role.is_subscriber().then(|| Subscriber::new(outgoing.0));
+        let publisher = true.then(|| Publisher::new(outgoing.0.clone(), webtransport.clone()));
+        let subscriber = true.then(|| Subscriber::new(outgoing.0));
 
         let session = Self {
             webtransport,
@@ -68,14 +65,15 @@ impl Session {
     pub async fn connect(
         session: web_transport::Session,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
-        Self::connect_role(session, setup::Role::Both).await.map(
-            |(session, publisher, subscriber)| (session, publisher.unwrap(), subscriber.unwrap()),
-        )
+        Self::connect_role(session)
+            .await
+            .map(|(session, publisher, subscriber)| {
+                (session, publisher.unwrap(), subscriber.unwrap())
+            })
     }
 
     pub async fn connect_role(
         mut session: web_transport::Session,
-        role: setup::Role,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let control = session.open_bi().await?;
         let mut sender = Writer::new(control.0);
@@ -84,7 +82,6 @@ impl Session {
         let versions: setup::Versions = [setup::Version::DRAFT_12].into();
 
         let client = setup::Client {
-            role,
             versions: versions.clone(),
             params: Default::default(),
         };
@@ -95,37 +92,17 @@ impl Session {
         let server: setup::Server = recver.decode().await?;
         log::debug!("received server SETUP: {:?}", server);
 
-        // Downgrade our role based on the server's role.
-        let role = match server.role {
-            setup::Role::Both => role,
-            setup::Role::Publisher => match role {
-                // Both sides are publishers only
-                setup::Role::Publisher => {
-                    return Err(SessionError::RoleIncompatible(server.role, role))
-                }
-                _ => setup::Role::Subscriber,
-            },
-            setup::Role::Subscriber => match role {
-                // Both sides are subscribers only
-                setup::Role::Subscriber => {
-                    return Err(SessionError::RoleIncompatible(server.role, role))
-                }
-                _ => setup::Role::Publisher,
-            },
-        };
-
-        Ok(Session::new(session, sender, recver, role))
+        Ok(Session::new(session, sender, recver))
     }
 
     pub async fn accept(
         session: web_transport::Session,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
-        Self::accept_role(session, setup::Role::Both).await
+        Self::accept_role(session).await
     }
 
     pub async fn accept_role(
         mut session: web_transport::Session,
-        role: setup::Role,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let control = session.accept_bi().await?;
         let mut sender = Writer::new(control.0);
@@ -141,27 +118,7 @@ impl Session {
             ));
         }
 
-        // Downgrade our role based on the client's role.
-        let role = match client.role {
-            setup::Role::Both => role,
-            setup::Role::Publisher => match role {
-                // Both sides are publishers only
-                setup::Role::Publisher => {
-                    return Err(SessionError::RoleIncompatible(client.role, role))
-                }
-                _ => setup::Role::Subscriber,
-            },
-            setup::Role::Subscriber => match role {
-                // Both sides are subscribers only
-                setup::Role::Subscriber => {
-                    return Err(SessionError::RoleIncompatible(client.role, role))
-                }
-                _ => setup::Role::Publisher,
-            },
-        };
-
         let server = setup::Server {
-            role,
             version: setup::Version::DRAFT_12,
             params: Default::default(),
         };
@@ -169,7 +126,7 @@ impl Session {
         log::debug!("sending server SETUP: {:?}", server);
         sender.encode(&server).await?;
 
-        Ok(Session::new(session, sender, recver, role))
+        Ok(Session::new(session, sender, recver))
     }
 
     pub async fn run(self) -> Result<(), SessionError> {
@@ -206,7 +163,7 @@ impl Session {
                 Ok(msg) => {
                     subscriber
                         .as_mut()
-                        .ok_or(SessionError::RoleViolation)?
+                        .ok_or(SessionError::Internal)?
                         .recv_message(msg)?;
                     continue;
                 }
@@ -217,7 +174,7 @@ impl Session {
                 Ok(msg) => {
                     publisher
                         .as_mut()
-                        .ok_or(SessionError::RoleViolation)?
+                        .ok_or(SessionError::Internal)?
                         .recv_message(msg)?;
                     continue;
                 }
@@ -239,7 +196,7 @@ impl Session {
             tokio::select! {
                 res = webtransport.accept_uni() => {
                     let stream = res?;
-                    let subscriber = subscriber.clone().ok_or(SessionError::RoleViolation)?;
+                    let subscriber = subscriber.clone().ok_or(SessionError::Internal)?;
 
                     tasks.push(async move {
                         if let Err(err) = Subscriber::recv_stream(subscriber, stream).await {
@@ -260,7 +217,7 @@ impl Session {
             let datagram = webtransport.recv_datagram().await?;
             subscriber
                 .as_mut()
-                .ok_or(SessionError::RoleViolation)?
+                .ok_or(SessionError::Internal)?
                 .recv_datagram(datagram)?;
         }
     }
