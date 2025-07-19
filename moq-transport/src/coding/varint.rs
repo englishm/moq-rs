@@ -236,6 +236,20 @@ impl Decode for u64 {
     }
 }
 
+impl Encode for u16 {
+    fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+        w.put_u16(*self);
+        Ok(())
+    }
+}
+
+impl Decode for u16 {
+    fn decode<B: bytes::Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        Self::decode_remaining(buf, 2)?;
+        Ok(buf.get_u16())
+    }
+}
+
 impl Encode for usize {
     /// Encode a varint to the given writer.
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {

@@ -21,7 +21,7 @@ impl Decode for Server {
             return Err(DecodeError::InvalidMessage(typ));
         }
 
-        let _len = u64::decode(r)?;
+        let _len = u16::decode(r)?;
 
         // TODO: Check the length of the message.
 
@@ -50,7 +50,7 @@ impl Encode for Server {
 
         self.params.encode(&mut buf).unwrap();
 
-        (buf.len() as u64).encode(w)?;
+        (buf.len() as u16).encode(w)?;
 
         // At least don't encode the message twice.
         // Instead, write the buffer directly to the writer.
@@ -76,9 +76,7 @@ mod tests {
         client.encode(&mut buf).unwrap();
         assert_eq!(
             buf.to_vec(),
-            vec![
-                0x21, 0x09, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0C, 0x00
-            ]
+            vec![0x21, 0x00, 0x09, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0C, 0x00]
         );
 
         let decoded = Server::decode(&mut buf).unwrap();
