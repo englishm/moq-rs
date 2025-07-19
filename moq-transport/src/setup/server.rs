@@ -84,7 +84,7 @@ mod tests {
     fn encode_decode() {
         let mut buf = BytesMut::new();
         let client = Server {
-            version: Version::DRAFT_11,
+            version: Version::DRAFT_12,
             role: Role::Both,
             params: Params::default(),
         };
@@ -93,7 +93,7 @@ mod tests {
         assert_eq!(
             buf.to_vec(),
             vec![
-                0x21, 0x0C, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0B, 0x01, 0x00, 0x01, 0x03
+                0x21, 0x0C, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0C, 0x01, 0x00, 0x01, 0x03
             ]
         );
 
