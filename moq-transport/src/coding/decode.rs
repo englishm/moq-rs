@@ -1,4 +1,4 @@
-use super::BoundsExceeded;
+use super::{BoundsExceeded, EncodeError};
 use std::{io, string::FromUtf8Error, sync};
 use thiserror::Error;
 
@@ -70,6 +70,9 @@ pub enum DecodeError {
 
     #[error("io error: {0}")]
     Io(sync::Arc<io::Error>),
+
+    #[error("internal encode error: {0}")]
+    Encode(#[from] EncodeError),
 }
 
 impl From<io::Error> for DecodeError {

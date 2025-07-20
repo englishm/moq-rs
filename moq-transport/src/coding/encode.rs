@@ -33,6 +33,9 @@ pub enum EncodeError {
 
     #[error("i/o error: {0}")]
     Io(sync::Arc<io::Error>),
+
+    #[error("internal decode error: {0}")]
+    Decode(String),
 }
 
 impl From<io::Error> for EncodeError {
