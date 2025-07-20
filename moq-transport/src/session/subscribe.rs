@@ -49,7 +49,6 @@ impl Subscribe {
     ) -> (Subscribe, SubscribeRecv) {
         subscriber.send_message(message::Subscribe {
             id,
-            track_alias: id,
             track_namespace: track.namespace.clone(),
             track_name: track.name.clone(),
             // TODO add prioritization logic on the publisher side

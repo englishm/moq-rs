@@ -40,9 +40,9 @@ impl Default for SubscribedState {
 pub struct Subscribed {
     publisher: Publisher,
     state: State<SubscribedState>,
-    msg: message::Subscribe,
+    pub id: u64,
+    pub track_alias: u64,
     ok: bool,
-
     pub info: SubscribeInfo,
 }
 
@@ -54,10 +54,16 @@ impl Subscribed {
             name: msg.track_name.clone(),
         };
 
+        // Simply use the id from the subscribe message
+        // as the track alias until we have a better
+        // way of assigning aliases
+        let track_alias = msg.id;
+
         let send = Self {
             publisher,
             state: send,
-            msg,
+            id: msg.id,
+            track_alias,
             info,
             ok: false,
         };
@@ -85,7 +91,7 @@ impl Subscribed {
             .max_group_id = latest;
 
         self.publisher.send_message(message::SubscribeOk {
-            id: self.msg.id,
+            id: self.id,
             expires: None,
             group_order: message::GroupOrder::Descending, // TODO: resolve correct value from publisher / subscriber prefs
             latest,
@@ -149,14 +155,14 @@ impl Drop for Subscribed {
 
         if self.ok {
             self.publisher.send_message(message::SubscribeDone {
-                id: self.msg.id,
+                id: self.id,
                 last: max_group_id,
                 code: err.code(),
                 reason: err.to_string(),
             });
         } else {
             self.publisher.send_message(message::SubscribeError {
-                id: self.msg.id,
+                id: self.id,
                 alias: 0,
                 code: err.code(),
                 reason: err.to_string(),
@@ -175,8 +181,8 @@ impl Subscribed {
         let mut writer = Writer::new(stream);
 
         let header: data::Header = data::TrackHeader {
-            subscribe_id: self.msg.id,
-            track_alias: self.msg.track_alias,
+            subscribe_id: self.id,
+            track_alias: self.track_alias,
             publisher_priority: track.priority,
         }
         .into();
@@ -227,8 +233,8 @@ impl Subscribed {
                 res = subgroups.next(), if done.is_none() => match res {
                     Ok(Some(subgroup)) => {
                         let header = data::SubgroupHeader {
-                            subscribe_id: self.msg.id,
-                            track_alias: self.msg.track_alias,
+                            subscribe_id: self.id,
+                            track_alias: self.track_alias,
                             group_id: subgroup.group_id,
                             subgroup_id: subgroup.subgroup_id,
                             publisher_priority: subgroup.priority,
@@ -305,8 +311,8 @@ impl Subscribed {
     ) -> Result<(), SessionError> {
         while let Some(datagram) = datagrams.read().await? {
             let datagram = data::Datagram {
-                subscribe_id: self.msg.id,
-                track_alias: self.msg.track_alias,
+                subscribe_id: self.id,
+                track_alias: self.track_alias,
                 group_id: datagram.group_id,
                 object_id: datagram.object_id,
                 publisher_priority: datagram.priority,

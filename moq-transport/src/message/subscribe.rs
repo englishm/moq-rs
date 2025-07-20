@@ -11,7 +11,6 @@ pub struct Subscribe {
     pub id: u64,
 
     /// Track properties
-    pub track_alias: u64, // This alias is useless but part of the spec
     pub track_namespace: Tuple,
     pub track_name: String,
 
@@ -33,7 +32,6 @@ pub struct Subscribe {
 impl Decode for Subscribe {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
-        let track_alias = u64::decode(r)?;
         let track_namespace = Tuple::decode(r)?;
         let track_name = String::decode(r)?;
 
@@ -84,7 +82,6 @@ impl Decode for Subscribe {
 
         Ok(Self {
             id,
-            track_alias,
             track_namespace,
             track_name,
             subscriber_priority,
@@ -100,7 +97,6 @@ impl Decode for Subscribe {
 impl Encode for Subscribe {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         self.id.encode(w)?;
-        self.track_alias.encode(w)?;
         self.track_namespace.encode(w)?;
         self.track_name.encode(w)?;
 
