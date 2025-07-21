@@ -92,6 +92,7 @@ impl Subscribed {
 
         self.publisher.send_message(message::SubscribeOk {
             id: self.id,
+            track_alias: self.track_alias,
             expires: None,
             group_order: message::GroupOrder::Descending, // TODO: resolve correct value from publisher / subscriber prefs
             latest,

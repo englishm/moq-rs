@@ -7,6 +7,9 @@ pub struct SubscribeOk {
     /// The ID for this subscription.
     pub id: u64,
 
+    /// The track alias for this subscription.
+    pub track_alias: u64,
+
     /// The subscription will expire in this many milliseconds.
     pub expires: Option<u64>,
 
@@ -20,6 +23,7 @@ pub struct SubscribeOk {
 impl Decode for SubscribeOk {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
+        let track_alias = u64::decode(r)?;
         let expires = match u64::decode(r)? {
             0 => None,
             expires => Some(expires),
@@ -41,6 +45,7 @@ impl Decode for SubscribeOk {
 
         Ok(Self {
             id,
+            track_alias,
             expires,
             group_order,
             latest,
