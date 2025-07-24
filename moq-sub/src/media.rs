@@ -117,7 +117,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             tasks.spawn(async move {
                 let name = track.name.clone();
                 if let Err(err) = Self::recv_track(track, out).await {
-                    warn!("failed to play track {name}: {err:?}");
+                    warn!("failed to play track {}: {:?}", name.as_str().unwrap(), err);
                 }
             });
         }
@@ -127,7 +127,8 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 
     async fn recv_track(track: TrackReader, out: Arc<Mutex<O>>) -> anyhow::Result<()> {
         let name = track.name.clone();
-        debug!("track {name}: start");
+        let name_str = name.as_str()?;
+        debug!("track {name_str}: start",);
         if let TrackReaderMode::Subgroups(mut groups) = track.mode().await? {
             while let Some(group) = groups.next().await? {
                 let out = out.clone();
@@ -136,7 +137,8 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
                 }
             }
         }
-        debug!("track {name}: finish");
+        debug!("track {name_str}: finish");
+
         Ok(())
     }
 

@@ -120,7 +120,12 @@ impl Publisher {
         subscribe: Subscribed,
         mut tracks: TracksReader,
     ) -> Result<(), SessionError> {
-        if let Some(track) = tracks.subscribe(&subscribe.name) {
+        if let Some(track) = tracks.subscribe(
+            subscribe
+                .name
+                .as_str()
+                .map_err(|_| SessionError::Internal)?,
+        ) {
             subscribe.serve(track).await?;
         } else {
             subscribe.close(ServeError::NotFound)?;

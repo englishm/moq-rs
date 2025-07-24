@@ -12,7 +12,7 @@
 //!
 //! The track is closed with [ServeError::Closed] when all writers or readers are dropped.
 
-use crate::watch::State;
+use crate::{coding::TupleField, watch::State};
 
 use super::{
     Datagrams, DatagramsReader, DatagramsWriter, ObjectsWriter, ServeError, Stream, StreamReader,
@@ -26,11 +26,11 @@ use std::{ops::Deref, sync::Arc};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Track {
     pub namespace: Tuple,
-    pub name: String,
+    pub name: TupleField,
 }
 
 impl Track {
-    pub fn new(namespace: Tuple, name: String) -> Self {
+    pub fn new(namespace: Tuple, name: TupleField) -> Self {
         Self { namespace, name }
     }
 

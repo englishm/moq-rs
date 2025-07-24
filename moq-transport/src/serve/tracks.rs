@@ -13,7 +13,7 @@
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use super::{ServeError, Track, TrackReader, TrackWriter};
-use crate::coding::Tuple;
+use crate::coding::{Tuple, TupleField};
 use crate::watch::{Queue, State};
 
 /// Static information about a broadcast.
@@ -42,7 +42,7 @@ impl Tracks {
 
 #[derive(Default)]
 pub struct TracksState {
-    tracks: HashMap<String, TrackReader>,
+    tracks: HashMap<TupleField, TrackReader>,
 }
 
 /// Publish new tracks for a broadcast by name.
@@ -58,24 +58,28 @@ impl TracksWriter {
 
     /// Create a new track with the given name, inserting it into the broadcast.
     /// None is returned if all [TracksReader]s have been dropped.
+    /// Note: Expects a UTF-8 track name which is internally represented as a TupleField
     pub fn create(&mut self, track: &str) -> Option<TrackWriter> {
         let (writer, reader) = Track {
             namespace: self.namespace.clone(),
-            name: track.to_owned(),
+            name: TupleField::from_utf8(track),
         }
         .produce();
+
+        let track_tuplefield = TupleField::from_utf8(track);
 
         // NOTE: We overwrite the track if it already exists.
         self.state
             .lock_mut()?
             .tracks
-            .insert(track.to_owned(), reader);
+            .insert(track_tuplefield, reader);
 
         Some(writer)
     }
 
     pub fn remove(&mut self, track: &str) -> Option<TrackReader> {
-        self.state.lock_mut()?.tracks.remove(track)
+        let track_tuplefield = TupleField::from_utf8(track);
+        self.state.lock_mut()?.tracks.remove(&track_tuplefield)
     }
 }
 
@@ -147,14 +151,16 @@ impl TracksReader {
     pub fn subscribe(&mut self, name: &str) -> Option<TrackReader> {
         let state = self.state.lock();
 
-        if let Some(track) = state.tracks.get(name) {
+        let tuplefield_name = TupleField::from_utf8(name);
+
+        if let Some(track) = state.tracks.get(&tuplefield_name) {
             return Some(track.clone());
         }
 
         let mut state = state.into_mut()?;
         let track = Track {
             namespace: self.namespace.clone(),
-            name: name.to_owned(),
+            name: TupleField::from_utf8(name),
         }
         .produce();
 
@@ -162,8 +168,10 @@ impl TracksReader {
             return None;
         }
 
+        let name_tuplefield = TupleField::from_utf8(name);
+
         // We requested the track sucessfully so we can deduplicate it.
-        state.tracks.insert(name.to_owned(), track.1.clone());
+        state.tracks.insert(name_tuplefield, track.1.clone());
 
         Some(track.1.clone())
     }

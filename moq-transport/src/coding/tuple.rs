@@ -21,6 +21,22 @@ impl Hash for TupleField {
     }
 }
 
+impl From<String> for TupleField {
+    fn from(s: String) -> Self {
+        Self {
+            value: s.into_bytes(),
+        }
+    }
+}
+
+impl From<&str> for TupleField {
+    fn from(s: &str) -> Self {
+        Self {
+            value: s.as_bytes().to_vec(),
+        }
+    }
+}
+
 impl Decode for TupleField {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let size = usize::decode(r)?;
@@ -60,6 +76,18 @@ impl TupleField {
 
     pub fn get<P: Decode>(&self) -> Result<P, DecodeError> {
         P::decode(&mut bytes::Bytes::from(self.value.clone()))
+    }
+
+    pub fn as_str(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.value)
+    }
+
+    pub fn into_string(self) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.value)
+    }
+
+    pub fn to_string_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.value)
     }
 }
 

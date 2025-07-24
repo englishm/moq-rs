@@ -85,8 +85,11 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("failed to create MoQ Transport session")?;
 
-        let (prod, sub) =
-            serve::Track::new(Tuple::from_utf8_path(&config.namespace), config.track).produce();
+        let (prod, sub) = serve::Track::new(
+            Tuple::from_utf8_path(&config.namespace),
+            config.track.into(),
+        )
+        .produce();
 
         let clock = clock::Subscriber::new(sub);
 

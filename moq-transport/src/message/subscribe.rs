@@ -1,4 +1,4 @@
-use crate::coding::{Decode, DecodeError, Encode, EncodeError, Params, Tuple};
+use crate::coding::{Decode, DecodeError, Encode, EncodeError, Params, Tuple, TupleField};
 use crate::message::FilterType;
 use crate::message::GroupOrder;
 
@@ -7,12 +7,12 @@ use crate::message::GroupOrder;
 /// Objects will use the provided ID instead of the full track name, to save bytes.
 #[derive(Clone, Debug)]
 pub struct Subscribe {
-    /// The subscription ID
+    /// The request ID
     pub id: u64,
 
     /// Track properties
     pub track_namespace: Tuple,
-    pub track_name: String,
+    pub track_name: TupleField, // equivalent to Track Name length + Track Name
 
     // Subscriber Priority
     pub subscriber_priority: u8,
@@ -33,7 +33,7 @@ impl Decode for Subscribe {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
         let track_namespace = Tuple::decode(r)?;
-        let track_name = String::decode(r)?;
+        let track_name = TupleField::decode(r)?;
 
         let subscriber_priority = u8::decode(r)?;
         let group_order = GroupOrder::decode(r)?;

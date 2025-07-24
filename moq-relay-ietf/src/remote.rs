@@ -308,7 +308,7 @@ impl RemoteConsumer {
             None => return Ok(None),
         };
 
-        let (writer, reader) = Track::new(namespace, name).produce();
+        let (writer, reader) = Track::new(namespace, name.into()).produce();
         let reader = RemoteTrackReader::new(reader, self.state.clone());
 
         // Insert the track into our Map so we deduplicate future requests.
@@ -337,7 +337,10 @@ impl RemoteTrackReader {
     fn new(reader: TrackReader, parent: State<RemoteState>) -> Self {
         let drop = Arc::new(RemoteTrackDrop {
             parent,
-            key: (reader.namespace.clone(), reader.name.clone()),
+            key: (
+                reader.namespace.clone(),
+                reader.name.clone().into_string().unwrap(),
+            ),
         });
 
         Self { reader, drop }

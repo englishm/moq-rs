@@ -51,7 +51,7 @@ impl Producer {
 
     async fn serve(self, subscribe: Subscribed) -> Result<(), anyhow::Error> {
         if let Some(mut local) = self.locals.route(&subscribe.namespace) {
-            if let Some(track) = local.subscribe(&subscribe.name) {
+            if let Some(track) = local.subscribe(subscribe.name.as_str()?) {
                 log::info!("serving from local: {:?}", track.info);
                 return Ok(subscribe.serve(track).await?);
             }
@@ -59,9 +59,10 @@ impl Producer {
 
         if let Some(remotes) = &self.remotes {
             if let Some(remote) = remotes.route(&subscribe.namespace).await? {
-                if let Some(track) =
-                    remote.subscribe(subscribe.namespace.clone(), subscribe.name.clone())?
-                {
+                if let Some(track) = remote.subscribe(
+                    subscribe.namespace.clone(),
+                    subscribe.name.clone().into_string()?,
+                )? {
                     log::info!("serving from remote: {:?} {:?}", remote.info, track.info);
 
                     // NOTE: Depends on drop(track) being called afterwards
