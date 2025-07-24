@@ -54,7 +54,7 @@ impl Subscribe {
             // TODO add prioritization logic on the publisher side
             subscriber_priority: 127, // default to mid value, see: https://github.com/moq-wg/moq-transport/issues/504
             group_order: GroupOrder::Publisher, // defer to publisher send order
-            filter_type: FilterType::LatestGroup,
+            filter_type: FilterType::NextGroupStart,
             // TODO add these to the publisher.
             start: Some(SubscribePair {
                 group: SubscribeLocation::Latest(0),
