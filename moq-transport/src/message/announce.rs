@@ -6,21 +6,30 @@ pub struct Announce {
     /// The track namespace
     pub namespace: Tuple,
 
+    // Request ID
+    pub id: u64,
+
     /// Optional parameters
     pub params: Params,
 }
 
 impl Decode for Announce {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
+        let id = u64::decode(r)?;
         let namespace = Tuple::decode(r)?;
         let params = Params::decode(r)?;
 
-        Ok(Self { namespace, params })
+        Ok(Self {
+            id,
+            namespace,
+            params,
+        })
     }
 }
 
 impl Encode for Announce {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+        self.id.encode(w)?;
         self.namespace.encode(w)?;
         self.params.encode(w)?;
 

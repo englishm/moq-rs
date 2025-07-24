@@ -52,6 +52,7 @@ impl Announce {
         };
 
         publisher.send_message(message::Announce {
+            id: 0,
             namespace,
             params: Default::default(),
         });

@@ -26,6 +26,8 @@ pub struct Publisher {
     subscribed: Arc<Mutex<HashMap<u64, SubscribedRecv>>>,
     unknown: Queue<Subscribed>,
 
+    // https://www.ietf.org/archive/id/draft-ietf-moq-transport-12.html#section-8.1
+    //    announce_next: Arc<atomic::AtomicU64>, // TODO: Increment Announce Request IDs
     outgoing: Queue<Message>,
 }
 

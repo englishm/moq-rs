@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops;
 
 use futures::stream::FuturesUnordered;
@@ -95,7 +96,9 @@ impl Subscribed {
             track_alias: self.track_alias,
             expires: None,
             group_order: message::GroupOrder::Descending, // TODO: resolve correct value from publisher / subscriber prefs
-            latest,
+            content_exists: 1,                            // TODO fix
+            largest_location: latest,
+            params: crate::coding::Params(HashMap::new()), // TODO: something
         });
 
         self.ok = true; // So we sent SubscribeDone on drop

@@ -18,13 +18,15 @@ pub struct Subscribe {
     pub subscriber_priority: u8,
     pub group_order: GroupOrder,
 
+    pub forward: u8,
+
     /// Filter type
     pub filter_type: FilterType,
 
     /// The start/end group/object. (TODO: Make optional)
     pub start: Option<SubscribePair>, // TODO: Make optional
     pub end: Option<SubscribePair>, // TODO: Make optional
-
+    //pub end_group: Option<u64>, // TODO: Make optional
     /// Optional parameters
     pub params: Params,
 }
@@ -37,6 +39,8 @@ impl Decode for Subscribe {
 
         let subscriber_priority = u8::decode(r)?;
         let group_order = GroupOrder::decode(r)?;
+
+        let forward = u8::decode(r)?;
 
         let filter_type = FilterType::decode(r)?;
 
@@ -86,6 +90,7 @@ impl Decode for Subscribe {
             track_name,
             subscriber_priority,
             group_order,
+            forward,
             filter_type,
             start,
             end,
@@ -103,6 +108,8 @@ impl Encode for Subscribe {
         self.subscriber_priority.encode(w)?;
 
         self.group_order.encode(w)?;
+
+        self.forward.encode(w)?;
 
         self.filter_type.encode(w)?;
 
