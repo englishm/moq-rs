@@ -1077,7 +1077,7 @@ checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 
 [[package]]
 name = "moq-api"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "axum",
  "clap",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "moq-clock-ietf"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "moq-pub"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1162,7 +1162,7 @@ dependencies = [
 
 [[package]]
 name = "moq-relay-ietf"
-version = "0.7.5"
+version = "0.7.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "moq-sub"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1203,7 +1203,7 @@ dependencies = [
 
 [[package]]
 name = "moq-transport"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "bytes",
  "futures",
