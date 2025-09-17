@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/englishm/moq-rs/compare/moq-transport-v0.11.0...moq-transport-v0.11.1) - 2025-09-17
+
+### Other
+
+- Tidy versions test fixture
+- Tidy track namespace test fixture
+- Tidy tuple test fixture
+- Setup message test formatting
+- Fix comment placement in Location test
+- Fix comment placement in KeyValuePair tests
+- VarInt tests - use binary literals for readability
+
 ## [0.11.0](https://github.com/englishm/moq-rs/compare/moq-transport-v0.10.0...moq-transport-v0.11.0) - 2025-09-15
 
 ### Other
