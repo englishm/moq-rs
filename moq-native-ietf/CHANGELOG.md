@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/englishm/moq-rs/compare/moq-native-ietf-v0.5.5...moq-native-ietf-v0.6.0) - 2025-10-08
+
+### Other
+
+- Implement per-connection qlog file generation
+- Thread qlog_dir and base_server_config to accept_session
+- Store qlog_dir and base_server_config in Server struct
+- Validate qlog directory exists at startup
+- Add --qlog-dir CLI argument to QUIC configuration
+- Enable qlog feature of quinn
+- Log QUIC CIDs for accepted connections
+- Use newer quinn
+
 ## [0.5.5](https://github.com/englishm/moq-rs/compare/moq-native-ietf-v0.5.4...moq-native-ietf-v0.5.5) - 2025-09-15
 
 ### Other
