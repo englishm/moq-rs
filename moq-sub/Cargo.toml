@@ -5,7 +5,7 @@ authors = []
 repository = "https://github.com/englishm/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.3.4"
+version = "0.4.0"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
@@ -14,8 +14,8 @@ categories = ["multimedia", "network-programming", "web-programming"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-moq-transport = { path = "../moq-transport", version = "0.11" }
-moq-native-ietf = { path = "../moq-native-ietf", version = "0.5" }
+moq-transport = { path = "../moq-transport", version = "0.12" }
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.6" }
 moq-catalog = { path = "../moq-catalog", version = "0.2" }
 url = "2"
 

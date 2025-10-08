@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/englishm/moq-rs/compare/moq-transport-v0.11.0...moq-transport-v0.12.0) - 2025-10-08
+
+### Other
+
+- Merge pull request #78 from sgodin/moq-interim-updates-2
+- cargo fmt
+- Fix lint nit
+- Fix lint nit
+- Add extra logging
+- cargo fmt
+- - send track_alias in SubscribeOk to match what is sent in the stream header
+- cargo fmt
+- Appease linter
+- -clock demo - task out  reception of new streams so we don't need to wait for previous stream to end
+- Tidy versions test fixture
+- Tidy track namespace test fixture
+- Tidy tuple test fixture
+- Setup message test formatting
+- Fix comment placement in Location test
+- Fix comment placement in KeyValuePair tests
+- VarInt tests - use binary literals for readability
+
 ## [0.11.0](https://github.com/englishm/moq-rs/compare/moq-transport-v0.10.0...moq-transport-v0.11.0) - 2025-09-15
 
 ### Other
