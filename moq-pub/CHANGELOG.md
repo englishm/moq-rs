@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6](https://github.com/englishm/moq-rs/compare/moq-pub-v0.8.5...moq-pub-v0.8.6) - 2025-11-01
+
+### Other
+
+- moq-transport variable renames and comments added
+- Log CID
+- Print CID for clock sessions
+- Add --qlog-dir CLI argument to QUIC configuration
+
 ## [0.8.5](https://github.com/englishm/moq-rs/compare/moq-pub-v0.8.4...moq-pub-v0.8.5) - 2025-09-15
 
 ### Other

@@ -6,6 +6,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/englishm/moq-rs/compare/moq-transport-v0.11.0...moq-transport-v0.11.1) - 2025-11-01
+
+### Fixed
+
+- fix issues noticed by CoPilot
+
+### Other
+
+- Wire Up Track Status Handling
+- cargo fmt
+- Add separators when printing multiple kv pairs
+- Print max 16 bytes of BytesValues when debugging
+- Cleanup mlog serialization
+- Appease Copilot with more comments
+- Improve err handling of push_and_wait_until_popped
+- Fix comment typo
+- Fix comment typo
+- Fixup Subscribe Alias Handling
+- -fix spelling errors found by CoPilot
+- moq-transport variable renames and comments added
+- Use FilterType::LargestObject for subscribe
+- Fix param types to match draft-14
+- cargo fmt
+- Add MoQT qlog events and TODOs for remainder
+- cargo fmt
+- cargo clippy --fix
+- Add more qlog logging to 'mlog' session logs
+- Add qlog events for generic logs
+- Add some events for subgroup headers and objects
+- Add more moqt qlog events
+- Emit subscribe and subscribe_ok moqt qlog events
+- Add more moqt qlog events
+- Refactor mlog feature for better layering
+- cargo fmt
+- First pass of 'mlog' support
+- Initial mlog scaffolding
+- Add/bump serde for mlog in moq-transport
+- Merge pull request #78 from sgodin/moq-interim-updates-2
+- cargo fmt
+- Fix lint nit
+- Fix lint nit
+- Add extra logging
+- cargo fmt
+- - send track_alias in SubscribeOk to match what is sent in the stream header
+- cargo fmt
+- Appease linter
+- -clock demo - task out  reception of new streams so we don't need to wait for previous stream to end
+- Tidy versions test fixture
+- Tidy track namespace test fixture
+- Tidy tuple test fixture
+- Setup message test formatting
+- Fix comment placement in Location test
+- Fix comment placement in KeyValuePair tests
+- VarInt tests - use binary literals for readability
+
 ## [0.11.0](https://github.com/englishm/moq-rs/compare/moq-transport-v0.10.0...moq-transport-v0.11.0) - 2025-09-15
 
 ### Other

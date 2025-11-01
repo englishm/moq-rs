@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6](https://github.com/englishm/moq-rs/compare/moq-clock-ietf-v0.6.5...moq-clock-ietf-v0.6.6) - 2025-11-01
+
+### Other
+
+- Wire Up Track Status Handling
+- moq-clock-ietf variable renames and comments added
+- Print CID for clock sessions
+- Add --qlog-dir CLI argument to QUIC configuration
+- -clock demo - task out  reception of new streams so we don't need to wait for previous stream to end
+
 ## [0.6.5](https://github.com/englishm/moq-rs/compare/moq-clock-ietf-v0.6.4...moq-clock-ietf-v0.6.5) - 2025-09-15
 
 ### Other
