@@ -13,6 +13,7 @@ use url::Url;
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
 use moq_relay_ietf::{Coordinator, Relay, RelayConfig, SessionConfig, Web, WebConfig};
+use std::time::Duration;
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -35,6 +36,12 @@ pub struct Cli {
     /// Maximum request ID plus one advertised in MoQT setup.
     #[arg(long, default_value_t = 100)]
     pub max_request_id: u64,
+
+    /// Seconds to keep a cached track with no subscribers before releasing its
+    /// upstream subscription. 0 disables eviction, holding upstream
+    /// subscriptions for the lifetime of the upstream session.
+    #[arg(long, default_value_t = 30)]
+    pub cache_idle_timeout: u64,
 
     /// Forward all PUBLISH_NAMESPACE messages to the provided server for auth/routing.
     /// If not provided, the relay accepts every unique namespace publish.
@@ -188,23 +195,26 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create a QUIC server for media.
-    let relay = Relay::new(RelayConfig {
-        tls: tls.clone(),
-        bind: Some(cli.bind),
-        endpoints: vec![],
-        qlog_dir: qlog_dir_for_relay,
-        mlog_dir: mlog_dir_for_relay,
-        node: cli.node,
-        announce: cli.announce,
-        coordinator,
-        session: SessionConfig {
-            max_request_id: cli.max_request_id,
+    let relay = Relay::new_with_cache_idle_timeout(
+        RelayConfig {
+            tls: tls.clone(),
+            bind: Some(cli.bind),
+            endpoints: vec![],
+            qlog_dir: qlog_dir_for_relay,
+            mlog_dir: mlog_dir_for_relay,
+            node: cli.node,
+            announce: cli.announce,
+            coordinator,
+            session: SessionConfig {
+                max_request_id: cli.max_request_id,
+            },
+            // No connection tagger: the default binary treats every inbound
+            // connection as a public client. Embedders that run relay-to-relay
+            // meshes supply a tagger to mark internal peers.
+            connection_tagger: None,
         },
-        // No connection tagger: the default binary treats every inbound
-        // connection as a public client. Embedders that run relay-to-relay
-        // meshes supply a tagger to mark internal peers.
-        connection_tagger: None,
-    })?;
+        Duration::from_secs(cli.cache_idle_timeout),
+    )?;
 
     if cli.dev {
         // Create a web server too.

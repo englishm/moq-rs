@@ -12,7 +12,9 @@ use moq_transport::{
 };
 use tokio::sync::Semaphore;
 
-use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer, RemoteManager, SessionContext};
+use crate::{
+    metrics::GaugeGuard, Coordinator, Locals, Producer, RemoteManager, SessionContext, TrackRequest,
+};
 
 const MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION: usize = 1024;
 
@@ -254,11 +256,11 @@ impl Consumer {
                     tracing::info!(namespace = %ns, "PUBLISH_NAMESPACE closed");
                     return Ok(());
                 },
-                Some(track) = requests.recv() => {
+                Some(TrackRequest { writer, lease }) = requests.recv() => {
                     let mut subscriber = self.subscriber.clone();
 
                     tasks.push(async move {
-                        let info = track.clone();
+                        let info = writer.info.clone();
                         let namespace = info.namespace.to_utf8_path();
                         let track_name = info.name.clone();
                         tracing::info!(
@@ -267,14 +269,46 @@ impl Consumer {
                             "forwarding subscribe: {:?}", info
                         );
 
-                        if let Err(err) = subscriber.subscribe(track).await {
-                            tracing::warn!(
-                                namespace = %namespace,
-                                track = %track_name,
-                                error = %err,
-                                "failed forwarding subscribe: {:?}", info
-                            )
+                        // Hold the subscription explicitly rather than using
+                        // `subscribe()`, so it can be dropped — sending
+                        // UNSUBSCRIBE — once downstream interest goes away.
+                        let subscribe = match subscriber.subscribe_open(writer).await {
+                            Ok(subscribe) => subscribe,
+                            Err(err) => {
+                                tracing::warn!(
+                                    namespace = %namespace,
+                                    track = %track_name,
+                                    error = %err,
+                                    "failed forwarding subscribe: {:?}", info
+                                );
+                                return Ok(());
+                            }
+                        };
+
+                        tokio::select! {
+                            res = subscribe.closed() => {
+                                if let Err(err) = res {
+                                    tracing::warn!(
+                                        namespace = %namespace,
+                                        track = %track_name,
+                                        error = %err,
+                                        "failed forwarding subscribe: {:?}", info
+                                    )
+                                }
+                            }
+                            // The cached track went unwatched long enough to be
+                            // evicted, so stop pulling it. Dropping `subscribe`
+                            // below sends UNSUBSCRIBE upstream.
+                            _ = lease.released() => {
+                                tracing::info!(
+                                    namespace = %namespace,
+                                    track = %track_name,
+                                    "releasing upstream subscription for idle cached track"
+                                );
+                            }
                         }
+
+                        drop(subscribe);
 
                         Ok(())
                     }.boxed());
@@ -352,13 +386,13 @@ impl Consumer {
         }
 
         tracing::debug!(
-            namespace = %namespace.to_utf8_path(),
+            namespace = %namespace,
             track = %track_name,
             "PUBLISH registered as exact local track"
         );
 
         publish.closed().await?;
-        tracing::info!(namespace = %namespace.to_utf8_path(), track = %track_name, "PUBLISH closed");
+        tracing::info!(namespace = %namespace, track = %track_name, "PUBLISH closed");
 
         Ok(())
     }
