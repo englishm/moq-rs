@@ -83,6 +83,17 @@ impl Drop for PrefixInterest {
             return;
         };
         let Ok(mut slots) = registry.slots.lock() else {
+            // Poisoning means a panic happened while holding the lock, so this
+            // lease can no longer be retired: the upstream namespace pull it
+            // owns leaks for the lifetime of the process. Surface it as a
+            // counter rather than only a log line, since the visible symptom
+            // (upstream subscriptions that never go away) is otherwise hard to
+            // trace back to here.
+            metrics::counter!(
+                "moq_relay_lease_registry_lock_poisoned_total",
+                "operation" => "release"
+            )
+            .increment(1);
             tracing::error!("upstream namespace lease registry lock poisoned");
             return;
         };
@@ -161,11 +172,14 @@ impl UpstreamNamespaces {
             },
             prefix,
         };
-        let mut slots = self
-            .registry
-            .slots
-            .lock()
-            .map_err(|_| anyhow::anyhow!("upstream namespace lease registry lock poisoned"))?;
+        let mut slots = self.registry.slots.lock().map_err(|_| {
+            metrics::counter!(
+                "moq_relay_lease_registry_lock_poisoned_total",
+                "operation" => "acquire"
+            )
+            .increment(1);
+            anyhow::anyhow!("upstream namespace lease registry lock poisoned")
+        })?;
 
         if let Some(interest) = slots.get(&key).and_then(|slot| slot.interest.upgrade()) {
             return Ok(PrefixLease {

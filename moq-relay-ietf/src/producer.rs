@@ -305,7 +305,13 @@ impl Producer {
                         Ok(change) => {
                             self.apply_namespace_change(&mut subscribed_namespace, &mut known_namespaces, change)?;
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Recoverable: a full resync reconstructs the state the
+                            // skipped events would have produced. Counted so that
+                            // sustained churn outgrowing the channel capacity is
+                            // visible before it shows up as latency.
+                            metrics::counter!("moq_relay_change_channel_lagged_total", "channel" => "namespace")
+                                .increment(skipped);
                             self.resync_namespaces(&mut subscribed_namespace, &mut known_namespaces)?;
                         }
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -316,7 +322,9 @@ impl Producer {
                         Ok(change) => {
                             self.apply_track_change(&subscribed_namespace, &mut known_tracks, &mut publish_tasks, change).await?;
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            metrics::counter!("moq_relay_change_channel_lagged_total", "channel" => "track")
+                                .increment(skipped);
                             self.resync_publish_tracks(&subscribed_namespace, &mut known_tracks, &mut publish_tasks).await?;
                         }
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
