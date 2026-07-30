@@ -11,7 +11,7 @@ use moq_transport::{
     session::{Announced, SessionError, Subscriber},
 };
 
-use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer};
+use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer, DEFAULT_SUBSCRIBE_TIMEOUT};
 
 /// Consumer of tracks from a remote Publisher
 #[derive(Clone)]
@@ -28,6 +28,9 @@ pub struct Consumer {
     /// retained before its upstream subscription is released. Zero disables
     /// eviction.
     cache_idle_timeout: Duration,
+    /// How long to wait for the upstream to acknowledge a SUBSCRIBE before
+    /// giving up. Never zero.
+    subscribe_timeout: Duration,
 }
 
 impl Consumer {
@@ -45,6 +48,7 @@ impl Consumer {
             forward,
             scope,
             cache_idle_timeout: DEFAULT_CACHE_IDLE_TIMEOUT,
+            subscribe_timeout: DEFAULT_SUBSCRIBE_TIMEOUT,
         }
     }
 
@@ -55,6 +59,15 @@ impl Consumer {
     /// of [`Consumer::new`] keep compiling.
     pub fn with_cache_idle_timeout(mut self, cache_idle_timeout: Duration) -> Self {
         self.cache_idle_timeout = cache_idle_timeout;
+        self
+    }
+
+    /// Set how long to wait for the upstream to acknowledge a SUBSCRIBE.
+    ///
+    /// A builder method rather than a `new()` parameter so that existing callers
+    /// of [`Consumer::new`] keep compiling.
+    pub fn with_subscribe_timeout(mut self, subscribe_timeout: Duration) -> Self {
+        self.subscribe_timeout = subscribe_timeout;
         self
     }
 
@@ -172,6 +185,7 @@ impl Consumer {
                 // Wait for the next subscriber and serve the track.
                 Some(TrackRequest { writer, lease }) = request.next() => {
                     let mut subscriber = self.subscriber.clone();
+                    let subscribe_timeout = self.subscribe_timeout;
 
                     // Spawn a new task to handle the subscribe
                     tasks.push(async move {
@@ -183,21 +197,32 @@ impl Consumer {
                         // `subscribe()`, so it can be dropped — sending
                         // UNSUBSCRIBE — once downstream interest goes away.
                         //
-                        // The handshake itself is raced against the lease, not just
-                        // the established subscription. `subscribe_open` waits for
-                        // SUBSCRIBE_OK, which an upstream is under no obligation to
-                        // ever send; without this arm a never-acked subscribe would
-                        // pin this task, and the `TrackWriter` it carries, until the
-                        // session died — the resource leak this path exists to avoid.
-                        // Dropping the in-flight future drops the `Subscribe`, whose
-                        // `Drop` sends UNSUBSCRIBE, so cancelling mid-handshake is
-                        // still clean. `remote.rs` races its handshake against
-                        // connection cancellation for the same reason.
+                        // The handshake is bounded two ways, because `subscribe_open`
+                        // waits for SUBSCRIBE_OK and an upstream is under no
+                        // obligation to ever send it. Left unbounded it would pin this
+                        // task, and the `TrackWriter` it carries, until the session
+                        // died — the resource leak this path exists to avoid.
+                        //
+                        // - `lease.released()` covers "nobody downstream is waiting
+                        //   for this track any more", which is the condition that
+                        //   actually matters and needs no arbitrary constant.
+                        // - `subscribe_timeout` covers the rest: a subscriber that is
+                        //   still waiting cannot wait forever on a peer that never
+                        //   answers.
+                        //
+                        // Either way the in-flight future is dropped, which drops the
+                        // `Subscribe`, whose `Drop` sends UNSUBSCRIBE — so giving up
+                        // mid-handshake leaves nothing dangling upstream.
                         let subscribe = tokio::select! {
-                            result = subscriber.subscribe_open(writer) => match result {
-                                Ok(subscribe) => subscribe,
-                                Err(err) => {
+                            result = tokio::time::timeout(subscribe_timeout, subscriber.subscribe_open(writer)) => match result {
+                                Ok(Ok(subscribe)) => subscribe,
+                                Ok(Err(err)) => {
                                     tracing::warn!(namespace = %info.namespace, track = %track_name, error = %err, "failed forwarding subscribe: {:?}, error: {}", info, err);
+                                    return Ok(());
+                                }
+                                Err(_elapsed) => {
+                                    tracing::warn!(namespace = %info.namespace, track = %track_name, timeout = ?subscribe_timeout, "upstream did not acknowledge SUBSCRIBE in time: {:?}", info);
+                                    metrics::counter!("moq_relay_subscribe_timeouts_total", "source" => "local").increment(1);
                                     return Ok(());
                                 }
                             },

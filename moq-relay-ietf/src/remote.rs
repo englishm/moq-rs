@@ -9,14 +9,12 @@ use std::time::Duration;
 
 use moq_native_ietf::quic;
 use moq_transport::coding::TrackNamespace;
-use moq_transport::serve::{
-    Track, TrackInterest, TrackInterestGuard, TrackReader, DEFAULT_CACHE_IDLE_TIMEOUT,
-};
+use moq_transport::serve::{Track, TrackInterest, TrackInterestGuard, TrackReader};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError};
+use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError, RelayTuning};
 
 /// Cache key for upstream relay-to-relay connections.
 ///
@@ -48,9 +46,8 @@ pub struct RemoteManager {
     clients: Vec<quic::Client>,
     remotes: Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
 
-    /// How long an unwatched cross-relay cache entry is retained before its
-    /// upstream subscription is released. Zero disables eviction.
-    cache_idle_timeout: Duration,
+    /// Timeouts applied to this relay's upstream track subscriptions.
+    tuning: RelayTuning,
 }
 
 impl RemoteManager {
@@ -60,7 +57,7 @@ impl RemoteManager {
             coordinator,
             clients,
             remotes: Arc::new(Mutex::new(HashMap::new())),
-            cache_idle_timeout: DEFAULT_CACHE_IDLE_TIMEOUT,
+            tuning: RelayTuning::default(),
         }
     }
 
@@ -70,7 +67,13 @@ impl RemoteManager {
     /// A zero timeout disables idle eviction, holding subscriptions to peer
     /// relays for as long as the peer session lives.
     pub fn with_cache_idle_timeout(mut self, cache_idle_timeout: Duration) -> Self {
-        self.cache_idle_timeout = cache_idle_timeout;
+        self.tuning.cache_idle_timeout = cache_idle_timeout;
+        self
+    }
+
+    /// Override how long to wait for a peer relay to acknowledge a SUBSCRIBE.
+    pub fn with_subscribe_timeout(mut self, subscribe_timeout: Duration) -> Self {
+        self.tuning.subscribe_timeout = subscribe_timeout;
         self
     }
 
@@ -172,7 +175,7 @@ impl RemoteManager {
                 cache_key.0.clone(),
                 cache_key.1,
                 client,
-                self.cache_idle_timeout,
+                self.tuning,
                 Arc::downgrade(&self.remotes),
                 cache_key.clone(),
                 Arc::downgrade(&slot),
@@ -320,8 +323,8 @@ struct Remote {
     connected: Arc<AtomicBool>,
     /// Cancellation token for the session task.
     cancel: CancellationToken,
-    /// Idle timeout applied to this peer's cached track readers.
-    cache_idle_timeout: Duration,
+    /// Timeouts applied to this peer's track subscriptions.
+    tuning: RelayTuning,
 }
 
 impl Remote {
@@ -330,7 +333,7 @@ impl Remote {
         url: Url,
         addr: Option<SocketAddr>,
         client: &quic::Client,
-        cache_idle_timeout: Duration,
+        tuning: RelayTuning,
         remotes: Weak<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
         cache_key: RemoteCacheKey,
         cache_slot: Weak<Mutex<Option<Remote>>>,
@@ -405,7 +408,7 @@ impl Remote {
             tracks: Arc::new(Mutex::new(HashMap::new())),
             connected,
             cancel,
-            cache_idle_timeout,
+            tuning,
         })
     }
 
@@ -477,8 +480,15 @@ impl Remote {
             tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
 
             let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
+
+            // `subscribe_open` waits for SUBSCRIBE_OK, which a peer relay is under
+            // no obligation to ever send, so the handshake is bounded three ways:
+            // the peer connection closing, a wall-clock timeout, and — once the
+            // entry exists — idle eviction. Dropping the in-flight future drops the
+            // `Subscribe`, whose `Drop` sends UNSUBSCRIBE, so giving up here leaves
+            // nothing dangling on the peer.
             let subscribe_result = tokio::select! {
-                result = subscriber.subscribe_open(writer) => result,
+                result = tokio::time::timeout(self.tuning.subscribe_timeout, subscriber.subscribe_open(writer)) => result,
                 _ = cancel.cancelled() => {
                     drop(cached);
                     remove_empty_track_slot(&self.tracks, &key, &slot).await;
@@ -487,11 +497,23 @@ impl Remote {
             };
 
             let subscribe = match subscribe_result {
-                Ok(subscribe) => subscribe,
-                Err(err) => {
+                Ok(Ok(subscribe)) => subscribe,
+                Ok(Err(err)) => {
                     drop(cached);
                     remove_empty_track_slot(&self.tracks, &key, &slot).await;
                     return Err(err.into());
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(remote_url = %url, namespace = %key.0, track = %key.1, timeout = ?self.tuning.subscribe_timeout, "remote relay did not acknowledge SUBSCRIBE in time");
+                    metrics::counter!("moq_relay_subscribe_timeouts_total", "source" => "remote")
+                        .increment(1);
+                    drop(cached);
+                    remove_empty_track_slot(&self.tracks, &key, &slot).await;
+                    anyhow::bail!(
+                        "remote relay {} did not acknowledge SUBSCRIBE within {:?}",
+                        self.url,
+                        self.tuning.subscribe_timeout
+                    );
                 }
             };
 
@@ -516,7 +538,7 @@ impl Remote {
             let cleanup_key = key.clone();
             let cleanup_reader = reader.clone();
             let cleanup_slot = slot.clone();
-            let idle_timeout = self.cache_idle_timeout;
+            let idle_timeout = self.tuning.cache_idle_timeout;
             tokio::spawn(async move {
                 tokio::select! {
                     result = subscribe.closed() => {

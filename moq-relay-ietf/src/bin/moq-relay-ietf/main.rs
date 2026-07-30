@@ -13,7 +13,7 @@ use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
-use moq_relay_ietf::{Coordinator, Relay, RelayConfig, Web, WebConfig};
+use moq_relay_ietf::{Coordinator, Relay, RelayConfig, RelayTuning, Web, WebConfig};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -43,6 +43,12 @@ pub struct Cli {
     /// subscriptions for the lifetime of the upstream session.
     #[arg(long, default_value_t = 30)]
     pub cache_idle_timeout: u64,
+
+    /// Seconds to wait for an upstream to acknowledge a SUBSCRIBE before giving
+    /// up. Must be at least 1: an unbounded wait on a peer is what this timeout
+    /// exists to prevent, so there is no "disabled" setting.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
+    pub subscribe_timeout: u64,
 
     /// The URL of the moq-api server in order to run a cluster.
     /// Must be used in conjunction with --node to advertise the origin
@@ -188,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create a QUIC server for media.
-    let relay = Relay::new_with_cache_idle_timeout(
+    let relay = Relay::new_with_tuning(
         RelayConfig {
             tls: tls.clone(),
             bind: Some(cli.bind),
@@ -199,7 +205,9 @@ async fn main() -> anyhow::Result<()> {
             announce: cli.announce,
             coordinator,
         },
-        Duration::from_secs(cli.cache_idle_timeout),
+        RelayTuning::default()
+            .with_cache_idle_timeout(Duration::from_secs(cli.cache_idle_timeout))
+            .with_subscribe_timeout(Duration::from_secs(cli.subscribe_timeout)),
     )?;
 
     if cli.dev {

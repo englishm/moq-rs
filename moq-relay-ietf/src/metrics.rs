@@ -104,6 +104,10 @@ pub fn describe_metrics() {
         "moq_relay_cache_idle_evictions_total",
         "Cached tracks evicted for having no downstream subscribers, releasing their upstream subscription, by source (local, remote)"
     );
+    describe_counter!(
+        "moq_relay_subscribe_timeouts_total",
+        "Upstream subscriptions abandoned because SUBSCRIBE was not acknowledged within the configured timeout, by source (local, remote)"
+    );
 
     // Gauges
     describe_gauge!(
