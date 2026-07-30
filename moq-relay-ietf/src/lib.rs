@@ -37,6 +37,7 @@ mod api;
 mod consumer;
 mod coordinator;
 mod covering_prefix_set;
+mod interest;
 mod local;
 pub mod metrics;
 mod producer;

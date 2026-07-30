@@ -154,7 +154,7 @@ impl Producer {
         // 1. actual FullTrackName -> TrackReader media cache
         // 2. PUBLISH_NAMESPACE route source, which triggers upstream SUBSCRIBE
         let mut locals = self.locals.clone();
-        if let Some(track) = locals
+        if let Some((track, interest_guard)) = locals
             .get_or_request_track(self.context.scope(), namespace.clone(), &track_name)
             .await
         {
@@ -162,6 +162,9 @@ impl Producer {
             tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
             timing_guard.set_label("source", "local");
             let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
+            // Held until serving finishes. Once the last guard for a cached track
+            // drops, its upstream subscription becomes eligible for release.
+            let _interest_guard = interest_guard;
             return Ok(subscribed.serve(track).await?);
         }
 
@@ -172,13 +175,16 @@ impl Producer {
             .await
         {
             Ok(track) => {
-                if let Some(track) = track {
+                if let Some((track, interest_guard)) = track {
                     let ns = namespace.to_utf8_path();
                     tracing::info!(namespace = %ns, track = %track_name, source = "remote", "serving subscribe from remote: {:?}", track.info);
                     // Update label to indicate remote source, timing recorded on drop
                     timing_guard.set_label("source", "remote");
                     // Track active tracks - decrements when serve completes
                     let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
+                    // Held until serving finishes; the cross-relay subscription is
+                    // released once the last guard for this track drops.
+                    let _interest_guard = interest_guard;
                     return Ok(subscribed.serve(track).await?);
                 }
             }

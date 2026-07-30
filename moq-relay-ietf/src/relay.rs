@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{future::Future, net, path::PathBuf, pin::Pin, sync::Arc};
+use std::{future::Future, net, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::Context;
 
@@ -13,7 +13,7 @@ use url::Url;
 use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
 use crate::{
     metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
-    RelayInfo, RemoteManager, Session, SessionContext,
+    RelayInfo, RemoteManager, Session, SessionContext, DEFAULT_CACHE_IDLE_TIMEOUT,
 };
 
 // A type alias for boxed future
@@ -74,6 +74,18 @@ impl RelayConfig {
     pub fn build(self) -> anyhow::Result<Relay> {
         Relay::new(self)
     }
+
+    /// Build a relay with a custom pull-through cache idle timeout.
+    ///
+    /// See [`Relay::new_with_cache_idle_timeout`]. This is a separate
+    /// constructor rather than a `RelayConfig` field so that adding it does not
+    /// break existing struct-literal construction of [`RelayConfig`].
+    pub fn build_with_cache_idle_timeout(
+        self,
+        cache_idle_timeout: Duration,
+    ) -> anyhow::Result<Relay> {
+        Relay::new_with_cache_idle_timeout(self, cache_idle_timeout)
+    }
 }
 
 /// MoQ Relay server.
@@ -86,7 +98,21 @@ pub struct Relay {
 }
 
 impl Relay {
-    pub fn new(mut config: RelayConfig) -> anyhow::Result<Self> {
+    pub fn new(config: RelayConfig) -> anyhow::Result<Self> {
+        Self::new_with_cache_idle_timeout(config, DEFAULT_CACHE_IDLE_TIMEOUT)
+    }
+
+    /// Create a relay that releases upstream subscriptions for cached tracks that
+    /// have had no downstream subscribers for `cache_idle_timeout`.
+    ///
+    /// The relay caches tracks it does not publish itself so multiple downstream
+    /// subscribers can share one upstream subscription. Without a timeout that
+    /// subscription outlives the last subscriber and the relay keeps receiving a
+    /// track nobody is watching. A zero timeout restores that behaviour.
+    pub fn new_with_cache_idle_timeout(
+        mut config: RelayConfig,
+        cache_idle_timeout: Duration,
+    ) -> anyhow::Result<Self> {
         if config.bind.is_some() && !config.endpoints.is_empty() {
             anyhow::bail!("cannot specify both bind and endpoints");
         }
@@ -115,7 +141,7 @@ impl Relay {
             tracing::info!("mlog output enabled: {}", mlog_dir.display());
         }
 
-        let locals = Locals::new();
+        let locals = Locals::with_cache_idle_timeout(cache_idle_timeout);
 
         // FIXME(itzmanish): have a generic filter to find endpoints for forward, remote etc.
         let remote_clients = config
@@ -129,7 +155,8 @@ impl Relay {
             config.coordinator.clone(),
             remote_clients,
             config.session,
-        );
+        )
+        .with_cache_idle_timeout(cache_idle_timeout);
         let (upstream_namespaces, upstream_namespaces_runner) =
             UpstreamNamespaces::new(locals.clone(), remotes.clone(), config.coordinator.clone());
 
