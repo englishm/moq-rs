@@ -182,10 +182,28 @@ impl Consumer {
                         // Hold the subscription explicitly rather than using
                         // `subscribe()`, so it can be dropped — sending
                         // UNSUBSCRIBE — once downstream interest goes away.
-                        let subscribe = match subscriber.subscribe_open(writer).await {
-                            Ok(subscribe) => subscribe,
-                            Err(err) => {
-                                tracing::warn!(namespace = %info.namespace, track = %track_name, error = %err, "failed forwarding subscribe: {:?}, error: {}", info, err);
+                        //
+                        // The handshake itself is raced against the lease, not just
+                        // the established subscription. `subscribe_open` waits for
+                        // SUBSCRIBE_OK, which an upstream is under no obligation to
+                        // ever send; without this arm a never-acked subscribe would
+                        // pin this task, and the `TrackWriter` it carries, until the
+                        // session died — the resource leak this path exists to avoid.
+                        // Dropping the in-flight future drops the `Subscribe`, whose
+                        // `Drop` sends UNSUBSCRIBE, so cancelling mid-handshake is
+                        // still clean. `remote.rs` races its handshake against
+                        // connection cancellation for the same reason.
+                        let subscribe = tokio::select! {
+                            result = subscriber.subscribe_open(writer) => match result {
+                                Ok(subscribe) => subscribe,
+                                Err(err) => {
+                                    tracing::warn!(namespace = %info.namespace, track = %track_name, error = %err, "failed forwarding subscribe: {:?}, error: {}", info, err);
+                                    return Ok(());
+                                }
+                            },
+                            _ = lease.released() => {
+                                tracing::info!(namespace = %info.namespace, track = %track_name, "abandoning upstream subscribe for idle cached track");
+                                metrics::counter!("moq_relay_cache_idle_evictions_total", "source" => "local").increment(1);
                                 return Ok(());
                             }
                         };
