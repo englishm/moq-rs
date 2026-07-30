@@ -65,9 +65,11 @@ pub struct TrackRequest {
     /// Reports whether the upstream subscription was established.
     ///
     /// Downstream subscribers wait on this before SUBSCRIBE_OK is sent, so the
-    /// requester must resolve it exactly once — via
-    /// [`UpstreamReadyTx::established`] or [`UpstreamReadyTx::failed`] — as soon
-    /// as the upstream publisher answers.
+    /// requester must report the outcome as soon as the upstream publisher
+    /// answers — via [`UpstreamReadyTx::established`] or
+    /// [`UpstreamReadyTx::failed`] — or drop the sender to abandon the request,
+    /// which releases any waiting subscribers with an error rather than
+    /// stranding them until the upstream response timeout.
     pub upstream: UpstreamReadyTx,
 }
 

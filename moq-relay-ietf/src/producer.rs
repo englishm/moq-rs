@@ -172,13 +172,17 @@ impl Producer {
             // entry exists before its upstream subscription does, so wait for it.
             if let Some(upstream) = local.upstream {
                 if let Err(err) = Self::await_upstream(&subscribed, &upstream).await {
+                    // Distinguish a cancelled SUBSCRIBE from a genuine upstream
+                    // failure, so the latency histogram is not polluted with
+                    // subscribers that simply went away while waiting.
                     if Self::is_expected_serve_shutdown_err(&err) {
                         tracing::debug!(namespace = %ns, track = %track_name, error = %err, "downstream subscriber left before the upstream subscription was established");
+                        timing_guard.set_label("source", "downstream_left");
                     } else {
                         tracing::warn!(namespace = %ns, track = %track_name, error = %err, "upstream subscription could not be established");
                         metrics::counter!("moq_relay_subscribe_upstream_errors_total").increment(1);
+                        timing_guard.set_label("source", "upstream_error");
                     }
-                    timing_guard.set_label("source", "upstream_error");
 
                     // Rejects when the subscription is already closed (the
                     // downstream-left case), which is fine: the error below is

@@ -51,7 +51,7 @@
 //!
 //! | Name | Labels | Description |
 //! |------|--------|-------------|
-//! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, route_error, upstream_error) |
+//! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, route_error, upstream_error, downstream_left) |
 
 use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
 
@@ -168,7 +168,7 @@ pub fn describe_metrics() {
     describe_histogram!(
         "moq_relay_subscribe_latency_seconds",
         Unit::Seconds,
-        "Time to resolve subscription by source (local, remote, not_found, route_error, upstream_error)"
+        "Time to resolve subscription by source (local, remote, not_found, route_error, upstream_error, downstream_left)"
     );
 }
 
