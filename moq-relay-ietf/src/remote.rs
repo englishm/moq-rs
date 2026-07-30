@@ -922,7 +922,7 @@ impl Remote {
             anyhow::bail!("remote connection to {} is closed", self.url);
         }
 
-        tracing::info!(remote_url = %self.url, prefix = %prefix.to_utf8_path(), "forwarding SUBSCRIBE_NAMESPACE to remote relay");
+        tracing::info!(remote_url = %self.url, prefix = %prefix, "forwarding SUBSCRIBE_NAMESPACE to remote relay");
 
         let mut subscriber = self.subscriber.clone();
         let subscribe_namespace = tokio::select! {
@@ -947,7 +947,7 @@ impl Remote {
             anyhow::bail!("remote connection to {} is closed", self.url);
         }
 
-        tracing::info!(remote_url = %self.url, namespace = %tracks.namespace.to_utf8_path(), "forwarding PUBLISH_NAMESPACE to remote relay");
+        tracing::info!(remote_url = %self.url, namespace = %tracks.namespace, "forwarding PUBLISH_NAMESPACE to remote relay");
 
         let mut publisher = self.publisher.clone();
         tokio::select! {

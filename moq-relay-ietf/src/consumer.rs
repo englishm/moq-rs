@@ -386,13 +386,13 @@ impl Consumer {
         }
 
         tracing::debug!(
-            namespace = %namespace.to_utf8_path(),
+            namespace = %namespace,
             track = %track_name,
             "PUBLISH registered as exact local track"
         );
 
         publish.closed().await?;
-        tracing::info!(namespace = %namespace.to_utf8_path(), track = %track_name, "PUBLISH closed");
+        tracing::info!(namespace = %namespace, track = %track_name, "PUBLISH closed");
 
         Ok(())
     }

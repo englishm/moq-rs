@@ -239,7 +239,7 @@ impl Producer {
                 Ok(lease) => Some(lease),
                 Err(error) => {
                     tracing::error!(
-                        prefix = %subscribed_namespace.namespace_prefix.to_utf8_path(),
+                        prefix = %subscribed_namespace.namespace_prefix,
                         error = %error,
                         "failed to acquire shared upstream namespace lease; serving local state only"
                     );

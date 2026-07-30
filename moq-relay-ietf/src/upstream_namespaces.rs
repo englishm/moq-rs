@@ -518,7 +518,7 @@ impl UpstreamNamespacesRunner {
             Err(error) => {
                 tracing::error!(
                     scope = key.group.scope.as_deref().unwrap_or("<unscoped>"),
-                    prefix = %key.prefix.to_utf8_path(),
+                    prefix = %key.prefix,
                     error = %error,
                     "failed to register shared upstream namespace interest"
                 );
@@ -611,7 +611,7 @@ impl UpstreamNamespacesRunner {
                     }
                     Err(error) => {
                         tracing::error!(
-                            namespace = %namespace.to_utf8_path(),
+                            namespace = %namespace,
                             error = %error,
                             "failed to register upstream namespace source"
                         );

@@ -103,7 +103,7 @@ impl CacheLease {
             // A subscriber arrived between the timer firing and the eviction
             // taking the lock, so the entry is busy again. Go back to waiting.
             tracing::trace!(
-                namespace = %self.full_name.namespace.to_utf8_path(),
+                namespace = %self.full_name.namespace,
                 track = %self.full_name.name,
                 "cache eviction abandoned; downstream interest returned"
             );
@@ -542,7 +542,7 @@ impl Locals {
         }
 
         tracing::debug!(
-            namespace = %full_name.namespace.to_utf8_path(),
+            namespace = %full_name.namespace,
             track = %full_name.name,
             "evicting idle cached track and releasing upstream subscription"
         );
