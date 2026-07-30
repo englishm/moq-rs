@@ -31,6 +31,22 @@ pub struct Producer {
     context: SessionContext,
 }
 
+/// Why the wait for upstream readiness ended without the subscription being
+/// established.
+///
+/// The two cases carry the same [`ServeError`] variants — an upstream rejection
+/// can be `Cancel` or `Done` just as a departing subscriber can — so the
+/// direction has to come from which branch resolved rather than from the error.
+/// Getting it wrong misreports publisher failures as subscriber cancellations in
+/// the subscribe metrics.
+enum UpstreamWait {
+    /// The upstream subscription could not be established.
+    UpstreamFailed(ServeError),
+
+    /// The downstream subscriber went away before it was established.
+    DownstreamLeft(ServeError),
+}
+
 impl Producer {
     pub fn new(
         publisher: Publisher,
@@ -171,18 +187,26 @@ impl Producer {
             // subscription before it sends SUBSCRIBE_OK. A pull-through cache
             // entry exists before its upstream subscription does, so wait for it.
             if let Some(upstream) = local.upstream {
-                if let Err(err) = Self::await_upstream(&subscribed, &upstream).await {
-                    // Distinguish a cancelled SUBSCRIBE from a genuine upstream
-                    // failure, so the latency histogram is not polluted with
-                    // subscribers that simply went away while waiting.
-                    if Self::is_expected_serve_shutdown_err(&err) {
-                        tracing::debug!(namespace = %ns, track = %track_name, error = %err, "downstream subscriber left before the upstream subscription was established");
-                        timing_guard.set_label("source", "downstream_left");
-                    } else {
-                        tracing::warn!(namespace = %ns, track = %track_name, error = %err, "upstream subscription could not be established");
-                        metrics::counter!("moq_relay_subscribe_upstream_errors_total").increment(1);
-                        timing_guard.set_label("source", "upstream_error");
-                    }
+                if let Err(outcome) = Self::await_upstream(&subscribed, &upstream).await {
+                    // Which side ended the wait is decided by the branch that
+                    // resolved, not by the error variant: an upstream failure can
+                    // itself be Cancel or Done, so sniffing the variant would
+                    // report a publisher-side failure as a subscriber cancellation
+                    // and skip the upstream-error counter.
+                    let err = match outcome {
+                        UpstreamWait::DownstreamLeft(err) => {
+                            tracing::debug!(namespace = %ns, track = %track_name, error = %err, "downstream subscriber left before the upstream subscription was established");
+                            timing_guard.set_label("source", "downstream_left");
+                            err
+                        }
+                        UpstreamWait::UpstreamFailed(err) => {
+                            tracing::warn!(namespace = %ns, track = %track_name, error = %err, "upstream subscription could not be established");
+                            metrics::counter!("moq_relay_subscribe_upstream_errors_total")
+                                .increment(1);
+                            timing_guard.set_label("source", "upstream_error");
+                            err
+                        }
+                    };
 
                     // Rejects when the subscription is already closed (the
                     // downstream-left case), which is fine: the error below is
@@ -250,14 +274,17 @@ impl Producer {
     ///
     /// Also completes when the downstream subscriber goes away first, so a
     /// cancelled SUBSCRIBE is not held here for the full upstream response
-    /// timeout.
+    /// timeout. The two cases are reported separately because they cannot be
+    /// told apart from the error alone — see [`UpstreamWait`].
     async fn await_upstream(
         subscribed: &Subscribed,
         upstream: &UpstreamReady,
-    ) -> Result<(), ServeError> {
+    ) -> Result<(), UpstreamWait> {
         tokio::select! {
-            res = upstream.established() => res,
-            res = subscribed.closed() => Err(res.err().unwrap_or(ServeError::Done)),
+            res = upstream.established() => res.map_err(UpstreamWait::UpstreamFailed),
+            res = subscribed.closed() => Err(UpstreamWait::DownstreamLeft(
+                res.err().unwrap_or(ServeError::Done),
+            )),
         }
     }
 
