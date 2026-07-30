@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{future::Future, net, path::PathBuf, pin::Pin, sync::Arc};
+use std::{future::Future, net, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::Context;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
+use moq_transport::serve::DEFAULT_CACHE_IDLE_TIMEOUT;
 use url::Url;
 
 use crate::{metrics::GaugeGuard, Consumer, Coordinator, Locals, Producer, RemoteManager, Session};
@@ -63,10 +64,25 @@ pub struct Relay {
     locals: Locals,
     remotes: RemoteManager,
     coordinator: Arc<dyn Coordinator>,
+    cache_idle_timeout: Duration,
 }
 
 impl Relay {
     pub fn new(config: RelayConfig) -> anyhow::Result<Self> {
+        Self::new_with_cache_idle_timeout(config, DEFAULT_CACHE_IDLE_TIMEOUT)
+    }
+
+    /// Create a relay that releases upstream subscriptions for cached tracks that
+    /// have had no downstream subscribers for `cache_idle_timeout`.
+    ///
+    /// The relay caches tracks it does not publish itself so multiple downstream
+    /// subscribers can share one upstream subscription. Without a timeout that
+    /// subscription outlives the last subscriber and the relay keeps receiving a
+    /// track nobody is watching. A zero timeout restores that behaviour.
+    pub fn new_with_cache_idle_timeout(
+        config: RelayConfig,
+        cache_idle_timeout: Duration,
+    ) -> anyhow::Result<Self> {
         if config.bind.is_some() && !config.endpoints.is_empty() {
             anyhow::bail!("cannot specify both bind and endpoints");
         }
@@ -106,7 +122,8 @@ impl Relay {
             .collect::<Vec<_>>();
 
         // Create remote manager - uses coordinator for namespace lookups
-        let remotes = RemoteManager::new(config.coordinator.clone(), remote_clients);
+        let remotes = RemoteManager::new(config.coordinator.clone(), remote_clients)
+            .with_cache_idle_timeout(cache_idle_timeout);
 
         Ok(Self {
             quic_endpoints: endpoints,
@@ -115,6 +132,7 @@ impl Relay {
             locals,
             remotes,
             coordinator: config.coordinator,
+            cache_idle_timeout,
         })
     }
 
@@ -127,6 +145,7 @@ impl Relay {
             locals,
             remotes,
             coordinator,
+            cache_idle_timeout,
         } = self;
 
         let run_result = async {
@@ -176,13 +195,16 @@ impl Relay {
                         remote_manager.clone(),
                         forward_scope.clone(),
                     )),
-                    consumer: Some(Consumer::new(
-                        subscriber,
-                        locals.clone(),
-                        forward_coordinator,
-                        None,
-                        forward_scope,
-                    )),
+                    consumer: Some(
+                        Consumer::new(
+                            subscriber,
+                            locals.clone(),
+                            forward_coordinator,
+                            None,
+                            forward_scope,
+                        )
+                        .with_cache_idle_timeout(cache_idle_timeout),
+                    ),
                     // Forward connections are always full read-write relay peers,
                     // so no reject loops needed.
                     reject_publishes: None,
@@ -322,7 +344,7 @@ impl Relay {
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id)), None)
+                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id).with_cache_idle_timeout(cache_idle_timeout)), None)
                             } else {
                                 (None, subscriber)
                             };

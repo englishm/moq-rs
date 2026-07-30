@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    serve::Tracks,
+    serve::{TrackRequest, Tracks, DEFAULT_CACHE_IDLE_TIMEOUT},
     session::{Announced, SessionError, Subscriber},
 };
 
@@ -23,6 +24,10 @@ pub struct Consumer {
     /// Produced by `Coordinator::resolve_scope()` from the connection path.
     /// Passed to coordinator register/lookup calls to isolate namespaces.
     scope: Option<String>,
+    /// How long a pull-through cache entry with no downstream subscribers is
+    /// retained before its upstream subscription is released. Zero disables
+    /// eviction.
+    cache_idle_timeout: Duration,
 }
 
 impl Consumer {
@@ -39,7 +44,18 @@ impl Consumer {
             coordinator,
             forward,
             scope,
+            cache_idle_timeout: DEFAULT_CACHE_IDLE_TIMEOUT,
         }
+    }
+
+    /// Set how long an unwatched cached track is retained before its upstream
+    /// subscription is released.
+    ///
+    /// A builder method rather than a `new()` parameter so that existing callers
+    /// of [`Consumer::new`] keep compiling.
+    pub fn with_cache_idle_timeout(mut self, cache_idle_timeout: Duration) -> Self {
+        self.cache_idle_timeout = cache_idle_timeout;
+        self
     }
 
     /// Run the consumer to serve announce requests.
@@ -80,7 +96,8 @@ impl Consumer {
         let mut tasks = FuturesUnordered::new();
 
         // Produce the tracks for this announce and return the reader
-        let (_, mut request, reader) = Tracks::new(announce.namespace.clone()).produce();
+        let (_, mut request, reader) = Tracks::new(announce.namespace.clone())
+            .produce_with_cache_idle_timeout(self.cache_idle_timeout);
 
         // should we allow the same namespace being served from multiple relays??
         // Manish: NO.
@@ -158,20 +175,43 @@ impl Consumer {
                 },
 
                 // Wait for the next subscriber and serve the track.
-                Some(track) = request.next() => {
+                Some(TrackRequest { writer, lease }) = request.next() => {
                     let mut subscriber = self.subscriber.clone();
 
                     // Spawn a new task to handle the subscribe
                     tasks.push(async move {
-                        let info = track.clone();
+                        let info = writer.info.clone();
                         let namespace = info.namespace.to_utf8_path();
                         let track_name = info.name.clone();
                         tracing::info!(namespace = %namespace, track = %track_name, "forwarding subscribe: {:?}", info);
 
-                        // Forward the subscribe request
-                        if let Err(err) = subscriber.subscribe(track).await {
-                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed forwarding subscribe: {:?}, error: {}", info, err)
+                        // Hold the subscription explicitly rather than using
+                        // `subscribe()`, so it can be dropped — sending
+                        // UNSUBSCRIBE — once downstream interest goes away.
+                        let subscribe = match subscriber.subscribe_open(writer).await {
+                            Ok(subscribe) => subscribe,
+                            Err(err) => {
+                                tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed forwarding subscribe: {:?}, error: {}", info, err);
+                                return Ok(());
+                            }
+                        };
+
+                        tokio::select! {
+                            res = subscribe.closed() => {
+                                if let Err(err) = res {
+                                    tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed forwarding subscribe: {:?}, error: {}", info, err)
+                                }
+                            }
+                            // The cached track went unwatched long enough to be
+                            // evicted, so stop pulling it. Dropping `subscribe`
+                            // below sends UNSUBSCRIBE upstream.
+                            _ = lease.released() => {
+                                tracing::info!(namespace = %namespace, track = %track_name, "releasing upstream subscription for idle cached track");
+                                metrics::counter!("moq_relay_cache_idle_evictions_total", "source" => "local").increment(1);
+                            }
                         }
+
+                        drop(subscribe);
 
                         Ok(())
                     }.boxed());

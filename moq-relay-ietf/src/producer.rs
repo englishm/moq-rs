@@ -110,13 +110,17 @@ impl Producer {
         // Check local tracks first, and serve from local if possible
         if let Some(mut local) = self.locals.retrieve(self.scope.as_deref(), &namespace) {
             // Pass the full requested namespace, not the announced prefix
-            if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
+            if let Some((track, interest)) = local.subscribe(namespace.clone(), &track_name) {
                 let ns = namespace.to_utf8_path();
                 tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
                 // Update label to indicate local source, timing recorded on drop
                 timing_guard.set_label("source", "local");
                 // Track active tracks - decrements when serve completes
                 let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
+                // Hold the downstream-interest guard for as long as we are
+                // serving, so the cache entry backing this reader is not evicted
+                // (and its upstream subscription released) underneath us.
+                let _interest = interest;
                 return Ok(subscribed.serve(track).await?);
             }
         }
@@ -128,13 +132,18 @@ impl Producer {
             .await
         {
             Ok(track) => {
-                if let Some(track) = track {
+                if let Some((track, interest)) = track {
                     let ns = namespace.to_utf8_path();
                     tracing::info!(namespace = %ns, track = %track_name, source = "remote", "serving subscribe from remote: {:?}", track.info);
                     // Update label to indicate remote source, timing recorded on drop
                     timing_guard.set_label("source", "remote");
                     // Track active tracks - decrements when serve completes
                     let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
+                    // Hold the downstream-interest guard for as long as we are
+                    // serving, so the cross-relay cache entry backing this reader
+                    // is not evicted (and its peer subscription released) while
+                    // we are still forwarding from it.
+                    let _interest = interest;
                     return Ok(subscribed.serve(track).await?);
                 }
             }

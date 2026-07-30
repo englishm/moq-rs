@@ -111,11 +111,14 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
                     });
                 });
 
-                tracks.push(
-                    self.broadcast
-                        .subscribe(self.broadcast.namespace.clone(), &name)
-                        .context("no track")?,
-                );
+                // The track was just created locally by `tracks_writer.create`,
+                // so this is a plain cache hit with no pull-through interest to
+                // register (hence no guard to hold).
+                let (track_reader, _interest) = self
+                    .broadcast
+                    .subscribe(self.broadcast.namespace.clone(), &name)
+                    .context("no track")?;
+                tracks.push(track_reader);
             }
         }
 
@@ -151,7 +154,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             });
         });
 
-        let track = self
+        let (track, _interest) = self
             .broadcast
             .subscribe(self.broadcast.namespace.clone(), track_name)
             .context(format!("no {alias} track"))?;

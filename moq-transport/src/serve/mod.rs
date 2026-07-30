@@ -4,6 +4,7 @@
 
 mod datagram;
 mod error;
+mod interest;
 mod object;
 mod stream;
 mod subgroup;
@@ -12,6 +13,7 @@ mod tracks;
 
 pub use datagram::*;
 pub use error::*;
+pub use interest::*;
 pub use object::*;
 pub use stream::*;
 pub use subgroup::*;

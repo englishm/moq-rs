@@ -5,6 +5,7 @@ mod api_coordinator;
 mod file_coordinator;
 
 use std::sync::Arc;
+use std::time::Duration;
 use std::{net, path::PathBuf};
 
 use clap::Parser;
@@ -36,6 +37,12 @@ pub struct Cli {
     /// If not provided, the relay accepts every unique announce.
     #[arg(long)]
     pub announce: Option<Url>,
+
+    /// Seconds to keep a cached track with no subscribers before releasing its
+    /// upstream subscription. 0 disables eviction, holding upstream
+    /// subscriptions for the lifetime of the upstream session.
+    #[arg(long, default_value_t = 30)]
+    pub cache_idle_timeout: u64,
 
     /// The URL of the moq-api server in order to run a cluster.
     /// Must be used in conjunction with --node to advertise the origin
@@ -181,16 +188,19 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create a QUIC server for media.
-    let relay = Relay::new(RelayConfig {
-        tls: tls.clone(),
-        bind: Some(cli.bind),
-        endpoints: vec![],
-        qlog_dir: qlog_dir_for_relay,
-        mlog_dir: mlog_dir_for_relay,
-        node: cli.node,
-        announce: cli.announce,
-        coordinator,
-    })?;
+    let relay = Relay::new_with_cache_idle_timeout(
+        RelayConfig {
+            tls: tls.clone(),
+            bind: Some(cli.bind),
+            endpoints: vec![],
+            qlog_dir: qlog_dir_for_relay,
+            mlog_dir: mlog_dir_for_relay,
+            node: cli.node,
+            announce: cli.announce,
+            coordinator,
+        },
+        Duration::from_secs(cli.cache_idle_timeout),
+    )?;
 
     if cli.dev {
         // Create a web server too.

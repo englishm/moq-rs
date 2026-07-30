@@ -5,10 +5,13 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use moq_native_ietf::quic;
 use moq_transport::coding::TrackNamespace;
-use moq_transport::serve::{Track, TrackReader};
+use moq_transport::serve::{
+    Track, TrackInterest, TrackInterestGuard, TrackReader, DEFAULT_CACHE_IDLE_TIMEOUT,
+};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -22,7 +25,17 @@ use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError};
 type RemoteCacheKey = (Url, Option<SocketAddr>);
 type RemoteSlot = Arc<Mutex<Option<Remote>>>;
 type TrackCacheKey = (TrackNamespace, String);
-type TrackSlot = Arc<Mutex<Option<TrackReader>>>;
+type TrackSlot = Arc<Mutex<Option<CachedTrack>>>;
+
+/// A cached cross-relay track reader plus the downstream interest in it.
+#[derive(Clone)]
+struct CachedTrack {
+    reader: TrackReader,
+
+    /// Interest in this cached reader. When it goes idle for the configured
+    /// grace period the upstream subscription to the peer relay is released.
+    interest: TrackInterest,
+}
 
 /// Manages connections to remote relays.
 ///
@@ -34,6 +47,10 @@ pub struct RemoteManager {
     coordinator: Arc<dyn Coordinator>,
     clients: Vec<quic::Client>,
     remotes: Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
+
+    /// How long an unwatched cross-relay cache entry is retained before its
+    /// upstream subscription is released. Zero disables eviction.
+    cache_idle_timeout: Duration,
 }
 
 impl RemoteManager {
@@ -43,7 +60,18 @@ impl RemoteManager {
             coordinator,
             clients,
             remotes: Arc::new(Mutex::new(HashMap::new())),
+            cache_idle_timeout: DEFAULT_CACHE_IDLE_TIMEOUT,
         }
+    }
+
+    /// Override how long an unwatched cross-relay cache entry is retained before
+    /// its upstream subscription is released.
+    ///
+    /// A zero timeout disables idle eviction, holding subscriptions to peer
+    /// relays for as long as the peer session lives.
+    pub fn with_cache_idle_timeout(mut self, cache_idle_timeout: Duration) -> Self {
+        self.cache_idle_timeout = cache_idle_timeout;
+        self
     }
 
     /// Subscribe to a track from a remote relay.
@@ -57,7 +85,7 @@ impl RemoteManager {
         scope: Option<&str>,
         namespace: &TrackNamespace,
         track_name: &str,
-    ) -> anyhow::Result<Option<TrackReader>> {
+    ) -> anyhow::Result<Option<(TrackReader, TrackInterestGuard)>> {
         let (origin, client) = match self.coordinator.lookup(scope, namespace).await {
             Ok(result) => result,
             Err(CoordinatorError::NamespaceNotFound) => return Ok(None),
@@ -144,6 +172,7 @@ impl RemoteManager {
                 cache_key.0.clone(),
                 cache_key.1,
                 client,
+                self.cache_idle_timeout,
                 Arc::downgrade(&self.remotes),
                 cache_key.clone(),
                 Arc::downgrade(&slot),
@@ -218,6 +247,52 @@ async fn remove_empty_remote_slot(
     }
 }
 
+/// Clear a cached cross-relay track once it has been unwatched for `timeout`.
+///
+/// Resolving means the caller should drop its subscription to the peer relay. The
+/// slot is cleared *before* returning, while the lock is still held, so a
+/// subscriber arriving afterwards misses the cache and re-subscribes instead of
+/// attaching to a reader whose upstream subscription is being torn down.
+///
+/// The idle re-check happens under the slot lock, which is also where interest
+/// guards are created, so a subscriber racing eviction is either counted here
+/// (and we keep waiting) or misses the slot entirely.
+///
+/// Never resolves when `timeout` is zero, preserving the previous behaviour of
+/// holding the subscription for as long as the peer session lives.
+async fn evict_when_idle(slot: &TrackSlot, interest: &TrackInterest, timeout: Duration) {
+    if timeout.is_zero() {
+        // Idle eviction disabled.
+        std::future::pending::<()>().await;
+    }
+
+    loop {
+        interest.idle_for(timeout).await;
+
+        let mut cached = slot.lock().await;
+
+        // A different generation now owns the slot; it has its own idle timer, so
+        // this subscription is no longer serving anything and must not clear it.
+        let ours = matches!(
+            cached.as_ref(),
+            Some(current) if current.interest.same_generation(interest)
+        );
+
+        if !ours {
+            return;
+        }
+
+        if interest.is_idle() {
+            cached.take();
+            return;
+        }
+
+        // Interest returned between the timer firing and taking the lock, so keep
+        // serving and start waiting again.
+        drop(cached);
+    }
+}
+
 async fn remove_empty_track_slot(
     tracks: &Arc<Mutex<HashMap<TrackCacheKey, TrackSlot>>>,
     key: &TrackCacheKey,
@@ -245,6 +320,8 @@ struct Remote {
     connected: Arc<AtomicBool>,
     /// Cancellation token for the session task.
     cancel: CancellationToken,
+    /// Idle timeout applied to this peer's cached track readers.
+    cache_idle_timeout: Duration,
 }
 
 impl Remote {
@@ -253,6 +330,7 @@ impl Remote {
         url: Url,
         addr: Option<SocketAddr>,
         client: &quic::Client,
+        cache_idle_timeout: Duration,
         remotes: Weak<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
         cache_key: RemoteCacheKey,
         cache_slot: Weak<Mutex<Option<Remote>>>,
@@ -327,6 +405,7 @@ impl Remote {
             tracks: Arc::new(Mutex::new(HashMap::new())),
             connected,
             cancel,
+            cache_idle_timeout,
         })
     }
 
@@ -351,7 +430,7 @@ impl Remote {
         &self,
         namespace: TrackNamespace,
         track_name: String,
-    ) -> anyhow::Result<Option<TrackReader>> {
+    ) -> anyhow::Result<Option<(TrackReader, TrackInterestGuard)>> {
         let key = (namespace.clone(), track_name.clone());
 
         loop {
@@ -378,9 +457,11 @@ impl Remote {
                 continue;
             }
 
-            if let Some(reader) = cached.as_ref() {
-                if !reader.is_closed() {
-                    return Ok(Some(reader.clone()));
+            if let Some(entry) = cached.as_ref() {
+                if !entry.reader.is_closed() {
+                    // Register interest while still holding the slot lock, which
+                    // is the same lock idle eviction re-checks under.
+                    return Ok(Some((entry.reader.clone(), entry.interest.guard())));
                 }
 
                 tracing::debug!(remote_url = %self.url, namespace = %key.0, track = %key.1, "removing closed remote track from cache");
@@ -420,12 +501,22 @@ impl Remote {
                 anyhow::bail!("remote connection to {} is closed", self.url);
             }
 
-            *cached = Some(reader.clone());
+            let interest = TrackInterest::new();
+
+            // Take this caller's guard before the entry becomes visible, so the
+            // cleanup task cannot see a brand new entry as idle.
+            let guard = interest.guard();
+
+            *cached = Some(CachedTrack {
+                reader: reader.clone(),
+                interest: interest.clone(),
+            });
             drop(cached);
 
             let cleanup_key = key.clone();
             let cleanup_reader = reader.clone();
             let cleanup_slot = slot.clone();
+            let idle_timeout = self.cache_idle_timeout;
             tokio::spawn(async move {
                 tokio::select! {
                     result = subscribe.closed() => {
@@ -441,11 +532,23 @@ impl Remote {
                     _ = cancel.cancelled() => {
                         tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription cancelled");
                     }
+                    // Nobody downstream is watching this cross-relay track any
+                    // more, so stop pulling it from the peer relay. The slot is
+                    // already cleared by the time this resolves, so a later
+                    // subscriber re-subscribes rather than attaching to a reader
+                    // that is about to go silent.
+                    _ = evict_when_idle(&cleanup_slot, &interest, idle_timeout) => {
+                        tracing::info!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "releasing idle remote track subscription");
+                        metrics::counter!("moq_relay_cache_idle_evictions_total", "source" => "remote").increment(1);
+                    }
                 }
+
+                // Sends UNSUBSCRIBE to the peer relay if it is still open.
+                drop(subscribe);
 
                 if let Some(tracks) = tracks.upgrade() {
                     let mut cached = cleanup_slot.lock().await;
-                    if matches!(cached.as_ref(), Some(current) if Arc::ptr_eq(&current.info, &cleanup_reader.info))
+                    if matches!(cached.as_ref(), Some(current) if Arc::ptr_eq(&current.reader.info, &cleanup_reader.info))
                     {
                         cached.take();
                     }
@@ -455,7 +558,7 @@ impl Remote {
                 }
             });
 
-            return Ok(Some(reader));
+            return Ok(Some((reader, guard)));
         }
     }
 }
@@ -466,5 +569,99 @@ impl std::fmt::Debug for Remote {
             .field("url", &self.url.to_string())
             .field("connected", &self.is_connected())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GRACE: Duration = Duration::from_secs(30);
+
+    fn cached_track() -> (TrackSlot, TrackInterest) {
+        let (_writer, reader) = Track::new(
+            TrackNamespace::from_utf8_path("example.com"),
+            "video".to_string(),
+        )
+        .produce();
+        let interest = TrackInterest::new();
+        let slot: TrackSlot = Arc::new(Mutex::new(Some(CachedTrack {
+            reader,
+            interest: interest.clone(),
+        })));
+        (slot, interest)
+    }
+
+    /// The slot must be cleared before the caller drops its peer subscription, so
+    /// a later subscriber re-subscribes instead of attaching to a dying reader.
+    #[tokio::test(start_paused = true)]
+    async fn evict_when_idle_clears_the_slot_once_unwatched() {
+        let (slot, interest) = cached_track();
+
+        evict_when_idle(&slot, &interest, GRACE).await;
+
+        assert!(
+            slot.lock().await.is_none(),
+            "slot must be cleared before the subscription is released"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn evict_when_idle_waits_for_the_last_subscriber() {
+        let (slot, interest) = cached_track();
+        let guard = interest.guard();
+
+        let evict = evict_when_idle(&slot, &interest, GRACE);
+        tokio::pin!(evict);
+
+        tokio::select! {
+            _ = &mut evict => panic!("evicted a track that still has a subscriber"),
+            _ = tokio::time::sleep(GRACE * 4) => {}
+        }
+        assert!(slot.lock().await.is_some());
+
+        drop(guard);
+        evict.await;
+        assert!(slot.lock().await.is_none());
+    }
+
+    /// A replacement generation owns the slot now, so this subscription is stale:
+    /// it should be released without disturbing the new entry.
+    #[tokio::test(start_paused = true)]
+    async fn evict_when_idle_leaves_a_replacement_generation_alone() {
+        let (slot, interest) = cached_track();
+        let (_replacement_slot, replacement_interest) = cached_track();
+
+        {
+            let mut cached = slot.lock().await;
+            let reader = cached.as_ref().unwrap().reader.clone();
+            *cached = Some(CachedTrack {
+                reader,
+                interest: replacement_interest.clone(),
+            });
+        }
+
+        // Resolves (so the stale subscription is dropped) but must not clear the
+        // slot the replacement is using.
+        evict_when_idle(&slot, &interest, GRACE).await;
+
+        assert!(
+            slot.lock().await.is_some(),
+            "a stale lease must not evict the replacement entry"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn evict_when_idle_is_disabled_by_a_zero_timeout() {
+        let (slot, interest) = cached_track();
+
+        tokio::select! {
+            _ = evict_when_idle(&slot, &interest, Duration::ZERO) => {
+                panic!("a zero timeout must disable eviction")
+            }
+            _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
+        }
+
+        assert!(slot.lock().await.is_some());
     }
 }
