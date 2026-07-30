@@ -335,7 +335,7 @@ impl Drop for TracksRequest {
         if !pending_tracks.is_empty() {
             tracing::debug!(
                 target: "moq_transport::tracks",
-                namespace = %self.info.namespace.to_utf8_path(),
+                namespace = %self.info.namespace,
                 count = pending_tracks.len(),
                 "TracksRequest dropped with pending track requests"
             );
@@ -419,7 +419,7 @@ impl TracksReader {
                 // Track is still active, return the cached reader
                 tracing::debug!(
                     target: "moq_transport::tracks",
-                    namespace = %namespace.to_utf8_path(),
+                    namespace = %namespace,
                     track = %track_name,
                     "track cache hit (active)"
                 );
@@ -429,7 +429,7 @@ impl TracksReader {
             // Track is closed/stale, fall through to create a new one
             tracing::debug!(
                 target: "moq_transport::tracks",
-                namespace = %namespace.to_utf8_path(),
+                namespace = %namespace,
                 track = %track_name,
                 "track cache hit but stale, will evict and re-request"
             );
@@ -463,7 +463,7 @@ impl TracksReader {
         if self.queue.push(TrackRequest { writer, lease }).is_err() {
             tracing::debug!(
                 target: "moq_transport::tracks",
-                namespace = %namespace.to_utf8_path(),
+                namespace = %namespace,
                 track = %track_name,
                 "track request queue closed"
             );
@@ -481,7 +481,7 @@ impl TracksReader {
 
         tracing::debug!(
             target: "moq_transport::tracks",
-            namespace = %namespace.to_utf8_path(),
+            namespace = %namespace,
             track = %track_name,
             "track cache miss, requested from upstream"
         );
