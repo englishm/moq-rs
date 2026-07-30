@@ -9,6 +9,7 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
 use crate::coding::{Encode, Location, ReasonPhrase};
+use crate::data::DataStreamResetCode;
 use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
@@ -17,6 +18,190 @@ use crate::{data, message, serve};
 use super::{Publisher, SessionError, SubscribeInfo, Writer};
 
 // This file defines Publisher handling of inbound Subscriptions
+
+/// A subgroup data stream that is reset unless it is explicitly finished.
+///
+/// Draft-14 §10.4.3: a FIN means "every object in this subgroup was delivered".
+/// Any earlier termination MUST be a `RESET_STREAM`, and the listed causes
+/// include early termination due to UNSUBSCRIBE and a publisher ending the
+/// subscription early — exactly the paths a relay hits when downstream interest
+/// disappears or an upstream track dies mid-object.
+///
+/// `quinn::SendStream::drop` implicitly calls `finish()`, so simply dropping the
+/// writer on a cancelled or failed forwarding task FINs the stream wherever it
+/// happened to stop. If that is mid-object the receiver has already been
+/// promised a payload length it will never get, and treats the truncated
+/// subgroup as a malformed track. This wrapper inverts that default: the stream
+/// is reset on drop unless [`SubgroupStream::finish`] ran, so the safe outcome
+/// is the automatic one.
+struct SubgroupStream {
+    writer: Writer,
+    /// Set once the stream has been explicitly finished or reset, after which
+    /// `Drop` must not touch it again.
+    terminated: bool,
+}
+
+impl SubgroupStream {
+    fn new(writer: Writer) -> Self {
+        Self {
+            writer,
+            terminated: false,
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), SessionError> {
+        if self.terminated {
+            return Ok(());
+        }
+        self.terminated = true;
+        self.writer.finish()
+    }
+
+    fn reset(&mut self, code: DataStreamResetCode) {
+        if self.terminated {
+            return;
+        }
+        self.terminated = true;
+        self.writer.reset(code.into());
+    }
+}
+
+impl Drop for SubgroupStream {
+    fn drop(&mut self) {
+        // Covers async cancellation, where no error path gets a chance to run:
+        // dropping the forwarding future must not leave quinn to implicitly FIN
+        // a partially written subgroup. `Cancelled` is the right default because
+        // a dropped forwarding task means the subscription ended early.
+        self.reset(DataStreamResetCode::Cancelled);
+    }
+}
+
+/// How a subgroup stream was terminated. Recorded by the test sink so tests can
+/// assert FIN-vs-RESET behaviour without a real QUIC connection.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubgroupTermination {
+    Fin,
+    Reset(DataStreamResetCode),
+}
+
+enum SubgroupSink {
+    Stream(SubgroupStream),
+    #[cfg(test)]
+    Buffer {
+        buffer: bytes::BytesMut,
+        termination: Option<SubgroupTermination>,
+    },
+}
+
+/// Writes a subgroup to a sink while tracking whether we are mid-object.
+///
+/// The accounting lives here rather than in the sink so there is exactly one
+/// place that knows whether a FIN is currently legal.
+struct SubgroupOutput {
+    sink: SubgroupSink,
+    /// Payload bytes still owed for the object whose header we already wrote.
+    /// Non-zero means we are mid-object and MUST NOT FIN.
+    owed: usize,
+}
+
+impl SubgroupOutput {
+    fn stream(writer: Writer) -> Self {
+        Self {
+            sink: SubgroupSink::Stream(SubgroupStream::new(writer)),
+            owed: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn buffer() -> Self {
+        Self {
+            sink: SubgroupSink::Buffer {
+                buffer: bytes::BytesMut::new(),
+                termination: None,
+            },
+            owed: 0,
+        }
+    }
+
+    async fn encode<T: Encode>(&mut self, msg: &T) -> Result<(), SessionError> {
+        match &mut self.sink {
+            SubgroupSink::Stream(stream) => stream.writer.encode(msg).await,
+            #[cfg(test)]
+            SubgroupSink::Buffer { buffer, .. } => {
+                msg.encode(buffer)?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn write(&mut self, buf: &[u8]) -> Result<(), SessionError> {
+        match &mut self.sink {
+            SubgroupSink::Stream(stream) => stream.writer.write(buf).await?,
+            #[cfg(test)]
+            SubgroupSink::Buffer { buffer, .. } => buffer.extend_from_slice(buf),
+        }
+
+        self.owed = self.owed.saturating_sub(buf.len());
+        Ok(())
+    }
+
+    /// Record that an object header promising `len` payload bytes was written.
+    fn begin_object(&mut self, len: usize) {
+        self.owed = len;
+    }
+
+    /// True when every promised payload byte has been written.
+    fn at_object_boundary(&self) -> bool {
+        self.owed == 0
+    }
+
+    /// FIN the stream, asserting the whole subgroup was delivered.
+    ///
+    /// Only legal at an object boundary; finishing while payload bytes are still
+    /// owed is the truncation this type exists to prevent, so it resets instead.
+    fn finish(&mut self) -> Result<(), SessionError> {
+        if !self.at_object_boundary() {
+            tracing::warn!(
+                owed = self.owed,
+                "refusing to FIN a subgroup stream mid-object; resetting instead"
+            );
+            self.reset(DataStreamResetCode::InternalError);
+            return Err(ServeError::Size.into());
+        }
+
+        match &mut self.sink {
+            SubgroupSink::Stream(stream) => stream.finish(),
+            #[cfg(test)]
+            SubgroupSink::Buffer { termination, .. } => {
+                termination.get_or_insert(SubgroupTermination::Fin);
+                Ok(())
+            }
+        }
+    }
+
+    /// RESET the stream, signalling an incomplete subgroup.
+    fn reset(&mut self, code: DataStreamResetCode) {
+        match &mut self.sink {
+            SubgroupSink::Stream(stream) => stream.reset(code),
+            #[cfg(test)]
+            SubgroupSink::Buffer { termination, .. } => {
+                termination.get_or_insert(SubgroupTermination::Reset(code));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn into_parts(self) -> (bytes::BytesMut, Option<SubgroupTermination>) {
+        match self.sink {
+            SubgroupSink::Buffer {
+                buffer,
+                termination,
+            } => (buffer, termination),
+            SubgroupSink::Stream(_) => unreachable!("test output should use a buffer"),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct SubscribedState {
@@ -234,7 +419,7 @@ impl Subscribed {
 
     async fn serve_subgroup(
         header: data::SubgroupHeader,
-        mut subgroup_reader: serve::SubgroupReader,
+        subgroup_reader: serve::SubgroupReader,
         mut publisher: Publisher,
         state: State<SubscribedState>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
@@ -252,8 +437,47 @@ impl Subscribed {
         // TODO figure out u32 vs u64 priority
         send_stream.set_priority(subgroup_reader.priority as i32);
 
-        let mut writer = Writer::new(send_stream);
+        let mut output = SubgroupOutput::stream(Writer::new(send_stream));
+        let res =
+            Self::serve_subgroup_objects(header, subgroup_reader, &mut output, state, mlog).await;
 
+        // Draft-14 §10.4.3: FIN only if the whole subgroup was delivered,
+        // otherwise RESET_STREAM. Without this the `Writer` would be dropped and
+        // quinn would implicitly FIN wherever we stopped, which silently
+        // truncates the in-flight object.
+        match res {
+            Ok(()) => output.finish(),
+            Err(err) => {
+                output.reset(Self::reset_code_for(&err));
+                Err(err)
+            }
+        }
+    }
+
+    /// Map a forwarding failure onto a draft-14 §13.1.8 reset code.
+    fn reset_code_for(err: &SessionError) -> DataStreamResetCode {
+        match err {
+            // The subscriber went away (UNSUBSCRIBE) or the track was cancelled;
+            // §10.4.3 calls out UNSUBSCRIBE as a reset case explicitly.
+            SessionError::Serve(ServeError::Done | ServeError::Cancel) => {
+                DataStreamResetCode::Cancelled
+            }
+            SessionError::Serve(ServeError::Closed(_)) => DataStreamResetCode::SessionClosed,
+            // Everything else, including an upstream object that ran short of
+            // its declared payload length (`ServeError::Size`). Draft-16 added
+            // MALFORMED_TRACK (0x12) for that case, but draft-14 §13.1.8 has no
+            // equivalent, so it collapses into INTERNAL_ERROR here.
+            _ => DataStreamResetCode::InternalError,
+        }
+    }
+
+    async fn serve_subgroup_objects(
+        header: data::SubgroupHeader,
+        mut subgroup_reader: serve::SubgroupReader,
+        output: &mut SubgroupOutput,
+        state: State<SubscribedState>,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    ) -> Result<(), SessionError> {
         tracing::debug!(
             "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
             header.track_alias,
@@ -263,7 +487,7 @@ impl Subscribed {
             header.header_type
         );
 
-        writer.encode(&header).await?;
+        output.encode(&header).await?;
 
         // Log subgroup header created/sent
         if let Some(ref mlog) = mlog {
@@ -299,7 +523,24 @@ impl Subscribed {
                 subgroup_object.extension_headers
             );
 
-            writer.encode(&subgroup_object).await?;
+            // Check the subscription is still live and the location is valid
+            // *before* writing the object header. The header promises
+            // `payload_length` bytes, so bailing out after writing it leaves the
+            // receiver waiting on payload we will never send. Previously this
+            // check ran after the encode, so a downstream UNSUBSCRIBE landing
+            // here truncated the object.
+            state
+                .lock_mut()
+                .ok_or(ServeError::Done)?
+                .update_largest_location(
+                    subgroup_reader.group_id,
+                    subgroup_object_reader.object_id,
+                )?;
+
+            output.encode(&subgroup_object).await?;
+            // From here until the payload is fully written we are mid-object and
+            // must not FIN.
+            output.begin_object(subgroup_object.payload_length);
 
             // Log subgroup object created/sent
             if let Some(ref mlog) = mlog {
@@ -318,14 +559,6 @@ impl Subscribed {
                 }
             }
 
-            state
-                .lock_mut()
-                .ok_or(ServeError::Done)?
-                .update_largest_location(
-                    subgroup_reader.group_id,
-                    subgroup_object_reader.object_id,
-                )?;
-
             let mut chunks_sent = 0;
             let mut bytes_sent = 0;
             while let Some(chunk) = subgroup_object_reader.read().await? {
@@ -336,7 +569,7 @@ impl Subscribed {
                     chunk.len()
                 );
                 bytes_sent += chunk.len();
-                writer.write(&chunk).await?;
+                output.write(&chunk).await?;
                 chunks_sent += 1;
             }
 
@@ -346,6 +579,21 @@ impl Subscribed {
                 chunks_sent,
                 bytes_sent
             );
+
+            // The reader ran out of chunks before satisfying the length we already
+            // promised. Surface it as an error so the stream is reset rather than
+            // FINed at a byte offset the receiver will read as a partial object.
+            if !output.at_object_boundary() {
+                tracing::warn!(
+                    group_id = subgroup_reader.group_id,
+                    object_id = subgroup_object_reader.object_id,
+                    promised = subgroup_object.payload_length,
+                    sent = bytes_sent,
+                    "upstream object ended short of its declared payload length"
+                );
+                return Err(ServeError::Size.into());
+            }
+
             object_count += 1;
         }
 
@@ -357,6 +605,35 @@ impl Subscribed {
         );
 
         Ok(())
+    }
+
+    /// Test helper mirroring [`Self::serve_subgroup`]'s termination logic so tests
+    /// can assert whether the stream would have been FINed or reset, without
+    /// needing a real QUIC connection to open a stream on.
+    #[cfg(test)]
+    async fn serve_subgroup_to_parts(
+        header: data::SubgroupHeader,
+        subgroup_reader: serve::SubgroupReader,
+        state: State<SubscribedState>,
+    ) -> (
+        bytes::BytesMut,
+        Result<(), SessionError>,
+        Option<SubgroupTermination>,
+    ) {
+        let mut output = SubgroupOutput::buffer();
+        let res =
+            Self::serve_subgroup_objects(header, subgroup_reader, &mut output, state, None).await;
+
+        let res = match res {
+            Ok(()) => output.finish(),
+            Err(err) => {
+                output.reset(Self::reset_code_for(&err));
+                Err(err)
+            }
+        };
+
+        let (buffer, termination) = output.into_parts();
+        (buffer, res, termination)
     }
 
     async fn serve_datagrams(
@@ -459,5 +736,211 @@ impl SubscribedRecv {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use bytes::{Buf, Bytes};
+
+    use crate::coding::{Decode, TrackNamespace};
+
+    /// Build a single-subgroup track reader carrying one complete object.
+    async fn subgroup_with_one_object() -> (serve::SubgroupReader, data::SubgroupHeader) {
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "video".to_string())
+                .produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(serve::Subgroup {
+                group_id: 1,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        subgroup_writer.write(Bytes::from_static(b"hello")).unwrap();
+        drop(subgroup_writer);
+        drop(subgroups_writer);
+
+        let mut subgroups = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(subgroups) => subgroups,
+            _ => panic!("expected subgroups mode"),
+        };
+        let subgroup = subgroups.next().await.unwrap().expect("subgroup available");
+        let header = data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupIdExt,
+            track_alias: 1,
+            group_id: subgroup.group_id,
+            subgroup_id: Some(subgroup.subgroup_id),
+            publisher_priority: subgroup.priority,
+        };
+
+        (subgroup, header)
+    }
+
+    /// A fully delivered subgroup is the one case where draft-14 §10.4.3 permits
+    /// a FIN.
+    #[tokio::test]
+    async fn complete_subgroup_is_finished_with_fin() {
+        let (subgroup, header) = subgroup_with_one_object().await;
+        let state = State::<SubscribedState>::default();
+
+        let (_buffer, res, termination) =
+            Subscribed::serve_subgroup_to_parts(header, subgroup, state).await;
+
+        res.expect("serving a complete subgroup should succeed");
+        assert_eq!(termination, Some(SubgroupTermination::Fin));
+    }
+
+    /// Draft-14 §10.4.3 lists UNSUBSCRIBE as a case that MUST reset rather than
+    /// FIN, and the stream must not be cut inside an object.
+    ///
+    /// This is the regression test for the truncation bug: the forwarder used to
+    /// encode an object header (promising `payload_length` bytes) and only then
+    /// check whether the subscription was still alive. When an UNSUBSCRIBE landed
+    /// in that window it returned early, dropped the `Writer`, and quinn
+    /// implicitly FINed the stream mid-object.
+    #[tokio::test]
+    async fn unsubscribe_mid_subgroup_resets_at_an_object_boundary() {
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "video".to_string())
+                .produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(serve::Subgroup {
+                group_id: 1,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+
+        // First object is available immediately; the second arrives only after we
+        // simulate the UNSUBSCRIBE.
+        subgroup_writer.write(Bytes::from_static(b"hello")).unwrap();
+
+        let mut subgroups = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(subgroups) => subgroups,
+            _ => panic!("expected subgroups mode"),
+        };
+        let subgroup = subgroups.next().await.unwrap().expect("subgroup available");
+        let header = data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupIdExt,
+            track_alias: 1,
+            group_id: subgroup.group_id,
+            subgroup_id: Some(subgroup.subgroup_id),
+            publisher_priority: subgroup.priority,
+        };
+
+        // Dropping one half of the split state is what UNSUBSCRIBE does to the
+        // forwarder: `lock_mut` starts returning None.
+        let (unsubscribe_handle, state) = State::<SubscribedState>::default().split();
+
+        let fut = Subscribed::serve_subgroup_to_parts(header.clone(), subgroup, state);
+        tokio::pin!(fut);
+
+        // Let the forwarder deliver the first object and then park waiting for
+        // the next one.
+        tokio::select! {
+            _ = &mut fut => panic!("forwarder should still be awaiting the next object"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+
+        drop(unsubscribe_handle);
+        subgroup_writer.write(Bytes::from_static(b"world")).unwrap();
+
+        let (buffer, res, termination) = fut.await;
+
+        assert!(res.is_err(), "forwarding should fail once unsubscribed");
+        assert_eq!(
+            termination,
+            Some(SubgroupTermination::Reset(DataStreamResetCode::Cancelled)),
+            "an early-terminated subgroup must be reset, never FINed"
+        );
+
+        // The bytes on the wire must end on an object boundary: the subgroup
+        // header plus exactly the first complete object, with no header for the
+        // object we never delivered.
+        let mut buffer = buffer.freeze();
+        let header_type = data::StreamHeaderType::decode(&mut buffer).unwrap();
+        assert_eq!(
+            data::SubgroupHeader::decode(header_type, &mut buffer).unwrap(),
+            header
+        );
+
+        let object = data::SubgroupObjectExt::decode(&mut buffer).unwrap();
+        assert_eq!(object.payload_length, 5);
+        assert_eq!(&buffer.copy_to_bytes(object.payload_length)[..], b"hello");
+        assert!(
+            !buffer.has_remaining(),
+            "no partial object should follow the last complete one"
+        );
+    }
+
+    /// FIN must be refused while payload bytes are still owed, even if a caller
+    /// asks for one; otherwise the receiver sees a truncated object.
+    #[tokio::test]
+    async fn finish_mid_object_resets_instead_of_truncating() {
+        let mut output = SubgroupOutput::buffer();
+
+        output.begin_object(10);
+        output.write(b"abc").await.unwrap();
+        assert!(!output.at_object_boundary());
+
+        let err = output.finish().expect_err("FIN mid-object must be refused");
+        assert!(matches!(err, SessionError::Serve(ServeError::Size)));
+
+        let (_buffer, termination) = output.into_parts();
+        assert_eq!(
+            termination,
+            Some(SubgroupTermination::Reset(
+                DataStreamResetCode::InternalError
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn owed_payload_tracking_follows_writes() {
+        let mut output = SubgroupOutput::buffer();
+        assert!(output.at_object_boundary(), "no object in flight");
+
+        output.begin_object(5);
+        assert!(!output.at_object_boundary());
+
+        output.write(b"hel").await.unwrap();
+        assert!(!output.at_object_boundary());
+
+        output.write(b"lo").await.unwrap();
+        assert!(output.at_object_boundary(), "object fully delivered");
+
+        output.finish().expect("FIN legal at object boundary");
+    }
+
+    #[test]
+    fn reset_codes_follow_the_failure_cause() {
+        // §10.4.3: subscription ended early.
+        assert_eq!(
+            Subscribed::reset_code_for(&ServeError::Done.into()),
+            DataStreamResetCode::Cancelled
+        );
+        assert_eq!(
+            Subscribed::reset_code_for(&ServeError::Cancel.into()),
+            DataStreamResetCode::Cancelled
+        );
+        assert_eq!(
+            Subscribed::reset_code_for(&ServeError::Closed(0x2).into()),
+            DataStreamResetCode::SessionClosed
+        );
+        // Draft-14 §13.1.8 has no MALFORMED_TRACK, so an upstream object that ran
+        // short of its declared length falls back to INTERNAL_ERROR.
+        assert_eq!(
+            Subscribed::reset_code_for(&ServeError::Size.into()),
+            DataStreamResetCode::InternalError
+        );
+        assert_eq!(
+            Subscribed::reset_code_for(&ServeError::internal_ctx("boom").into()),
+            DataStreamResetCode::InternalError
+        );
     }
 }
