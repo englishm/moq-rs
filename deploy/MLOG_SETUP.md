@@ -6,13 +6,13 @@ Where QUIC qlog (see [QLOG_SETUP.md](QLOG_SETUP.md)) captures transport-layer ev
 
 ## Quick Start: Verify Your Messages Reached the Relay
 
-This walkthrough uses `moq-test-client` against the public interop relay to demonstrate the basics. You can adapt the same technique for your own client.
+This walkthrough uses `moq-test-client` against a public interop relay to demonstrate the basics. The URL below is an example — check the [moq-interop-runner registry](https://github.com/englishm/moq-interop-runner/blob/main/implementations.json) for current endpoints. You can adapt the same technique for your own relay.
 
 ### Step 1: Run a test
 
 ```bash
 cargo run --bin moq-test-client -- \
-  --relay https://interop-relay.cloudflare.mediaoverquic.com:443 \
+  --relay https://draft-18-interop.cloudflare.mediaoverquic.com:443 \
   --tls-disable-verify \
   --test setup-only
 ```
@@ -32,7 +32,7 @@ ok 1 - setup-only
 ### Step 3: Fetch your mlog
 
 ```bash
-curl https://interop-relay.cloudflare.mediaoverquic.com:443/mlog/22c73802597dcd91ef662a3cd67a03e0
+curl https://draft-18-interop.cloudflare.mediaoverquic.com:443/mlog/22c73802597dcd91ef662a3cd67a03e0
 ```
 
 ### Step 4: Read the results
@@ -58,7 +58,7 @@ The simplest test: connect, exchange CLIENT_SETUP/SERVER_SETUP, disconnect.
 
 ```bash
 cargo run --bin moq-test-client -- \
-  --relay https://interop-relay.cloudflare.mediaoverquic.com:443 \
+  --relay https://draft-18-interop.cloudflare.mediaoverquic.com:443 \
   --tls-disable-verify \
   --test setup-only
 ```
@@ -106,7 +106,7 @@ After SETUP, announce a namespace and verify the relay accepts it.
 
 ```bash
 cargo run --bin moq-test-client -- \
-  --relay https://interop-relay.cloudflare.mediaoverquic.com:443 \
+  --relay https://draft-18-interop.cloudflare.mediaoverquic.com:443 \
   --tls-disable-verify \
   --test publish-namespace-only
 ```
@@ -156,7 +156,7 @@ This test uses two connections: a publisher and a subscriber. The test client re
 
 ```bash
 cargo run --bin moq-test-client -- \
-  --relay https://interop-relay.cloudflare.mediaoverquic.com:443 \
+  --relay https://draft-18-interop.cloudflare.mediaoverquic.com:443 \
   --tls-disable-verify \
   --test publish-namespace-subscribe
 ```
@@ -176,10 +176,10 @@ Fetch both mlogs to see each side of the exchange:
 
 ```bash
 # Publisher's view
-curl https://interop-relay.cloudflare.mediaoverquic.com:443/mlog/71d4b5eb1a807779af03331c330d5fa9
+curl https://draft-18-interop.cloudflare.mediaoverquic.com:443/mlog/71d4b5eb1a807779af03331c330d5fa9
 
 # Subscriber's view
-curl https://interop-relay.cloudflare.mediaoverquic.com:443/mlog/08d0b03ede133f0839435bff64ed2fc5
+curl https://draft-18-interop.cloudflare.mediaoverquic.com:443/mlog/08d0b03ede133f0839435bff64ed2fc5
 ```
 
 **Publisher mlog** (after SETUP):
