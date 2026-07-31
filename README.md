@@ -8,7 +8,7 @@ This codebase was originally created by [Luke Curley (@kixelated)](https://githu
 
 ## Protocol Support
 
-The `main` branch targets **draft-16** of the MoQT specification. For draft-07 compatibility (used in [Cloudflare's current production deployment](https://developers.cloudflare.com/moq/)), see the [`draft-ietf-moq-transport-07`](https://github.com/cloudflare/moq-rs/tree/draft-ietf-moq-transport-07) branch.
+The `main` branch targets **draft-16** of the MoQT specification and is the only actively supported draft version. Branches for older drafts remain available for interoperability testing and backports when needed. For draft-07 compatibility (used in [Cloudflare's current production deployment](https://developers.cloudflare.com/moq/)), see the [`draft-ietf-moq-transport-07`](https://github.com/cloudflare/moq-rs/tree/draft-ietf-moq-transport-07) branch.
 
 ### What's Included
 
