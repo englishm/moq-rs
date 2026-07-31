@@ -8,7 +8,7 @@ This codebase was originally created by [Luke Curley (@kixelated)](https://githu
 
 ## Protocol Support
 
-The `main` branch targets **draft-16** of the MoQT specification. For draft-07 compatibility (used in [Cloudflare's current production deployment](https://developers.cloudflare.com/moq/)), see the [`draft-ietf-moq-transport-07`](https://github.com/cloudflare/moq-rs/tree/draft-ietf-moq-transport-07) branch.
+The `main` branch targets **draft-16** of the MoQT specification and is the basis for Cloudflare's production deployment. Cloudflare currently runs draft-14 and draft-16 relays globally. See the [Cloudflare MoQ developer docs](https://developers.cloudflare.com/moq/) for endpoint URLs, provisioning, and a full feature matrix.
 
 ### What's Included
 
@@ -29,14 +29,21 @@ This repository provides:
 - Both stream ("subgroup") and datagram delivery modes
 
 **Not Supported:**
-- FETCH (Not Soon)
+- FETCH
+- GOAWAY
 
 ## Interoperability
 
-A public relay instance running the latest `main` branch is available for interop testing at:
-```
-https://interop-relay.cloudflare.mediaoverquic.com:443
-```
+Public relay endpoints for protocol testing:
+
+| Draft | Endpoint |
+|-------|----------|
+| draft-14 | `https://draft-14.cloudflare.mediaoverquic.com/` |
+| draft-16 | `https://draft-16.cloudflare.mediaoverquic.com/<token>` |
+
+The draft-16 endpoint requires an authentication token. Create a relay and issue tokens via the [Cloudflare MoQ provisioning API](https://developers.cloudflare.com/api/resources/moq) or the Cloudflare dashboard. Relays are free during the beta.
+
+For draft-18 interop testing ahead of a global deployment, see [moq-interop-runner](https://github.com/englishm/moq-interop-runner).
 
 As an implementation targeting the IETF specification, this codebase should be compatible with other implementations targeting the same draft version. See the [moq-wg/moq-transport wiki](https://github.com/moq-wg/moq-transport/wiki/Interop) for a list of other implementations.
 
