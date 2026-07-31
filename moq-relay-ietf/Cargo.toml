@@ -70,6 +70,11 @@ thiserror = "2.0.17"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", optional = true }
 
+[dev-dependencies]
+# test-util provides the paused-clock runtime used to test idle timeouts without
+# sleeping for real.
+tokio = { version = "1", features = ["full", "test-util"] }
+
 [features]
 default = []
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]

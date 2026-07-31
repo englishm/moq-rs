@@ -173,10 +173,14 @@ impl Publisher {
         subscribed: Subscribed,
         mut tracks: TracksReader,
     ) -> Result<(), SessionError> {
-        if let Some(track) = tracks.subscribe(
+        if let Some((track, interest)) = tracks.subscribe(
             subscribed.info.track_namespace.clone(),
             &subscribed.info.track_name,
         ) {
+            // Hold the interest guard for the whole of `serve`, so the cache entry
+            // backing this reader is not evicted (and its upstream subscription
+            // released) while we are still forwarding from it.
+            let _interest = interest;
             subscribed.serve(track).await?;
         } else {
             let namespace = subscribed.info.track_namespace.clone();
@@ -194,7 +198,10 @@ impl Publisher {
         track_status_request: TrackStatusRequested,
         mut tracks: TracksReader,
     ) -> Result<(), SessionError> {
-        let track = tracks
+        // The guard is held only for the duration of the response; a status
+        // request is not a subscription, so it should not keep an idle upstream
+        // subscription alive beyond the grace period.
+        let (track, _interest) = tracks
             .subscribe(
                 track_status_request.request_msg.track_namespace.clone(),
                 &track_status_request.request_msg.track_name,

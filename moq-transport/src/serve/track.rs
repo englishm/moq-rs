@@ -91,7 +91,7 @@ impl TrackWriter {
         // Lock state to modify it
         let mut state = self.state.lock_mut().ok_or_else(|| {
             tracing::debug!(
-                namespace = %self.info.namespace.to_utf8_path(),
+                namespace = %self.info.namespace,
                 track = %self.info.name,
                 "track state dropped (Cancel) in stream()"
             );
@@ -114,7 +114,7 @@ impl TrackWriter {
         // Lock state to modify it
         let mut state = self.state.lock_mut().ok_or_else(|| {
             tracing::debug!(
-                namespace = %self.info.namespace.to_utf8_path(),
+                namespace = %self.info.namespace,
                 track = %self.info.name,
                 "track state dropped (Cancel) in subgroups()"
             );
@@ -135,7 +135,7 @@ impl TrackWriter {
         // Lock state to modify it
         let mut state = self.state.lock_mut().ok_or_else(|| {
             tracing::debug!(
-                namespace = %self.info.namespace.to_utf8_path(),
+                namespace = %self.info.namespace,
                 track = %self.info.name,
                 "track state dropped (Cancel) in datagrams()"
             );
@@ -150,7 +150,7 @@ impl TrackWriter {
     /// Close the track with an error.
     pub fn close(self, err: ServeError) -> Result<(), ServeError> {
         tracing::debug!(
-            namespace = %self.info.namespace.to_utf8_path(),
+            namespace = %self.info.namespace,
             track = %self.info.name,
             error = %err,
             "track closing"
@@ -160,7 +160,7 @@ impl TrackWriter {
 
         let mut state = state.into_mut().ok_or_else(|| {
             tracing::debug!(
-                namespace = %self.info.namespace.to_utf8_path(),
+                namespace = %self.info.namespace,
                 track = %self.info.name,
                 "track state already dropped during close"
             );

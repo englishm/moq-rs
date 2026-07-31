@@ -89,4 +89,20 @@ impl Writer {
 
         Ok(())
     }
+
+    /// Cleanly close the stream with a FIN at the current offset.
+    ///
+    /// For data streams this asserts that everything the receiver was promised
+    /// has been written, so callers must only use it at a message boundary. See
+    /// [`crate::data::DataStreamResetCode`] for why a mid-object FIN is a
+    /// protocol violation rather than a cosmetic issue.
+    pub(super) fn finish(&mut self) -> Result<(), SessionError> {
+        self.stream.finish()?;
+        Ok(())
+    }
+
+    /// Abort the stream with a `RESET_STREAM` carrying `code`.
+    pub(super) fn reset(&mut self, code: u32) {
+        self.stream.reset(code);
+    }
 }

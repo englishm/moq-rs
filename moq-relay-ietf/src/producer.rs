@@ -63,13 +63,12 @@ impl Producer {
                     // Spawn a new task to handle the subscribe
                     tasks.push(async move {
                         let info = subscribed.clone();
-                        let namespace = info.track_namespace.to_utf8_path();
                         let track_name = info.track_name.clone();
-                        tracing::info!(namespace = %namespace, track = %track_name, "serving subscribe: {:?}", info);
+                        tracing::info!(namespace = %info.track_namespace, track = %track_name, "serving subscribe: {:?}", info);
 
                         // Serve the subscribe request
                         if let Err(err) = this.serve_subscribe(subscribed).await {
-                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving subscribe: {:?}, error: {}", info, err);
+                            tracing::warn!(namespace = %info.track_namespace, track = %track_name, error = %err, "failed serving subscribe: {:?}, error: {}", info, err);
                         }
                     }.boxed())
                 },
@@ -80,13 +79,12 @@ impl Producer {
                     // Spawn a new task to handle the track_status request
                     tasks.push(async move {
                         let info = track_status_requested.request_msg.clone();
-                        let namespace = info.track_namespace.to_utf8_path();
                         let track_name = info.track_name.clone();
-                        tracing::info!(namespace = %namespace, track = %track_name, "serving track_status: {:?}", info);
+                        tracing::info!(namespace = %info.track_namespace, track = %track_name, "serving track_status: {:?}", info);
 
                         // Serve the track_status request
                         if let Err(err) = this.serve_track_status(track_status_requested).await {
-                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving track_status: {:?}, error: {}", info, err)
+                            tracing::warn!(namespace = %info.track_namespace, track = %track_name, error = %err, "failed serving track_status: {:?}, error: {}", info, err)
                         }
                     }.boxed())
                 },
@@ -110,13 +108,16 @@ impl Producer {
         // Check local tracks first, and serve from local if possible
         if let Some(mut local) = self.locals.retrieve(self.scope.as_deref(), &namespace) {
             // Pass the full requested namespace, not the announced prefix
-            if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
-                let ns = namespace.to_utf8_path();
-                tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
+            if let Some((track, interest)) = local.subscribe(namespace.clone(), &track_name) {
+                tracing::info!(namespace = %namespace, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
                 // Update label to indicate local source, timing recorded on drop
                 timing_guard.set_label("source", "local");
                 // Track active tracks - decrements when serve completes
                 let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
+                // Hold the downstream-interest guard for as long as we are
+                // serving, so the cache entry backing this reader is not evicted
+                // (and its upstream subscription released) underneath us.
+                let _interest = interest;
                 return Ok(subscribed.serve(track).await?);
             }
         }
@@ -128,21 +129,24 @@ impl Producer {
             .await
         {
             Ok(track) => {
-                if let Some(track) = track {
-                    let ns = namespace.to_utf8_path();
-                    tracing::info!(namespace = %ns, track = %track_name, source = "remote", "serving subscribe from remote: {:?}", track.info);
+                if let Some((track, interest)) = track {
+                    tracing::info!(namespace = %namespace, track = %track_name, source = "remote", "serving subscribe from remote: {:?}", track.info);
                     // Update label to indicate remote source, timing recorded on drop
                     timing_guard.set_label("source", "remote");
                     // Track active tracks - decrements when serve completes
                     let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
+                    // Hold the downstream-interest guard for as long as we are
+                    // serving, so the cross-relay cache entry backing this reader
+                    // is not evicted (and its peer subscription released) while
+                    // we are still forwarding from it.
+                    let _interest = interest;
                     return Ok(subscribed.serve(track).await?);
                 }
             }
             Err(e) => {
                 // Route error = infrastructure failure (couldn't reach coordinator/upstream)
                 // This is different from "not found" - we don't know if the track exists
-                let ns = namespace.to_utf8_path();
-                tracing::error!(namespace = %ns, track = %track_name, error = %e, "failed to route to remote: {}", e);
+                tracing::error!(namespace = %namespace, track = %track_name, error = %e, "failed to route to remote: {}", e);
                 timing_guard.set_label("source", "route_error");
                 metrics::counter!("moq_relay_subscribe_route_errors_total").increment(1);
 
@@ -183,10 +187,7 @@ impl Producer {
                 &track_status_requested.request_msg.track_namespace,
                 &track_status_requested.request_msg.track_name,
             ) {
-                let namespace = track_status_requested
-                    .request_msg
-                    .track_namespace
-                    .to_utf8_path();
+                let namespace = &track_status_requested.request_msg.track_namespace;
                 let track_name = &track_status_requested.request_msg.track_name;
                 tracing::info!(namespace = %namespace, track = %track_name, source = "local", "serving track_status from local: {:?}", track.info);
                 return Ok(track_status_requested.respond_ok(&track)?);
