@@ -38,7 +38,7 @@ A public relay for interop testing is available at:
 
 ```
 # WebTransport
-https://draft-18-interop.cloudflare.mediaoverquic.com:443/moq
+https://draft-18-interop.cloudflare.mediaoverquic.com:443
 
 # Raw QUIC
 moqt://draft-18-interop.cloudflare.mediaoverquic.com:443
