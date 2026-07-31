@@ -9,7 +9,7 @@ authors = ["moq-rs contributors"]
 repository = "https://github.com/cloudflare/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.4.13"
+version = "0.4.14"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]

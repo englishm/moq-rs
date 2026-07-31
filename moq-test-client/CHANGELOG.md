@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.11...moq-test-client-v0.1.12) - 2026-07-31
+
+### Fixed
+
+- send log output to stderr instead of stdout
+
 ## [0.1.11](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.10...moq-test-client-v0.1.11) - 2026-07-20
 
 ### Other

@@ -8,7 +8,7 @@ authors = ["moq-rs contributors"]
 repository = "https://github.com/cloudflare/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 
 keywords = ["quic", "webtransport", "moqt", "testing", "interop"]
