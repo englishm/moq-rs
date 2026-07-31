@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.25](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.24...moq-relay-ietf-v0.7.25) - 2026-07-31
+
+### Added
+
+- add metrics for lock poisoning and broadcast lag
+
+### Fixed
+
+- decide upstream wait outcome by branch, not error variant
+- label cancelled subscribes distinctly from upstream failures
+- wait for upstream subscription before sending SUBSCRIBE_OK
+- release upstream subscriptions for idle cached tracks
+- send log output to stderr instead of stdout
+
+### Other
+
+- stream namespace paths into the formatter
+
 ## [0.7.24](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.23...moq-relay-ietf-v0.7.24) - 2026-07-20
 
 ### Added

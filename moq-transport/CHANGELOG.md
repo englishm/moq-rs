@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.0...moq-transport-v0.16.1) - 2026-07-31
+
+### Fixed
+
+- reset subgroup streams instead of FIN-ing mid-object
+
+### Other
+
+- stream namespace paths into the formatter
+
 ## [0.16.0](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.15.1...moq-transport-v0.16.0) - 2026-07-19
 
 ### Added
