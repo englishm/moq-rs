@@ -34,22 +34,17 @@ This repository provides:
 
 ## Interoperability
 
-Cloudflare operates public relay endpoints for protocol testing. For example:
+A public relay for interop testing is available at:
 
 ```
-# draft-14 (unauthenticated, WebTransport)
-https://draft-14.cloudflare.mediaoverquic.com:443/moq
-
-# draft-16 (requires auth token, WebTransport)
-https://draft-16.cloudflare.mediaoverquic.com:443/<token>
-
-# draft-18 (interop testing only, WebTransport)
+# WebTransport
 https://draft-18-interop.cloudflare.mediaoverquic.com:443/moq
+
+# Raw QUIC
+moqt://draft-18-interop.cloudflare.mediaoverquic.com:443
 ```
 
-The draft-16 endpoint requires an authentication token. Create a relay and issue tokens via the [Cloudflare MoQ provisioning API](https://developers.cloudflare.com/api/resources/moq) or the Cloudflare dashboard. Relays are free during the beta.
-
-For current endpoint URLs across all draft versions (including raw QUIC endpoints), see the [moq-interop-runner implementation registry](https://github.com/englishm/moq-interop-runner/blob/main/implementations.json).
+For current endpoint URLs across all implementations and draft versions, see the [moq-interop-runner implementation registry](https://github.com/englishm/moq-interop-runner/blob/main/implementations.json).
 
 As an implementation targeting the IETF specification, this codebase should be compatible with other implementations targeting the same draft version. See the [moq-wg/moq-transport wiki](https://github.com/moq-wg/moq-transport/wiki/Interop) for a list of other implementations.
 
