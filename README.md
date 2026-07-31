@@ -10,6 +10,10 @@ This codebase was originally created by [Luke Curley (@kixelated)](https://githu
 
 The `main` branch targets **draft-16** of the MoQT specification and is the basis for Cloudflare's production deployment. Cloudflare currently runs draft-14 and draft-16 relays globally. See the [Cloudflare MoQ developer docs](https://developers.cloudflare.com/moq/) for endpoint URLs, provisioning, and a full feature matrix.
 
+Other branches:
+- [`draft-ietf-moq-transport-14`](https://github.com/cloudflare/moq-rs/tree/draft-ietf-moq-transport-14) — draft-14 maintenance branch
+- [`draft-18-dev`](https://github.com/cloudflare/moq-rs/tree/draft-18-dev) — early draft-18 development
+
 ### What's Included
 
 This repository provides:
@@ -34,19 +38,7 @@ This repository provides:
 
 ## Interoperability
 
-A public relay for interop testing is available at:
-
-```
-# WebTransport
-https://draft-18-interop.cloudflare.mediaoverquic.com:443
-
-# Raw QUIC
-moqt://draft-18-interop.cloudflare.mediaoverquic.com:443
-```
-
-For current endpoint URLs across all implementations and draft versions, see the [moq-interop-runner implementation registry](https://github.com/englishm/moq-interop-runner/blob/main/implementations.json).
-
-As an implementation targeting the IETF specification, this codebase should be compatible with other implementations targeting the same draft version. See the [moq-wg/moq-transport wiki](https://github.com/moq-wg/moq-transport/wiki/Interop) for a list of other implementations.
+This codebase is compatible with other MoQT implementations targeting the same draft version. See the [moq-wg/moq-transport wiki](https://github.com/moq-wg/moq-transport/wiki/Interop) for a list of implementations, and the [moq-interop-runner](https://github.com/englishm/moq-interop-runner) for interop test tooling and a registry of public relay endpoints across draft versions.
 
 For streaming format compatibility:
 - **[video-dev/moq-js](https://github.com/video-dev/moq-js)**: A TypeScript player implementation compatible with moq-pub's fMP4 output. Check draft version compatibility when selecting branches.
