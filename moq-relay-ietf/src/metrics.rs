@@ -29,6 +29,7 @@
 //! | `moq_relay_subscribers_total` | - | Total subscribers (SUBSCRIBE requests) received |
 //! | `moq_relay_subscribe_not_found_total` | - | Track not found after checking all sources |
 //! | `moq_relay_subscribe_route_errors_total` | - | Infrastructure failure when routing to remote |
+//! | `moq_relay_subscribe_upstream_errors_total` | - | Upstream subscription could not be established, so the downstream SUBSCRIBE was rejected |
 //! | `moq_relay_upstream_errors_total` | `stage` | Upstream connection failures (stage: connect, session) |
 //! | `moq_relay_namespace_transition_timeouts_total` | - | Namespace pull streams reset after graceful transition timeout |
 //! | `moq_relay_cache_idle_evictions_total` | `source` | Unwatched cache entries evicted, releasing an upstream subscription (source: local, remote) |
@@ -50,7 +51,7 @@
 //!
 //! | Name | Labels | Description |
 //! |------|--------|-------------|
-//! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, route_error) |
+//! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, route_error, upstream_error, downstream_left) |
 
 use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
 
@@ -109,6 +110,10 @@ pub fn describe_metrics() {
         "Infrastructure failure when routing to remote"
     );
     describe_counter!(
+        "moq_relay_subscribe_upstream_errors_total",
+        "Upstream subscription could not be established, so the downstream SUBSCRIBE was rejected"
+    );
+    describe_counter!(
         "moq_relay_upstream_errors_total",
         "Upstream connection failures by stage (connect, session)"
     );
@@ -163,7 +168,7 @@ pub fn describe_metrics() {
     describe_histogram!(
         "moq_relay_subscribe_latency_seconds",
         Unit::Seconds,
-        "Time to resolve subscription by source (local, remote, not_found, route_error)"
+        "Time to resolve subscription by source (local, remote, not_found, route_error, upstream_error, downstream_left)"
     );
 }
 

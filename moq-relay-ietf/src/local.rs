@@ -10,7 +10,7 @@ use moq_transport::{
     coding::{TrackNamespace, TrackNamespacePrefix},
     serve::{FullTrackName, ServeError, Track, TrackReader, TrackWriter},
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::interest::{TrackInterest, TrackInterestGuard};
 use crate::metrics::GaugeGuard;
@@ -61,6 +61,96 @@ pub struct TrackRequest {
     /// The requester should hold the upstream subscription open until
     /// [`CacheLease::released`] resolves, then drop it to send UNSUBSCRIBE.
     pub lease: CacheLease,
+
+    /// Reports whether the upstream subscription was established.
+    ///
+    /// Downstream subscribers wait on this before SUBSCRIBE_OK is sent, so the
+    /// requester must report the outcome as soon as the upstream publisher
+    /// answers — via [`UpstreamReadyTx::established`] or
+    /// [`UpstreamReadyTx::failed`] — or drop the sender to abandon the request,
+    /// which releases any waiting subscribers with an error rather than
+    /// stranding them until the upstream response timeout.
+    pub upstream: UpstreamReadyTx,
+}
+
+/// State of the upstream subscription backing a pull-through cache entry.
+#[derive(Clone)]
+enum UpstreamState {
+    /// The upstream SUBSCRIBE has been queued but not answered yet.
+    Pending,
+
+    /// The upstream publisher acknowledged the SUBSCRIBE.
+    Established,
+
+    /// The upstream subscription could not be established.
+    Failed(ServeError),
+}
+
+/// Readiness gate for the upstream subscription behind a cached track.
+///
+/// Draft-16 §8.4 requires a relay to have an established upstream subscription
+/// before it sends SUBSCRIBE_OK for a downstream SUBSCRIBE. The pull-through
+/// cache reserves its entry synchronously but subscribes upstream asynchronously
+/// (the publishing session owns that side), so the entry exists before the
+/// upstream subscription does. Serving a downstream subscriber has to wait for
+/// this gate rather than for the entry alone.
+///
+/// Shared by every downstream subscriber of the same cache entry, so a second
+/// subscriber arriving mid-handshake waits on the same result instead of
+/// triggering a duplicate upstream SUBSCRIBE.
+#[derive(Clone)]
+pub struct UpstreamReady {
+    state: watch::Receiver<UpstreamState>,
+}
+
+impl UpstreamReady {
+    /// Wait until the upstream subscription is established.
+    ///
+    /// Returns the upstream failure if it could not be established, so the caller
+    /// can reject the downstream request with a matching REQUEST_ERROR instead of
+    /// accepting it and later reporting the failure as PUBLISH_DONE.
+    ///
+    /// Resolves as an error rather than hanging if the requester is dropped
+    /// without answering — an abandoned request is not an established one.
+    pub async fn established(&self) -> Result<(), ServeError> {
+        let mut state = self.state.clone();
+
+        loop {
+            match &*state.borrow_and_update() {
+                UpstreamState::Established => return Ok(()),
+                UpstreamState::Failed(err) => return Err(err.clone()),
+                UpstreamState::Pending => {}
+            }
+
+            if state.changed().await.is_err() {
+                return Err(ServeError::internal_ctx(
+                    "upstream subscription abandoned before it was established",
+                ));
+            }
+        }
+    }
+}
+
+/// Sender half of [`UpstreamReady`], held by the session that owns the upstream
+/// subscription.
+///
+/// Dropping this without resolving it releases any waiting downstream subscriber
+/// with an error, so a requester that gives up cannot strand them.
+pub struct UpstreamReadyTx {
+    state: watch::Sender<UpstreamState>,
+}
+
+impl UpstreamReadyTx {
+    /// Report that the upstream publisher acknowledged the SUBSCRIBE.
+    pub fn established(&self) {
+        // Fails only when every downstream subscriber has already gone away.
+        let _ = self.state.send(UpstreamState::Established);
+    }
+
+    /// Report that the upstream subscription could not be established.
+    pub fn failed(&self, err: ServeError) {
+        let _ = self.state.send(UpstreamState::Failed(err));
+    }
 }
 
 /// Ties an upstream subscription to downstream interest in its cache entry.
@@ -131,6 +221,31 @@ struct TrackEntry {
     /// Locally published tracks have no upstream subscription to release, so
     /// there is nothing to count.
     interest: Option<TrackInterest>,
+
+    /// Upstream readiness for [`TrackSource::Cache`] entries only.
+    ///
+    /// Locally published tracks are already established by the time they are
+    /// registered, so there is nothing to wait for.
+    upstream: Option<UpstreamReady>,
+}
+
+/// A track resolved from the relay-local registry, with the handles a caller must
+/// observe while serving it.
+pub struct LocalTrack {
+    /// The media reader to serve downstream.
+    pub reader: TrackReader,
+
+    /// Held for as long as the caller serves [`Self::reader`]. Dropping it is what
+    /// eventually lets an idle upstream subscription be released.
+    ///
+    /// `None` for locally published tracks, which have no upstream subscription.
+    pub interest: Option<TrackInterestGuard>,
+
+    /// Must resolve before the caller sends SUBSCRIBE_OK downstream (draft-16
+    /// §8.4).
+    ///
+    /// `None` for locally published tracks, which are already established.
+    pub upstream: Option<UpstreamReady>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -444,8 +559,10 @@ impl Locals {
                 reader: track.clone(),
                 source: TrackSource::Published,
                 // A locally published track has no upstream subscription to
-                // release, so there is nothing to count interest against.
+                // release, so there is nothing to count interest against and
+                // nothing to wait for before accepting a downstream SUBSCRIBE.
                 interest: None,
+                upstream: None,
             }),
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
         };
@@ -591,14 +708,15 @@ impl Locals {
     /// the actual track reader is stored in `tracks`, while PUBLISH_NAMESPACE is
     /// only a source to ask when a track is missing.
     /// Returns the reader plus, for pull-through cache entries, a guard the caller
-    /// must hold for as long as it is serving that reader. Dropping the guard is
-    /// what eventually lets the upstream subscription be released.
+    /// must hold for as long as it is serving that reader (dropping it is what
+    /// eventually lets the upstream subscription be released) and a readiness gate
+    /// the caller must await before accepting the downstream request.
     pub async fn get_or_request_track(
         &mut self,
         scope: Option<&str>,
         namespace: TrackNamespace,
         track_name: impl Into<moq_transport::coding::TrackName>,
-    ) -> Option<(TrackReader, Option<TrackInterestGuard>)> {
+    ) -> Option<LocalTrack> {
         let track_name = track_name.into();
         let full_name = FullTrackName {
             namespace: namespace.clone(),
@@ -617,14 +735,17 @@ impl Locals {
         // that finds no live entry claims the slot with a freshly produced track and
         // owns requesting it from the source; concurrent callers share the reserved
         // reader instead of racing to insert and failing with a spurious `None`.
-        let (writer, reader, interest, guard) = {
+        let (writer, reader, interest, guard, upstream_tx, upstream) = {
             let mut tracks = self.tracks.write().ok()?;
             let bucket = tracks.entry(scope_key.clone()).or_default();
 
             if let Some(entry) = bucket.get(&full_name) {
                 if !entry.reader.is_closed() {
-                    let guard = entry.interest.as_ref().map(TrackInterest::guard);
-                    return Some((entry.reader.clone(), guard));
+                    return Some(LocalTrack {
+                        reader: entry.reader.clone(),
+                        interest: entry.interest.as_ref().map(TrackInterest::guard),
+                        upstream: entry.upstream.clone(),
+                    });
                 }
             }
 
@@ -637,15 +758,29 @@ impl Locals {
             // setting up the upstream subscription.
             let guard = interest.guard();
 
+            // Published alongside the entry so that a subscriber arriving while
+            // the upstream handshake is still in flight shares this gate rather
+            // than being served a reader nothing has subscribed to yet.
+            let (upstream_tx, upstream_rx) = watch::channel(UpstreamState::Pending);
+            let upstream = UpstreamReady { state: upstream_rx };
+
             bucket.insert(
                 full_name.clone(),
                 TrackEntry {
                     reader: reader.clone(),
                     source: TrackSource::Cache,
                     interest: Some(interest.clone()),
+                    upstream: Some(upstream.clone()),
                 },
             );
-            (writer, reader, interest, guard)
+            (
+                writer,
+                reader,
+                interest,
+                guard,
+                UpstreamReadyTx { state: upstream_tx },
+                upstream,
+            )
         };
 
         let lease = CacheLease {
@@ -657,7 +792,11 @@ impl Locals {
 
         if source
             .requests
-            .send(TrackRequest { writer, lease })
+            .send(TrackRequest {
+                writer,
+                lease,
+                upstream: upstream_tx,
+            })
             .await
             .is_err()
         {
@@ -668,7 +807,11 @@ impl Locals {
             return None;
         }
 
-        Some((reader, Some(guard)))
+        Some(LocalTrack {
+            reader,
+            interest: Some(guard),
+            upstream: Some(upstream),
+        })
     }
 
     /// Remove a cache entry if it is still the given generation, regardless of
@@ -711,14 +854,17 @@ impl Locals {
         &self,
         scope_key: &str,
         full_name: &FullTrackName,
-    ) -> Option<(TrackReader, Option<TrackInterestGuard>)> {
+    ) -> Option<LocalTrack> {
         {
             let tracks = self.tracks.read().ok()?;
             let bucket = tracks.get(scope_key)?;
             match bucket.get(full_name) {
                 Some(entry) if !entry.reader.is_closed() => {
-                    let guard = entry.interest.as_ref().map(TrackInterest::guard);
-                    return Some((entry.reader.clone(), guard));
+                    return Some(LocalTrack {
+                        reader: entry.reader.clone(),
+                        interest: entry.interest.as_ref().map(TrackInterest::guard),
+                        upstream: entry.upstream.clone(),
+                    });
                 }
                 Some(_) => {} // closed: fall through to prune under the write lock
                 None => return None,
@@ -861,6 +1007,7 @@ impl Drop for LocalTrackRegistration {
 mod tests {
     use super::*;
     use moq_transport::coding::TrackName;
+    use moq_transport::message::RequestErrorCode;
 
     fn ns(path: &str) -> TrackNamespace {
         TrackNamespace::from_utf8_path(path)
@@ -1060,13 +1207,18 @@ mod tests {
             .await
             .expect("namespace source should register");
 
-        let (reader, guard) = locals
+        let local = locals
             .get_or_request_track(None, namespace.clone(), "video")
             .await
             .expect("missing track should be requested from namespace source");
+        let reader = local.reader;
         assert!(
-            guard.is_some(),
+            local.interest.is_some(),
             "a cached track should hand back an interest guard"
+        );
+        assert!(
+            local.upstream.is_some(),
+            "a cached track should hand back an upstream readiness gate"
         );
 
         let requested = requests
@@ -1083,12 +1235,12 @@ mod tests {
         assert_eq!(cached.namespace, reader.namespace);
         assert_eq!(cached.name, reader.name);
 
-        let (reader_again, _guard_again) = locals
+        let again = locals
             .get_or_request_track(None, namespace.clone(), "video")
             .await
             .expect("cached track should be returned");
-        assert_eq!(reader_again.namespace, namespace);
-        assert_eq!(reader_again.name, TrackName::from("video"));
+        assert_eq!(again.reader.namespace, namespace);
+        assert_eq!(again.reader.name, TrackName::from("video"));
 
         let no_second_request =
             tokio::time::timeout(std::time::Duration::from_millis(50), requests.recv()).await;
@@ -1114,9 +1266,12 @@ mod tests {
             second.get_or_request_track(None, namespace.clone(), "video"),
         );
 
-        let (first_reader, _first_guard) = first_reader.expect("first request should get a reader");
-        let (second_reader, _second_guard) =
-            second_reader.expect("second request should get cached reader");
+        let first_reader = first_reader
+            .expect("first request should get a reader")
+            .reader;
+        let second_reader = second_reader
+            .expect("second request should get cached reader")
+            .reader;
         assert_eq!(first_reader.namespace, namespace);
         assert_eq!(second_reader.namespace, namespace);
         assert_eq!(first_reader.name, TrackName::from("video"));
@@ -1191,11 +1346,11 @@ mod tests {
             .expect("long prefix should register");
 
         let requested_ns = ns("room/123/camera");
-        let (reader, _guard) = locals
+        let local = locals
             .get_or_request_track(None, requested_ns.clone(), "video")
             .await
             .expect("track should be requested from longest prefix");
-        assert_eq!(reader.namespace, requested_ns);
+        assert_eq!(local.reader.namespace, requested_ns);
 
         let long_request = long_requests
             .recv()
@@ -1446,6 +1601,177 @@ mod tests {
             TrackChange::Added { .. } => panic!("expected removed event"),
         }
     }
+    /// Draft-16 §8.4: the gate must not resolve until the requester reports that
+    /// the upstream subscription is established, because the caller sends
+    /// SUBSCRIBE_OK as soon as it does.
+    #[tokio::test]
+    async fn upstream_gate_waits_for_the_requester() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let upstream = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("missing track should be requested")
+            .upstream
+            .expect("a cached track should hand back an upstream readiness gate");
+        let request = requests.recv().await.expect("source should get a request");
+
+        let pending = tokio::time::timeout(Duration::from_millis(50), upstream.established()).await;
+        assert!(
+            pending.is_err(),
+            "the gate must not resolve before the upstream subscription is established"
+        );
+
+        request.upstream.established();
+
+        upstream
+            .established()
+            .await
+            .expect("gate should resolve once the upstream subscription is established");
+    }
+
+    /// An upstream rejection has to surface as the same error, so the caller can
+    /// answer REQUEST_ERROR with a matching code instead of accepting the request
+    /// and reporting the failure later as PUBLISH_DONE.
+    #[tokio::test]
+    async fn upstream_gate_propagates_the_upstream_rejection() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let upstream = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("missing track should be requested")
+            .upstream
+            .expect("cached track should hand back a gate");
+        let request = requests.recv().await.expect("source should get a request");
+
+        let rejection = ServeError::Closed(RequestErrorCode::DoesNotExist as u64);
+        request.upstream.failed(rejection.clone());
+
+        let err = upstream
+            .established()
+            .await
+            .expect_err("a rejected upstream subscription must not resolve as established");
+        assert_eq!(err, rejection);
+    }
+
+    /// A subscriber arriving mid-handshake is a cache hit on an entry that is not
+    /// established yet, so it must wait on the same gate rather than be served a
+    /// reader with no upstream subscription behind it.
+    #[tokio::test]
+    async fn upstream_gate_is_shared_by_concurrent_subscribers() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let first = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("first request")
+            .upstream
+            .expect("first gate");
+        let request = requests.recv().await.expect("source should get a request");
+
+        let second = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("second request")
+            .upstream
+            .expect("second gate");
+
+        let pending = tokio::time::timeout(Duration::from_millis(50), second.established()).await;
+        assert!(
+            pending.is_err(),
+            "a cache hit on an unestablished entry must still wait"
+        );
+
+        request.upstream.established();
+
+        first
+            .established()
+            .await
+            .expect("first subscriber should be released");
+        second
+            .established()
+            .await
+            .expect("second subscriber should be released");
+        assert!(
+            requests.try_recv().is_err(),
+            "sharing the gate must not trigger a second upstream SUBSCRIBE"
+        );
+    }
+
+    /// A requester that gives up without answering must release waiting
+    /// subscribers with an error rather than stranding them: an abandoned request
+    /// is not an established subscription.
+    #[tokio::test]
+    async fn abandoned_request_releases_waiting_subscribers() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let upstream = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("missing track should be requested")
+            .upstream
+            .expect("cached track should hand back a gate");
+
+        drop(requests.recv().await.expect("source should get a request"));
+
+        let err = upstream
+            .established()
+            .await
+            .expect_err("an abandoned request must not leave subscribers waiting forever");
+        assert!(
+            matches!(err, ServeError::InternalWithId(_, _)),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Locally published tracks are already established when they are registered,
+    /// so serving one must not wait on anything.
+    #[tokio::test]
+    async fn published_track_has_no_upstream_gate() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_writer, reader) = Track::new(namespace.clone(), "audio").produce();
+        let _registration = locals
+            .register_track(None, reader)
+            .await
+            .expect("track should register");
+
+        let local = locals
+            .get_or_request_track(None, namespace, "audio")
+            .await
+            .expect("published track should be served");
+
+        assert!(
+            local.upstream.is_none(),
+            "a published track needs no upstream readiness gate"
+        );
+        assert!(
+            local.interest.is_none(),
+            "a published track has no upstream subscription to lease"
+        );
+    }
+
     /// The core fix: once the last downstream subscriber leaves, the cache entry
     /// is evicted and the lease resolves so the upstream subscription can be
     /// dropped (sending UNSUBSCRIBE).
@@ -1459,11 +1785,12 @@ mod tests {
             .await
             .expect("namespace source should register");
 
-        let (_reader, guard) = locals
+        let guard = locals
             .get_or_request_track(None, namespace.clone(), "video")
             .await
-            .expect("missing track should be requested");
-        let guard = guard.expect("cached track should hand back a guard");
+            .expect("missing track should be requested")
+            .interest
+            .expect("cached track should hand back a guard");
 
         let request = requests.recv().await.expect("source should get a request");
         let key = full(&namespace, "video");
@@ -1507,7 +1834,7 @@ mod tests {
             .await
             .expect("namespace source should register");
 
-        let (_reader, guard) = locals
+        let local = locals
             .get_or_request_track(None, namespace.clone(), "video")
             .await
             .expect("missing track should be requested");
@@ -1516,7 +1843,11 @@ mod tests {
         let released = request.lease.released();
         tokio::pin!(released);
 
-        drop(guard.expect("cached track should hand back a guard"));
+        drop(
+            local
+                .interest
+                .expect("cached track should hand back a guard"),
+        );
 
         tokio::select! {
             _ = &mut released => panic!("evicted before the grace period elapsed"),
@@ -1524,11 +1855,12 @@ mod tests {
         }
 
         // New subscriber inside the grace period: served from cache, no new request.
-        let (_reader, guard) = locals
+        let guard = locals
             .get_or_request_track(None, namespace.clone(), "video")
             .await
-            .expect("warm entry should still be served");
-        let guard = guard.expect("cached track should hand back a guard");
+            .expect("warm entry should still be served")
+            .interest
+            .expect("cached track should hand back a guard");
 
         tokio::select! {
             _ = &mut released => panic!("evicted while a subscriber was present"),
@@ -1560,14 +1892,14 @@ mod tests {
             .await
             .expect("namespace source should register");
 
-        let (_reader, guard) = locals
+        let local = locals
             .get_or_request_track(None, namespace.clone(), "video")
             .await
             .expect("missing track should be requested");
 
         // The subscriber goes away before the source has even picked up the
         // request, which is what a cancelled SUBSCRIBE looks like.
-        drop(guard);
+        drop(local);
 
         let request = requests.recv().await.expect("source should get a request");
         request.lease.released().await;
@@ -1591,13 +1923,13 @@ mod tests {
             .await
             .expect("namespace source should register");
 
-        let (_reader, guard) = locals
+        let local = locals
             .get_or_request_track(None, namespace.clone(), "video")
             .await
             .expect("missing track should be requested");
         let request = requests.recv().await.expect("source should get a request");
 
-        drop(guard);
+        drop(local);
 
         tokio::select! {
             _ = request.lease.released() => panic!("eviction should be disabled"),
@@ -1620,7 +1952,7 @@ mod tests {
             .await
             .expect("namespace source should register");
 
-        let (_reader, first_guard) = locals
+        let first = locals
             .get_or_request_track(None, namespace.clone(), "video")
             .await
             .expect("first request");
@@ -1628,7 +1960,7 @@ mod tests {
 
         // Drop the first generation's entry while deliberately keeping its guard
         // alive, modelling a slow subscriber that outlives its cache entry.
-        let stale_guard = first_guard.expect("guard");
+        let stale_guard = first.interest.expect("guard");
         let key = full(&namespace, "video");
         locals
             .tracks
@@ -1640,12 +1972,12 @@ mod tests {
         drop(first_request);
 
         // A second subscriber creates a fresh generation.
-        let (_reader, second_guard) = locals
+        let second = locals
             .get_or_request_track(None, namespace.clone(), "video")
             .await
             .expect("second request");
         let second_request = requests.recv().await.expect("second request received");
-        drop(second_guard.expect("guard"));
+        drop(second.interest.expect("guard"));
 
         // The stale guard belongs to the old counter, so it must not make the new
         // entry look busy.

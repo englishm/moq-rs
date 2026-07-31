@@ -17,6 +17,7 @@ use crate::{
     metrics::{GaugeGuard, TimingGuard},
     upstream_namespaces::UpstreamNamespaces,
     Coordinator, Locals, NamespaceChange, RemoteManager, SessionContext, TrackChange,
+    UpstreamReady,
 };
 
 /// Producer of tracks to a remote Subscriber
@@ -28,6 +29,22 @@ pub struct Producer {
     upstream_namespaces: UpstreamNamespaces,
     /// Relay-level context for this MoQT session.
     context: SessionContext,
+}
+
+/// Why the wait for upstream readiness ended without the subscription being
+/// established.
+///
+/// The two cases carry the same [`ServeError`] variants — an upstream rejection
+/// can be `Cancel` or `Done` just as a departing subscriber can — so the
+/// direction has to come from which branch resolved rather than from the error.
+/// Getting it wrong misreports publisher failures as subscriber cancellations in
+/// the subscribe metrics.
+enum UpstreamWait {
+    /// The upstream subscription could not be established.
+    UpstreamFailed(ServeError),
+
+    /// The downstream subscriber went away before it was established.
+    DownstreamLeft(ServeError),
 }
 
 impl Producer {
@@ -154,18 +171,52 @@ impl Producer {
         // 1. actual FullTrackName -> TrackReader media cache
         // 2. PUBLISH_NAMESPACE route source, which triggers upstream SUBSCRIBE
         let mut locals = self.locals.clone();
-        if let Some((track, interest_guard)) = locals
+        if let Some(local) = locals
             .get_or_request_track(self.context.scope(), namespace.clone(), &track_name)
             .await
         {
             let ns = namespace.to_utf8_path();
-            tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
+            tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", local.reader.info);
             timing_guard.set_label("source", "local");
             let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
             // Held until serving finishes. Once the last guard for a cached track
             // drops, its upstream subscription becomes eligible for release.
-            let _interest_guard = interest_guard;
-            return Ok(subscribed.serve(track).await?);
+            let _interest_guard = local.interest;
+
+            // Draft-16 §8.4: a relay MUST have an Established upstream
+            // subscription before it sends SUBSCRIBE_OK. A pull-through cache
+            // entry exists before its upstream subscription does, so wait for it.
+            if let Some(upstream) = local.upstream {
+                if let Err(outcome) = Self::await_upstream(&subscribed, &upstream).await {
+                    // Which side ended the wait is decided by the branch that
+                    // resolved, not by the error variant: an upstream failure can
+                    // itself be Cancel or Done, so sniffing the variant would
+                    // report a publisher-side failure as a subscriber cancellation
+                    // and skip the upstream-error counter.
+                    let err = match outcome {
+                        UpstreamWait::DownstreamLeft(err) => {
+                            tracing::debug!(namespace = %ns, track = %track_name, error = %err, "downstream subscriber left before the upstream subscription was established");
+                            timing_guard.set_label("source", "downstream_left");
+                            err
+                        }
+                        UpstreamWait::UpstreamFailed(err) => {
+                            tracing::warn!(namespace = %ns, track = %track_name, error = %err, "upstream subscription could not be established");
+                            metrics::counter!("moq_relay_subscribe_upstream_errors_total")
+                                .increment(1);
+                            timing_guard.set_label("source", "upstream_error");
+                            err
+                        }
+                    };
+
+                    // Rejects when the subscription is already closed (the
+                    // downstream-left case), which is fine: the error below is
+                    // still the reason we stopped.
+                    let _ = subscribed.close(err.clone());
+                    return Err(err.into());
+                }
+            }
+
+            return Ok(subscribed.serve(local.reader).await?);
         }
 
         // Check remote tracks after local exact tracks and namespace route sources.
@@ -217,6 +268,24 @@ impl Producer {
         ));
         subscribed.close(err.clone())?;
         Err(err.into())
+    }
+
+    /// Wait for the upstream subscription behind a cached track to be established.
+    ///
+    /// Also completes when the downstream subscriber goes away first, so a
+    /// cancelled SUBSCRIBE is not held here for the full upstream response
+    /// timeout. The two cases are reported separately because they cannot be
+    /// told apart from the error alone — see [`UpstreamWait`].
+    async fn await_upstream(
+        subscribed: &Subscribed,
+        upstream: &UpstreamReady,
+    ) -> Result<(), UpstreamWait> {
+        tokio::select! {
+            res = upstream.established() => res.map_err(UpstreamWait::UpstreamFailed),
+            res = subscribed.closed() => Err(UpstreamWait::DownstreamLeft(
+                res.err().unwrap_or(ServeError::Done),
+            )),
+        }
     }
 
     /// Serve a SUBSCRIBE_NAMESPACE request using relay-local namespace state.
@@ -513,13 +582,18 @@ impl Producer {
     }
 
     fn is_expected_serve_shutdown(err: &anyhow::Error) -> bool {
-        matches!(
-            err.downcast_ref::<SessionError>(),
-            Some(SessionError::Serve(ServeError::Cancel | ServeError::Done))
-        ) || matches!(
-            err.downcast_ref::<ServeError>(),
-            Some(ServeError::Cancel | ServeError::Done)
-        )
+        let serve = match err.downcast_ref::<SessionError>() {
+            Some(SessionError::Serve(err)) => Some(err),
+            _ => err.downcast_ref::<ServeError>(),
+        };
+
+        serve.is_some_and(Self::is_expected_serve_shutdown_err)
+    }
+
+    /// True for the errors that mean nobody is waiting for the subscription any
+    /// more, rather than a failure worth warning about.
+    fn is_expected_serve_shutdown_err(err: &ServeError) -> bool {
+        matches!(err, ServeError::Cancel | ServeError::Done)
     }
 
     /// Serve a track_status request.

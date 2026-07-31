@@ -256,7 +256,7 @@ impl Consumer {
                     tracing::info!(namespace = %ns, "PUBLISH_NAMESPACE closed");
                     return Ok(());
                 },
-                Some(TrackRequest { writer, lease }) = requests.recv() => {
+                Some(TrackRequest { writer, lease, upstream }) = requests.recv() => {
                     let mut subscriber = self.subscriber.clone();
 
                     tasks.push(async move {
@@ -272,8 +272,15 @@ impl Consumer {
                         // Hold the subscription explicitly rather than using
                         // `subscribe()`, so it can be dropped — sending
                         // UNSUBSCRIBE — once downstream interest goes away.
+                        //
+                        // `subscribe_open` resolves once the upstream publisher
+                        // answers, so its outcome is exactly what downstream
+                        // subscribers are waiting on to satisfy draft-16 §8.4.
                         let subscribe = match subscriber.subscribe_open(writer).await {
-                            Ok(subscribe) => subscribe,
+                            Ok(subscribe) => {
+                                upstream.established();
+                                subscribe
+                            }
                             Err(err) => {
                                 tracing::warn!(
                                     namespace = %namespace,
@@ -281,6 +288,10 @@ impl Consumer {
                                     error = %err,
                                     "failed forwarding subscribe: {:?}", info
                                 );
+                                // Release waiting downstream subscribers with the
+                                // upstream reason so they get a REQUEST_ERROR that
+                                // matches it, rather than a premature accept.
+                                upstream.failed(err);
                                 return Ok(());
                             }
                         };
