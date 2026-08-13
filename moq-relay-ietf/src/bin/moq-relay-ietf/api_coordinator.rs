@@ -8,9 +8,12 @@
 //! It provides:
 //!
 //! - HTTP-based namespace lookups via moq-api
+//! - A short-lived cache in front of those lookups
 //! - Automatic TTL refresh to maintain registrations
 //! - High availability when using the moq-api server
 
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -18,6 +21,7 @@ use async_trait::async_trait;
 use moq_api::{Client, Origin};
 use moq_native_ietf::quic;
 use moq_transport::coding::TrackNamespace;
+use tokio::time::Instant;
 use url::Url;
 
 use moq_relay_ietf::{
@@ -27,6 +31,19 @@ use moq_relay_ietf::{
 /// Default TTL for namespace registrations (in seconds)
 /// moq-api server uses 600 seconds (10 minutes) TTL
 const DEFAULT_REGISTRATION_TTL_SECS: u64 = 600;
+
+/// Default TTL for cached namespace lookups (in seconds)
+///
+/// Deliberately tiny next to the registration TTL: long enough to collapse the
+/// lookups one subscriber makes while subscribing to several tracks, short
+/// enough that a registration change is picked up almost immediately.
+const DEFAULT_LOOKUP_CACHE_TTL_SECS: u64 = 2;
+
+/// Negative lookups expire this many times sooner than positive ones
+const NEGATIVE_LOOKUP_TTL_DIVISOR: u32 = 10;
+
+/// Sweep expired entries once the lookup cache holds this many namespaces
+const LOOKUP_CACHE_SWEEP_THRESHOLD: usize = 1024;
 
 /// Configuration for the API coordinator
 #[derive(Debug, Clone)]
@@ -39,6 +56,8 @@ pub struct ApiCoordinatorConfig {
     pub registration_ttl_secs: u64,
     /// Interval for refreshing registrations (should be less than TTL)
     pub refresh_interval_secs: u64,
+    /// TTL for cached namespace lookups in seconds (0 disables the cache)
+    pub lookup_cache_ttl_secs: u64,
 }
 
 impl ApiCoordinatorConfig {
@@ -50,6 +69,7 @@ impl ApiCoordinatorConfig {
             registration_ttl_secs: DEFAULT_REGISTRATION_TTL_SECS,
             // Refresh at half the TTL to ensure we don't expire
             refresh_interval_secs: DEFAULT_REGISTRATION_TTL_SECS / 2,
+            lookup_cache_ttl_secs: DEFAULT_LOOKUP_CACHE_TTL_SECS,
         }
     }
 
@@ -58,6 +78,124 @@ impl ApiCoordinatorConfig {
         self.registration_ttl_secs = ttl_secs;
         self.refresh_interval_secs = ttl_secs / 2;
         self
+    }
+
+    /// Set custom TTL for cached lookups, where 0 disables the cache.
+    ///
+    /// Keep this well below the registration TTL, otherwise a lookup can be
+    /// served from cache after the registration behind it has expired.
+    pub fn with_lookup_cache_ttl(mut self, ttl_secs: u64) -> Self {
+        self.lookup_cache_ttl_secs = ttl_secs;
+        self
+    }
+}
+
+/// A namespace lookup outcome worth remembering for a short while
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CachedLookup {
+    Found(Url),
+    NotFound,
+}
+
+impl CachedLookup {
+    fn into_result(
+        self,
+        namespace: &TrackNamespace,
+    ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        match self {
+            Self::Found(url) => Ok((NamespaceOrigin::new(namespace.clone(), url, None), None)),
+            Self::NotFound => Err(CoordinatorError::NamespaceNotFound),
+        }
+    }
+}
+
+struct CacheEntry {
+    lookup: CachedLookup,
+    expires_at: Instant,
+}
+
+/// Short-lived cache in front of the moq-api lookup endpoint.
+///
+/// A relay looks a namespace up once per track it cannot serve locally, so a
+/// subscriber asking for several tracks of the same namespace produces that
+/// many identical requests, each on the critical path of a cold subscribe.
+///
+/// The TTL is the only invalidation: it is also what bounds how long a lookup
+/// can point at a relay that has stopped serving the namespace, so it is kept
+/// far below the registration TTL rather than being explicitly purged.
+///
+/// Misses are not coalesced — concurrent misses for the same namespace each
+/// reach the API, and the first response to land populates the entry.
+struct LookupCache {
+    entries: Mutex<HashMap<String, CacheEntry>>,
+    ttl: Duration,
+    negative_ttl: Duration,
+}
+
+impl LookupCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            ttl,
+            // A namespace that does not exist yet is far more likely to show up
+            // than a live one is to move, so misses are forgotten much sooner.
+            negative_ttl: ttl / NEGATIVE_LOOKUP_TTL_DIVISOR,
+        }
+    }
+
+    /// Look up a cached outcome, dropping it if it has expired
+    fn get(&self, key: &str) -> Option<CachedLookup> {
+        let now = Instant::now();
+        let mut entries = self.lock();
+
+        match entries.get(key) {
+            Some(entry) if entry.expires_at > now => Some(entry.lookup.clone()),
+            Some(_) => {
+                entries.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Remember an outcome until its TTL elapses; a zero TTL caches nothing
+    fn insert(&self, key: &str, lookup: CachedLookup) {
+        let ttl = match lookup {
+            CachedLookup::Found(_) => self.ttl,
+            CachedLookup::NotFound => self.negative_ttl,
+        };
+
+        if ttl.is_zero() {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut entries = self.lock();
+
+        // Expired entries are otherwise only dropped when looked up again, so a
+        // relay seeing many distinct namespaces would accumulate them forever.
+        if entries.len() >= LOOKUP_CACHE_SWEEP_THRESHOLD {
+            entries.retain(|_, entry| entry.expires_at > now);
+        }
+
+        entries.insert(
+            key.to_owned(),
+            CacheEntry {
+                lookup,
+                expires_at: now + ttl,
+            },
+        );
+    }
+
+    /// The cache holds no invariant a panic could break, so recover from
+    /// poisoning instead of losing lookups for the rest of the process.
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, CacheEntry>> {
+        self.entries.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().len()
     }
 }
 
@@ -108,6 +246,7 @@ async fn unregister_namespace_async(client: &Client, namespace_key: &str) -> Res
 /// - HTTP-based registration and lookup
 /// - TTL-based automatic expiration of stale registrations
 /// - Background refresh tasks to maintain registrations
+/// - A short-lived lookup cache, so repeat subscribes skip the API
 ///
 /// # Scope handling
 ///
@@ -120,6 +259,8 @@ pub struct ApiCoordinator {
     client: Client,
     /// Configuration
     config: ApiCoordinatorConfig,
+    /// Recently resolved namespace lookups
+    lookups: LookupCache,
 }
 
 impl ApiCoordinator {
@@ -168,8 +309,13 @@ impl ApiCoordinator {
     /// A new `ApiCoordinator` instance
     pub fn new(config: ApiCoordinatorConfig) -> Self {
         let client = Client::new(config.api_url.clone());
+        let lookups = LookupCache::new(Duration::from_secs(config.lookup_cache_ttl_secs));
 
-        Self { client, config }
+        Self {
+            client,
+            config,
+            lookups,
+        }
     }
 
     /// Start a background task to refresh namespace registration
@@ -279,6 +425,12 @@ impl Coordinator for ApiCoordinator {
         namespace: &TrackNamespace,
     ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
         let namespace_str = Self::registry_key(scope, namespace);
+
+        if let Some(cached) = self.lookups.get(&namespace_str) {
+            tracing::trace!(namespace = %namespace_str, "serving cached namespace lookup: {}", namespace_str);
+            return cached.into_result(namespace);
+        }
+
         tracing::debug!(scope = scope.unwrap_or("<unscoped>"), namespace = %namespace_str, "looking up namespace in API: {}", namespace_str);
 
         // Query the API for the namespace
@@ -289,19 +441,22 @@ impl Coordinator for ApiCoordinator {
             .context("failed to lookup namespace in API")
             .map_err(CoordinatorError::Other)?;
 
-        match result {
+        // Only answers are cached; a failed request propagates above so that a
+        // transient API error is retried by the next subscriber.
+        let lookup = match result {
             Some(origin) => {
                 tracing::debug!(namespace = %namespace_str, origin_url = %origin.url, "found namespace {} at {}", namespace_str, origin.url);
-                Ok((
-                    NamespaceOrigin::new(namespace.clone(), origin.url, None),
-                    None,
-                ))
+                CachedLookup::Found(origin.url)
             }
             None => {
                 tracing::debug!(namespace = %namespace_str, "namespace not found: {}", namespace_str);
-                Err(CoordinatorError::NamespaceNotFound)
+                CachedLookup::NotFound
             }
-        }
+        };
+
+        self.lookups.insert(&namespace_str, lookup.clone());
+
+        lookup.into_result(namespace)
     }
 
     async fn shutdown(&self) -> CoordinatorResult<()> {
@@ -314,6 +469,14 @@ impl Coordinator for ApiCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
+
+    const CACHE_TTL: Duration = Duration::from_secs(DEFAULT_LOOKUP_CACHE_TTL_SECS);
+
+    fn origin() -> CachedLookup {
+        CachedLookup::Found(Url::parse("https://origin.example.com").unwrap())
+    }
 
     #[test]
     fn test_config_new() {
@@ -329,6 +492,7 @@ mod tests {
             config.refresh_interval_secs,
             DEFAULT_REGISTRATION_TTL_SECS / 2
         );
+        assert_eq!(config.lookup_cache_ttl_secs, DEFAULT_LOOKUP_CACHE_TTL_SECS);
     }
 
     #[test]
@@ -340,5 +504,105 @@ mod tests {
 
         assert_eq!(config.registration_ttl_secs, 120);
         assert_eq!(config.refresh_interval_secs, 60);
+    }
+
+    #[test]
+    fn test_config_with_lookup_cache_ttl() {
+        let api_url = Url::parse("http://localhost:8080").unwrap();
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+
+        let config = ApiCoordinatorConfig::new(api_url, relay_url).with_lookup_cache_ttl(0);
+
+        assert_eq!(config.lookup_cache_ttl_secs, 0);
+        assert_eq!(config.registration_ttl_secs, DEFAULT_REGISTRATION_TTL_SECS);
+    }
+
+    #[test]
+    fn test_coordinator_is_shareable_across_tasks() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<ApiCoordinator>();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cache_serves_a_repeat_lookup_within_the_ttl() {
+        let cache = LookupCache::new(CACHE_TTL);
+        cache.insert("ns", origin());
+
+        tokio::time::sleep(CACHE_TTL / 2).await;
+
+        assert_eq!(cache.get("ns"), Some(origin()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cache_forgets_an_entry_once_the_ttl_elapses() {
+        let cache = LookupCache::new(CACHE_TTL);
+        cache.insert("ns", origin());
+
+        tokio::time::sleep(CACHE_TTL + Duration::from_millis(1)).await;
+
+        assert_eq!(cache.get("ns"), None);
+        assert_eq!(cache.len(), 0, "an expired entry should not be retained");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cache_forgets_a_miss_sooner_than_a_hit() {
+        let cache = LookupCache::new(CACHE_TTL);
+        cache.insert("missing", CachedLookup::NotFound);
+        cache.insert("present", origin());
+
+        tokio::time::sleep(CACHE_TTL / NEGATIVE_LOOKUP_TTL_DIVISOR + Duration::from_millis(1))
+            .await;
+
+        // A namespace registered moments ago must not stay invisible.
+        assert_eq!(cache.get("missing"), None);
+        assert_eq!(cache.get("present"), Some(origin()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_zero_ttl_disables_the_cache() {
+        let cache = LookupCache::new(Duration::ZERO);
+        cache.insert("present", origin());
+        cache.insert("missing", CachedLookup::NotFound);
+
+        assert_eq!(cache.get("present"), None);
+        assert_eq!(cache.get("missing"), None);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cache_sweeps_expired_entries_as_it_grows() {
+        let cache = LookupCache::new(CACHE_TTL);
+
+        for i in 0..LOOKUP_CACHE_SWEEP_THRESHOLD {
+            cache.insert(&format!("ns-{i}"), origin());
+        }
+        assert_eq!(cache.len(), LOOKUP_CACHE_SWEEP_THRESHOLD);
+
+        tokio::time::sleep(CACHE_TTL + Duration::from_millis(1)).await;
+        cache.insert("fresh", origin());
+
+        assert_eq!(cache.len(), 1, "expired entries should not accumulate");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cache_is_shared_between_concurrent_lookups() {
+        let cache = Arc::new(LookupCache::new(CACHE_TTL));
+
+        let tasks: Vec<_> = (0..32)
+            .map(|i| {
+                let cache = cache.clone();
+                tokio::spawn(async move {
+                    let key = format!("ns-{}", i % 4);
+                    cache.insert(&key, origin());
+                    cache.get(&key)
+                })
+            })
+            .collect();
+
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), Some(origin()));
+        }
+        assert_eq!(cache.len(), 4);
     }
 }

@@ -95,6 +95,11 @@ pub struct Cli {
     #[arg(long, default_value = "600")]
     pub api_ttl: u64,
 
+    /// Seconds to reuse a namespace lookup before asking the API again.
+    /// Only used when --api-url is specified. 0 disables the cache.
+    #[arg(long, default_value = "2")]
+    pub api_lookup_cache_ttl: u64,
+
     /// Address to expose Prometheus metrics on (e.g., "127.0.0.1:9090").
     /// Requires the `metrics-prometheus` feature to be enabled.
     /// When set, serves metrics at http://<addr>/metrics
@@ -184,7 +189,9 @@ async fn main() -> anyhow::Result<()> {
     // Create the coordinator based on CLI arguments
     // Priority: api-url > file coordinator
     let coordinator: Arc<dyn Coordinator> = if let Some(api_url) = &cli.api_url {
-        let config = ApiCoordinatorConfig::new(api_url.clone(), relay_url).with_ttl(cli.api_ttl);
+        let config = ApiCoordinatorConfig::new(api_url.clone(), relay_url)
+            .with_ttl(cli.api_ttl)
+            .with_lookup_cache_ttl(cli.api_lookup_cache_ttl);
         let api_coordinator = ApiCoordinator::new(config);
         tracing::info!("using API coordinator: {}", api_url);
         Arc::new(api_coordinator)
