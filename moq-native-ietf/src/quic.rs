@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     fs::File,
     io::BufWriter,
@@ -26,7 +26,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 
 /// Represents the address family of the local QUIC socket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AddressFamily {
     Ipv4,
     Ipv6,
@@ -359,6 +359,7 @@ impl Endpoint {
             config: config.tls.client,
             transport,
             is_dual_stack: config.is_dual_stack,
+            dns_cache: Arc::new(DnsCache::new(DEFAULT_DNS_CACHE_TTL)),
         };
 
         Ok(Self {
@@ -510,15 +511,110 @@ impl Server {
     }
 }
 
+/// How long a resolved address is reused before the resolver is consulted again.
+///
+/// Establishing a connection is on the critical path of anything that cannot be
+/// served locally, and the same small set of hosts tends to be resolved over and
+/// over, so a brief cache collapses bursts and repeat connects. It is
+/// deliberately short: the resolver stays authoritative, and record changes
+/// (failover, rollout) are picked up in seconds instead of being pinned for the
+/// lifetime of the process.
+pub const DEFAULT_DNS_CACHE_TTL: time::Duration = time::Duration::from_secs(30);
+
+/// The inputs that determine which address [`Client::resolve_dns`] returns.
+///
+/// The address family is part of the key because resolution filters answers
+/// against the local socket's family, so the same host and port can legitimately
+/// resolve to different addresses on differently bound clients.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DnsCacheKey {
+    host: String,
+    port: u16,
+    family: AddressFamily,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DnsCacheEntry {
+    addr: net::SocketAddr,
+    expires_at: time::Instant,
+}
+
+/// A small time-to-live cache in front of the resolver.
+///
+/// A `ttl` of zero disables it: every lookup misses and nothing is stored.
+/// Concurrent misses for the same key each resolve and the last one wins; that
+/// is a redundant lookup, not a wrong answer, so it is not worth de-duplicating.
+#[derive(Debug)]
+struct DnsCache {
+    ttl: time::Duration,
+    entries: Mutex<HashMap<DnsCacheKey, DnsCacheEntry>>,
+}
+
+impl DnsCache {
+    fn new(ttl: time::Duration) -> Self {
+        Self {
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns the address cached for `key`, unless it has expired by `now`.
+    fn get(&self, key: &DnsCacheKey, now: time::Instant) -> Option<net::SocketAddr> {
+        if self.ttl.is_zero() {
+            return None;
+        }
+
+        self.entries
+            .lock()
+            .unwrap()
+            .get(key)
+            .filter(|entry| entry.expires_at > now)
+            .map(|entry| entry.addr)
+    }
+
+    /// Caches `addr` for `key` until `ttl` after `now`.
+    ///
+    /// Expired entries are swept on the way in; the working set is a handful of
+    /// hosts, so this stays cheap and keeps the map from growing without bound.
+    fn insert(&self, key: DnsCacheKey, addr: net::SocketAddr, now: time::Instant) {
+        if self.ttl.is_zero() {
+            return;
+        }
+
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|_, entry| entry.expires_at > now);
+        entries.insert(
+            key,
+            DnsCacheEntry {
+                addr,
+                expires_at: now + self.ttl,
+            },
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     quic: quinn::Endpoint,
     config: rustls::ClientConfig,
     transport: Arc<quinn::TransportConfig>,
     is_dual_stack: bool,
+    /// Shared with every clone of this client, so repeat connects through any
+    /// of them see the same entries.
+    dns_cache: Arc<DnsCache>,
 }
 
 impl Client {
+    /// Sets how long resolved addresses are reused, discarding anything already
+    /// cached.
+    ///
+    /// Defaults to [`DEFAULT_DNS_CACHE_TTL`]; zero resolves on every connect.
+    /// Only affects this client, not the clones already handed out.
+    pub fn with_dns_cache_ttl(mut self, ttl: time::Duration) -> Self {
+        self.dns_cache = Arc::new(DnsCache::new(ttl));
+        self
+    }
+
     /// Returns the local address of the QUIC socket.
     pub fn local_addr(&self) -> anyhow::Result<net::SocketAddr> {
         self.quic
@@ -626,6 +722,9 @@ impl Client {
     }
 
     /// Default DNS resolution logic that filters results by address family.
+    ///
+    /// Answers are cached for [`DEFAULT_DNS_CACHE_TTL`]; see
+    /// [`Client::with_dns_cache_ttl`].
     async fn resolve_dns(
         &self,
         host: &str,
@@ -634,12 +733,33 @@ impl Client {
     ) -> anyhow::Result<net::SocketAddr> {
         let local_addr = self.local_addr()?;
 
+        // A literal address never reaches the resolver, so it skips the cache.
+        let literal = Self::parse_socket_addr(host, port).ok();
+        let cache_key = literal.is_none().then(|| DnsCacheKey {
+            host: host.to_owned(),
+            port,
+            family: address_family,
+        });
+
+        if let Some(key) = &cache_key {
+            if let Some(addr) = self.dns_cache.get(key, time::Instant::now()) {
+                tracing::debug!(
+                    "DNS cache hit for {}:{}, family {:?}: {}",
+                    host,
+                    port,
+                    address_family,
+                    addr
+                );
+                return Ok(addr);
+            }
+        }
+
         // Collect all DNS results
-        let addrs: Vec<net::SocketAddr> = match Self::parse_socket_addr(host, port) {
-            Ok(addr) => {
+        let addrs: Vec<net::SocketAddr> = match literal {
+            Some(addr) => {
                 vec![addr]
             }
-            Err(_) => tokio::net::lookup_host((host, port))
+            None => tokio::net::lookup_host((host, port))
                 .await
                 .context("failed DNS lookup")?
                 .collect(),
@@ -703,6 +823,14 @@ impl Client {
             addrs.len()
         );
 
+        // Only successes are cached: a failure pinned for the whole TTL would
+        // outlive the resolver hiccup that caused it, and the retry right after
+        // is exactly when a fresh answer matters most.
+        if let Some(key) = cache_key {
+            self.dns_cache
+                .insert(key, compatible_addr, time::Instant::now());
+        }
+
         Ok(compatible_addr)
     }
 
@@ -750,6 +878,152 @@ mod tests {
         assert!(
             endpoint.server.is_none(),
             "client-only TLS config should yield no server"
+        );
+    }
+
+    fn key(host: &str, port: u16, family: AddressFamily) -> DnsCacheKey {
+        DnsCacheKey {
+            host: host.to_owned(),
+            port,
+            family,
+        }
+    }
+
+    fn addr(addr: &str) -> net::SocketAddr {
+        addr.parse().expect("valid socket address")
+    }
+
+    /// A cached address is reused right up to the TTL and never past it.
+    #[test]
+    fn dns_cache_serves_entries_until_they_expire() {
+        let ttl = time::Duration::from_secs(30);
+        let cache = DnsCache::new(ttl);
+        let now = time::Instant::now();
+        let key = key("relay.example", 443, AddressFamily::Ipv4);
+
+        cache.insert(key.clone(), addr("192.0.2.1:443"), now);
+
+        assert_eq!(cache.get(&key, now), Some(addr("192.0.2.1:443")));
+        assert_eq!(
+            cache.get(&key, now + ttl - time::Duration::from_millis(1)),
+            Some(addr("192.0.2.1:443")),
+            "entry should still be live just before the TTL"
+        );
+        assert_eq!(
+            cache.get(&key, now + ttl),
+            None,
+            "entry should expire at the TTL"
+        );
+        assert_eq!(cache.get(&key, now + ttl * 2), None);
+    }
+
+    /// Host, port and address family each select a distinct entry: the family
+    /// filter means the same host and port can resolve differently per socket.
+    #[test]
+    fn dns_cache_keys_on_host_port_and_family() {
+        let cache = DnsCache::new(time::Duration::from_secs(30));
+        let now = time::Instant::now();
+
+        cache.insert(
+            key("relay.example", 443, AddressFamily::Ipv4),
+            addr("192.0.2.1:443"),
+            now,
+        );
+        cache.insert(
+            key("relay.example", 443, AddressFamily::Ipv6),
+            addr("[2001:db8::1]:443"),
+            now,
+        );
+
+        assert_eq!(
+            cache.get(&key("relay.example", 443, AddressFamily::Ipv4), now),
+            Some(addr("192.0.2.1:443"))
+        );
+        assert_eq!(
+            cache.get(&key("relay.example", 443, AddressFamily::Ipv6), now),
+            Some(addr("[2001:db8::1]:443"))
+        );
+        assert_eq!(
+            cache.get(
+                &key("relay.example", 443, AddressFamily::Ipv6DualStack),
+                now
+            ),
+            None,
+            "a different address family must not reuse another family's answer"
+        );
+        assert_eq!(
+            cache.get(&key("relay.example", 4443, AddressFamily::Ipv4), now),
+            None,
+            "a different port must not reuse another port's answer"
+        );
+        assert_eq!(
+            cache.get(&key("other.example", 443, AddressFamily::Ipv4), now),
+            None,
+            "a different host must not reuse another host's answer"
+        );
+    }
+
+    /// Expired entries are swept on insert so the map stays bounded.
+    #[test]
+    fn dns_cache_drops_expired_entries_on_insert() {
+        let ttl = time::Duration::from_secs(30);
+        let cache = DnsCache::new(ttl);
+        let now = time::Instant::now();
+
+        cache.insert(
+            key("stale.example", 443, AddressFamily::Ipv4),
+            addr("192.0.2.1:443"),
+            now,
+        );
+        cache.insert(
+            key("fresh.example", 443, AddressFamily::Ipv4),
+            addr("192.0.2.2:443"),
+            now + ttl,
+        );
+
+        let entries = cache.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "the expired entry should have been swept");
+        assert!(entries.contains_key(&key("fresh.example", 443, AddressFamily::Ipv4)));
+    }
+
+    /// A zero TTL turns the cache off entirely.
+    #[test]
+    fn dns_cache_zero_ttl_disables_caching() {
+        let cache = DnsCache::new(time::Duration::ZERO);
+        let now = time::Instant::now();
+        let key = key("relay.example", 443, AddressFamily::Ipv4);
+
+        cache.insert(key.clone(), addr("192.0.2.1:443"), now);
+
+        assert_eq!(cache.get(&key, now), None);
+        assert!(cache.entries.lock().unwrap().is_empty());
+    }
+
+    /// A URL holding a literal address is resolved without the resolver, so it
+    /// must not consume or populate a cache entry. No network access.
+    #[tokio::test]
+    async fn resolve_dns_leaves_literal_addresses_uncached() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
+        let tls = tls::Args {
+            disable_verify: true,
+            ..Default::default()
+        }
+        .load()
+        .expect("load client TLS config");
+
+        let endpoint =
+            Endpoint::new(Config::with_socket(socket, None, tls)).expect("endpoint builds");
+        let client = endpoint.client;
+
+        let resolved = client
+            .resolve_dns("192.0.2.1", 443, AddressFamily::Ipv4)
+            .await
+            .expect("literal address resolves");
+
+        assert_eq!(resolved, addr("192.0.2.1:443"));
+        assert!(
+            client.dns_cache.entries.lock().unwrap().is_empty(),
+            "literal addresses should not enter the cache"
         );
     }
 }
