@@ -54,6 +54,6 @@ pub use local::*;
 pub use moq_transport::session::SessionConfig;
 pub use producer::*;
 pub use relay::*;
-pub use remote::RemoteManager;
+pub use remote::{RemoteManager, RemoteUseGuard, DEFAULT_MAX_REMOTE_CONNECTIONS};
 pub use session::*;
 pub use web::*;
