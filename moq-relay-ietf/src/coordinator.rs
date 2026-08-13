@@ -5,8 +5,10 @@ use std::net::SocketAddr;
 
 use async_trait::async_trait;
 use moq_native_ietf::quic;
-use moq_transport::coding::TrackNamespace;
+use moq_transport::coding::{TrackNamespace, TrackNamespacePrefix};
 use url::Url;
+
+use crate::session::SessionInterface;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinatorError {
@@ -211,9 +213,17 @@ pub struct ScopeConfig {
 /// The subscription remains active until this handle is dropped.
 /// On drop, cleanup is performed (e.g., unregistering from the coordinator).
 pub struct NamespaceSubscription {
-    /// Namespaces that currently match the subscribed prefix.
-    /// The relay should send PUBLISH_NAMESPACE for each of these.
-    pub existing_namespaces: Vec<NamespaceInfo>,
+    /// Peer relays that currently host namespaces matching the subscribed
+    /// prefix. The subscribing relay opens upstream SUBSCRIBE_NAMESPACE
+    /// sessions to these to receive live NAMESPACE / NAMESPACE_DONE updates.
+    /// The coordinator excludes the caller and the inbound source peer, so
+    /// every entry is a distinct upstream that is safe to pull from.
+    ///
+    /// The matching namespaces themselves are not returned here: they are
+    /// delivered live over the upstream pull sessions (cross-relay) and served
+    /// from relay-local state (same-relay), so a static snapshot would be both
+    /// redundant and unable to reflect later withdrawals.
+    pub upstream_relays: Vec<RelayInfo>,
 
     /// RAII handle — drop triggers unsubscription cleanup.
     _registration: Box<dyn Send + Sync>,
@@ -222,37 +232,19 @@ pub struct NamespaceSubscription {
 impl Default for NamespaceSubscription {
     fn default() -> Self {
         Self {
-            existing_namespaces: vec![],
+            upstream_relays: vec![],
             _registration: Box::new(()),
         }
     }
 }
 
 impl NamespaceSubscription {
-    /// Create a new subscription with existing namespaces and a cleanup handle.
-    pub fn new<T: Send + Sync + 'static>(existing: Vec<NamespaceInfo>, inner: T) -> Self {
+    /// Create a new subscription with upstream relays and a cleanup handle.
+    pub fn new<T: Send + Sync + 'static>(upstream_relays: Vec<RelayInfo>, inner: T) -> Self {
         Self {
-            existing_namespaces: existing,
+            upstream_relays,
             _registration: Box::new(inner),
         }
-    }
-}
-
-/// Information about a registered namespace.
-///
-/// Returned in [`NamespaceSubscription`] to describe namespaces matching
-/// a SUBSCRIBE_NAMESPACE prefix.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct NamespaceInfo {
-    /// The namespace identity.
-    pub namespace: TrackNamespace,
-}
-
-impl NamespaceInfo {
-    /// Create a new NamespaceInfo.
-    pub fn new(namespace: TrackNamespace) -> Self {
-        Self { namespace }
     }
 }
 
@@ -282,6 +274,68 @@ impl RelayInfo {
         Self {
             url,
             addr: Some(addr),
+        }
+    }
+
+    /// Create a `RelayInfo` identity from an inbound peer's socket address.
+    ///
+    /// Used when a relay accepts an internal connection and only knows the
+    /// peer by its transport-level source address — it trusts the incoming
+    /// socket address rather than asking the coordinator to resolve the
+    /// peer's canonical URL. The [`url`](Self::url) is a synthetic
+    /// `https://{addr}` identity; callers should treat [`addr`](Self::addr)
+    /// as the authoritative field and must not assume the URL is dialable.
+    pub fn from_socket_addr(addr: SocketAddr) -> Self {
+        // A `SocketAddr` always renders as a valid `host:port` authority
+        // (IPv6 is bracketed by its `Display`), so this parse is infallible.
+        let url = Url::parse(&format!("https://{addr}"))
+            .expect("socket address forms a valid https authority");
+        Self {
+            url,
+            addr: Some(addr),
+        }
+    }
+}
+
+/// Per-call context describing how a coordinator operation reached this relay.
+///
+/// Passed alongside `scope` to routing/registration methods so a coordinator
+/// can distinguish public client traffic from internal relay-to-relay traffic
+/// and, for the latter, know which peer relay it came from.
+///
+/// The relay's own URL (the "caller") is intentionally **not** part of this
+/// context: each coordinator instance is constructed knowing its own relay
+/// URL, so it does not need to be told on every call.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct CoordinatorContext {
+    /// Whether the originating session is public client-facing or internal
+    /// relay-to-relay. Defaults to [`SessionInterface::Public`].
+    pub interface: SessionInterface,
+
+    /// The peer relay this operation was received from, for internal
+    /// sessions. `None` for public client sessions.
+    ///
+    /// Derived by the relay from the inbound socket address (see
+    /// [`RelayInfo::from_socket_addr`]); the coordinator is not asked to
+    /// resolve peer identity.
+    pub source: Option<RelayInfo>,
+}
+
+impl CoordinatorContext {
+    /// A public, client-facing context with no peer relay.
+    pub fn public() -> Self {
+        Self {
+            interface: SessionInterface::Public,
+            source: None,
+        }
+    }
+
+    /// An internal, relay-to-relay context originating from `source`.
+    pub fn internal(source: Option<RelayInfo>) -> Self {
+        Self {
+            interface: SessionInterface::Internal,
+            source,
         }
     }
 }
@@ -448,6 +502,10 @@ pub trait Coordinator: Send + Sync {
     ///   registrations — the same namespace in different scopes may
     ///   route independently.
     /// * `namespace` - The namespace being registered
+    /// * `context` - Whether the registering session is a public client or an
+    ///   internal relay peer (and which peer). Coordinators may use this to
+    ///   avoid, for example, re-advertising registrations that arrived from
+    ///   another relay.
     ///
     /// # Returns
     ///
@@ -459,6 +517,7 @@ pub trait Coordinator: Send + Sync {
         &self,
         scope: Option<&str>,
         namespace: &TrackNamespace,
+        context: &CoordinatorContext,
     ) -> CoordinatorResult<NamespaceRegistration>;
 
     /// Unregister a namespace.
@@ -501,6 +560,27 @@ pub trait Coordinator: Send + Sync {
         scope: Option<&str>,
         namespace: &TrackNamespace,
     ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)>;
+
+    /// Lookup where a specific track is served from.
+    ///
+    /// Called when a subscriber requests a full track name. Implementations
+    /// should prefer exact track registrations created by PUBLISH, then fall
+    /// back to namespace routing created by PUBLISH_NAMESPACE. This keeps the
+    /// common caller ergonomic while still allowing a single PUBLISH track to be
+    /// routed without pretending the whole namespace was published.
+    ///
+    /// # Default Implementation
+    ///
+    /// Falls back to [`lookup`], so existing coordinators that only implement
+    /// namespace-level routing retain their current behavior.
+    async fn lookup_track(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+        _track: &str,
+    ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        self.lookup(scope, namespace).await
+    }
 
     /// Graceful shutdown of the coordinator.
     ///
@@ -546,27 +626,55 @@ pub trait Coordinator: Send + Sync {
     /// Called when a subscriber sends SUBSCRIBE_NAMESPACE. The coordinator
     /// should:
     /// 1. Record that this relay is interested in the prefix
-    /// 2. Return currently-matching namespaces
+    /// 2. Return the peer relays that host currently-matching namespaces (the
+    ///    upstream pull targets)
     /// 3. Return an RAII handle for cleanup on disconnect
     ///
-    /// When publishers later register namespaces matching this prefix, the
-    /// relay uses [`lookup_namespace_subscribers()`] to find interested relays
-    /// and forward PUBLISH_NAMESPACE to them.
+    /// The subscribing relay opens upstream SUBSCRIBE_NAMESPACE sessions to the
+    /// returned [`NamespaceSubscription::upstream_relays`] to receive live
+    /// NAMESPACE / NAMESPACE_DONE updates for namespaces that already exist
+    /// (the publish-before-subscribe case). Separately, when publishers *later*
+    /// register namespaces matching this prefix, the origin relay uses
+    /// [`lookup_namespace_subscribers()`] to find interested relays and push
+    /// PUBLISH_NAMESPACE to them (the subscribe-before-publish case).
+    ///
+    /// The subscribing relay applies **no** routing or topology policy of its
+    /// own and does not interpret the session interface: it simply opens an
+    /// upstream pull to each relay in `upstream_relays`, and an empty list means
+    /// "serve from local state only, do not connect upstream". All routing
+    /// policy therefore lives in the coordinator.
+    ///
+    /// To decide what to return, the coordinator MAY use the informational
+    /// [`CoordinatorContext`] — in particular the session
+    /// [`interface`][CoordinatorContext::interface] (public client vs. internal
+    /// relay peer) and the [`source`][CoordinatorContext::source] peer. For
+    /// example, the built-in implementations exclude both the caller (this
+    /// relay's own endpoint) and the source peer, so a relay is never told to
+    /// pull from itself or from the peer the SUBSCRIBE_NAMESPACE just arrived
+    /// from; and they return an empty list for internal sessions, so a pull
+    /// opened on another relay's behalf does not itself fan out upstream (which
+    /// would otherwise make relays recurse — and, in a mesh, cycle). Those are
+    /// policy choices of the built-in implementations, not requirements of this
+    /// trait. Interest is still recorded for the push path regardless of
+    /// interface.
     ///
     /// # Arguments
     ///
     /// * `scope` - The resolved scope identity, or `None` for unscoped sessions.
     /// * `prefix` - The namespace prefix to subscribe to.
+    /// * `context` - Whether the subscribing session is a public client or an
+    ///   internal relay peer (and which peer).
     ///
     /// # Default Implementation
     ///
-    /// Returns an empty subscription (no existing namespaces, no-op cleanup).
+    /// Returns an empty subscription (no upstream relays, no-op cleanup).
     ///
     /// [`lookup_namespace_subscribers()`]: Coordinator::lookup_namespace_subscribers
     async fn subscribe_namespace(
         &self,
         _scope: Option<&str>,
-        _prefix: &TrackNamespace,
+        _prefix: &TrackNamespacePrefix,
+        _context: &CoordinatorContext,
     ) -> CoordinatorResult<NamespaceSubscription> {
         Ok(NamespaceSubscription::default())
     }
@@ -588,7 +696,7 @@ pub trait Coordinator: Send + Sync {
     async fn unsubscribe_namespace(
         &self,
         _scope: Option<&str>,
-        _prefix: &TrackNamespace,
+        _prefix: &TrackNamespacePrefix,
     ) -> CoordinatorResult<()> {
         Ok(())
     }
@@ -603,10 +711,18 @@ pub trait Coordinator: Send + Sync {
     ///
     /// * `scope` - The resolved scope identity, or `None` for unscoped sessions.
     /// * `namespace` - The newly-registered namespace.
+    /// * `context` - Origin of the PUBLISH_NAMESPACE that triggered this lookup.
+    ///   Implementations MUST use this (together with their own relay identity)
+    ///   to exclude relays that would create forwarding loops:
+    ///   - the **caller** (this relay's own endpoint), so a relay never forwards
+    ///     PUBLISH_NAMESPACE to itself; and
+    ///   - the **source** ([`CoordinatorContext::source`]), so a PUBLISH_NAMESPACE
+    ///     is never echoed back to the peer relay it just arrived from.
     ///
     /// # Returns
     ///
-    /// List of relay endpoints to forward PUBLISH_NAMESPACE to.
+    /// List of peer relay endpoints to forward PUBLISH_NAMESPACE to, with the
+    /// caller and source excluded.
     ///
     /// # Default Implementation
     ///
@@ -615,6 +731,7 @@ pub trait Coordinator: Send + Sync {
         &self,
         _scope: Option<&str>,
         _namespace: &TrackNamespace,
+        _context: &CoordinatorContext,
     ) -> CoordinatorResult<Vec<RelayInfo>> {
         Ok(vec![])
     }
@@ -812,8 +929,16 @@ mod tests {
         TrackNamespace::from_utf8_path(path)
     }
 
+    fn prefix(path: &str) -> TrackNamespacePrefix {
+        TrackNamespacePrefix::from_utf8_path(path)
+    }
+
     /// Returns true if `namespace` starts with all the fields in `prefix`.
-    fn ns_has_prefix(namespace: &TrackNamespace, prefix: &TrackNamespace) -> bool {
+    fn ns_has_prefix(namespace: &TrackNamespace, prefix: &TrackNamespacePrefix) -> bool {
+        prefix.is_prefix_of(namespace)
+    }
+
+    fn ns_has_namespace_prefix(namespace: &TrackNamespace, prefix: &TrackNamespace) -> bool {
         namespace.fields.len() >= prefix.fields.len()
             && prefix
                 .fields
@@ -860,7 +985,7 @@ mod tests {
         tracks: HashMap<String, HashMap<(TrackNamespace, String), String>>,
 
         /// Maps scope → SUBSCRIBE_NAMESPACE prefixes → list of relay URLs
-        namespace_subscribers: HashMap<String, HashMap<TrackNamespace, Vec<String>>>,
+        namespace_subscribers: HashMap<String, HashMap<TrackNamespacePrefix, Vec<String>>>,
 
         /// Maps scope → subscribed tracks → list of relay URLs
         /// Key: (namespace, track_name)
@@ -919,7 +1044,7 @@ mod tests {
     struct MockNamespaceSubHandle {
         state: std::sync::Arc<Mutex<MockState>>,
         scope_key: String,
-        prefix: TrackNamespace,
+        prefix: TrackNamespacePrefix,
         relay_url: String,
     }
 
@@ -979,6 +1104,19 @@ mod tests {
             }
         }
 
+        /// Create another relay's view of the *same* shared oracle state.
+        ///
+        /// The returned coordinator shares this instance's registry but reports
+        /// a different `relay_url`, modelling a distinct relay talking to the
+        /// same coordinator (as separate relay processes do with a shared
+        /// [`FileCoordinator`] file).
+        fn peer(&self, relay_url: &str) -> Self {
+            Self {
+                state: self.state.clone(),
+                relay_url: Url::parse(relay_url).unwrap(),
+            }
+        }
+
         /// Configure scope resolution: connection path → ScopeInfo.
         fn add_path_mapping(&self, path: &str, scope_id: &str, permissions: ScopePermissions) {
             let mut state = self.state.lock().unwrap();
@@ -1025,6 +1163,7 @@ mod tests {
             &self,
             scope: Option<&str>,
             namespace: &TrackNamespace,
+            _context: &CoordinatorContext,
         ) -> CoordinatorResult<NamespaceRegistration> {
             let scope_key = MockState::scope_key(scope);
             let relay_url = self.relay_url.to_string();
@@ -1081,7 +1220,7 @@ mod tests {
             // Prefix match (longest wins)
             let mut best: Option<(&TrackNamespace, &String)> = None;
             for (registered, url) in bucket {
-                if ns_has_prefix(namespace, registered) {
+                if ns_has_namespace_prefix(namespace, registered) {
                     match &best {
                         Some((prev, _)) if registered.fields.len() > prev.fields.len() => {
                             best = Some((registered, url));
@@ -1103,6 +1242,30 @@ mod tests {
             }
         }
 
+        async fn lookup_track(
+            &self,
+            scope: Option<&str>,
+            namespace: &TrackNamespace,
+            track: &str,
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+            let scope_key = MockState::scope_key(scope);
+            let track_key = MockState::track_key(namespace, track);
+
+            {
+                let state = self.state.lock().unwrap();
+                if let Some(relay_url) = state
+                    .tracks
+                    .get(&scope_key)
+                    .and_then(|bucket| bucket.get(&track_key))
+                {
+                    let url = Url::parse(relay_url).unwrap();
+                    return Ok((NamespaceOrigin::new(namespace.clone(), url, None), None));
+                }
+            }
+
+            self.lookup(scope, namespace).await
+        }
+
         async fn get_scope_config(&self, scope: Option<&str>) -> CoordinatorResult<ScopeConfig> {
             let state = self.state.lock().unwrap();
             let scope_key = MockState::scope_key(scope);
@@ -1116,25 +1279,44 @@ mod tests {
         async fn subscribe_namespace(
             &self,
             scope: Option<&str>,
-            prefix: &TrackNamespace,
+            prefix: &TrackNamespacePrefix,
+            context: &CoordinatorContext,
         ) -> CoordinatorResult<NamespaceSubscription> {
             let scope_key = MockState::scope_key(scope);
             let relay_url = self.relay_url.to_string();
 
+            // Exclude the caller (this relay) and the inbound source peer so we
+            // never return ourselves or the relay the SUBSCRIBE_NAMESPACE
+            // arrived from as an upstream to pull from.
+            let caller = relay_url.clone();
+            let source = context.source.as_ref().map(|relay| relay.url.to_string());
+
             let mut state = self.state.lock().unwrap();
 
-            // Find currently-registered namespaces that match the prefix
-            let existing: Vec<NamespaceInfo> = state
-                .namespaces
-                .get(&scope_key)
-                .map(|bucket| {
-                    bucket
-                        .keys()
-                        .filter(|ns| ns_has_prefix(ns, prefix))
-                        .map(|ns| NamespaceInfo::new(ns.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Find the distinct relays hosting namespaces that match the prefix
+            // (the upstream pull targets), excluding the caller and source. Only
+            // public sessions fan out: an internal (relay-to-relay) pull must
+            // not recurse, so it is served from local state alone (empty
+            // upstream_relays breaks the loop). Interest is still recorded below
+            // for the push path regardless of interface.
+            let mut upstream_relays = Vec::new();
+            if context.interface == SessionInterface::Public {
+                let mut seen_relays = std::collections::HashSet::new();
+                if let Some(bucket) = state.namespaces.get(&scope_key) {
+                    for (ns, hosting_relay) in bucket {
+                        if !ns_has_prefix(ns, prefix) {
+                            continue;
+                        }
+                        if hosting_relay == &caller || Some(hosting_relay) == source.as_ref() {
+                            continue;
+                        }
+                        if seen_relays.insert(hosting_relay.clone()) {
+                            upstream_relays
+                                .push(RelayInfo::new(Url::parse(hosting_relay).unwrap()));
+                        }
+                    }
+                }
+            }
 
             // Register this relay as interested in the prefix
             state
@@ -1152,13 +1334,13 @@ mod tests {
                 relay_url,
             };
 
-            Ok(NamespaceSubscription::new(existing, handle))
+            Ok(NamespaceSubscription::new(upstream_relays, handle))
         }
 
         async fn unsubscribe_namespace(
             &self,
             scope: Option<&str>,
-            prefix: &TrackNamespace,
+            prefix: &TrackNamespacePrefix,
         ) -> CoordinatorResult<()> {
             let scope_key = MockState::scope_key(scope);
             let relay_url = self.relay_url.to_string();
@@ -1175,15 +1357,29 @@ mod tests {
             &self,
             scope: Option<&str>,
             namespace: &TrackNamespace,
+            context: &CoordinatorContext,
         ) -> CoordinatorResult<Vec<RelayInfo>> {
             let scope_key = MockState::scope_key(scope);
             let state = self.state.lock().unwrap();
 
+            // Exclude the caller (this relay) and the inbound source peer so a
+            // forwarded PUBLISH_NAMESPACE is never sent to ourselves or echoed
+            // back to the relay it just arrived from.
+            let caller = self.relay_url.to_string();
+            let source = context.source.as_ref().map(|relay| relay.url.to_string());
+
+            let mut seen = std::collections::HashSet::new();
             let mut relays = Vec::new();
             if let Some(subs) = state.namespace_subscribers.get(&scope_key) {
                 for (prefix, relay_urls) in subs {
-                    if ns_has_prefix(namespace, prefix) {
-                        for url_str in relay_urls {
+                    if !ns_has_prefix(namespace, prefix) {
+                        continue;
+                    }
+                    for url_str in relay_urls {
+                        if url_str == &caller || Some(url_str) == source.as_ref() {
+                            continue;
+                        }
+                        if seen.insert(url_str.clone()) {
                             relays.push(RelayInfo::new(Url::parse(url_str).unwrap()));
                         }
                     }
@@ -1359,12 +1555,6 @@ mod tests {
     }
 
     #[test]
-    fn namespace_info_construction() {
-        let info = NamespaceInfo::new(ns("sports/football/match-42"));
-        assert_eq!(info.namespace.to_utf8_path(), "/sports/football/match-42");
-    }
-
-    #[test]
     fn relay_info_without_addr() {
         let info = RelayInfo::new(Url::parse("https://relay-us-east.example.com").unwrap());
         assert_eq!(info.url.as_str(), "https://relay-us-east.example.com/");
@@ -1392,7 +1582,7 @@ mod tests {
     #[test]
     fn namespace_subscription_default_is_empty() {
         let sub = NamespaceSubscription::default();
-        assert!(sub.existing_namespaces.is_empty());
+        assert!(sub.upstream_relays.is_empty());
     }
 
     #[test]
@@ -1502,6 +1692,41 @@ mod tests {
     }
 
     // ========================================================================
+    // RelayInfo / CoordinatorContext
+    // ========================================================================
+
+    #[test]
+    fn relay_info_from_socket_addr_synthesizes_https_identity() {
+        let v4: SocketAddr = "203.0.113.7:4443".parse().unwrap();
+        let info = RelayInfo::from_socket_addr(v4);
+        assert_eq!(info.addr, Some(v4));
+        assert_eq!(info.url.as_str(), "https://203.0.113.7:4443/");
+
+        // IPv6 authorities are bracketed by SocketAddr's Display.
+        let v6: SocketAddr = "[2001:db8::1]:4443".parse().unwrap();
+        let info6 = RelayInfo::from_socket_addr(v6);
+        assert_eq!(info6.addr, Some(v6));
+        assert_eq!(info6.url.as_str(), "https://[2001:db8::1]:4443/");
+    }
+
+    #[test]
+    fn coordinator_context_constructors() {
+        let public = CoordinatorContext::public();
+        assert_eq!(public.interface, SessionInterface::Public);
+        assert!(public.source.is_none());
+
+        let addr: SocketAddr = "10.0.0.7:4443".parse().unwrap();
+        let internal = CoordinatorContext::internal(Some(RelayInfo::from_socket_addr(addr)));
+        assert_eq!(internal.interface, SessionInterface::Internal);
+        assert_eq!(internal.source.unwrap().addr, Some(addr));
+
+        // Default is public with no source.
+        let default = CoordinatorContext::default();
+        assert_eq!(default.interface, SessionInterface::Public);
+        assert!(default.source.is_none());
+    }
+
+    // ========================================================================
     // Namespace registration and lookup
     // ========================================================================
 
@@ -1512,7 +1737,11 @@ mod tests {
         let scope = Some("content-provider-123");
 
         let _reg = coord
-            .register_namespace(scope, &ns("sports/football/match-42"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -1532,7 +1761,11 @@ mod tests {
         let scope = Some("content-provider-123");
 
         let _reg = coord
-            .register_namespace(scope, &ns("sports/football/match-42"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -1560,7 +1793,11 @@ mod tests {
         let coord = MockCoordinator::new("https://relay-1.example.com");
 
         let _reg = coord
-            .register_namespace(Some("provider-abc"), &ns("live/main"))
+            .register_namespace(
+                Some("provider-abc"),
+                &ns("live/main"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -1582,12 +1819,20 @@ mod tests {
         let scope = Some("content-provider-123");
 
         let _reg = coord
-            .register_namespace(scope, &ns("sports/football/match-42"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
         let result = coord
-            .register_namespace(scope, &ns("sports/football/match-42"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await;
         assert!(matches!(
             result,
@@ -1602,7 +1847,11 @@ mod tests {
 
         {
             let _reg = coord
-                .register_namespace(scope, &ns("sports/football/match-42"))
+                .register_namespace(
+                    scope,
+                    &ns("sports/football/match-42"),
+                    &CoordinatorContext::public(),
+                )
                 .await
                 .unwrap();
 
@@ -1623,43 +1872,177 @@ mod tests {
     // ========================================================================
 
     #[tokio::test]
-    async fn subscribe_namespace_returns_existing_matches() {
-        // An edge relay subscribes to all broadcasts from a content provider's
-        // "sports/football" prefix. Two matches are already live; a third
-        // match under "sports/tennis" should NOT match.
-        let coord = MockCoordinator::new("https://relay-1.example.com");
+    async fn subscribe_namespace_returns_hosting_relays_for_matching_prefix() {
+        // Two football matches are live on origin-a; an unrelated tennis match
+        // is live on origin-b. An edge relay subscribes to the "sports/football"
+        // prefix and must be told to pull from origin-a only — deduped across
+        // both football matches, and never origin-b, whose namespace does not
+        // match the prefix.
+        let origin_a = MockCoordinator::new("https://origin-a.example.com");
+        let origin_b = origin_a.peer("https://origin-b.example.com");
+        let edge = origin_a.peer("https://edge.example.com");
         let scope = Some("content-provider-123");
 
-        // Two football matches already live
-        let _reg_match42 = coord
-            .register_namespace(scope, &ns("sports/football/match-42"))
+        // Two football matches, both hosted by origin-a.
+        let _reg_match42 = origin_a
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
-        let _reg_match43 = coord
-            .register_namespace(scope, &ns("sports/football/match-43"))
-            .await
-            .unwrap();
-
-        // A tennis match (should NOT match the football prefix)
-        let _reg_tennis = coord
-            .register_namespace(scope, &ns("sports/tennis/open-7"))
-            .await
-            .unwrap();
-
-        // Subscribe to the football prefix
-        let sub = coord
-            .subscribe_namespace(scope, &ns("sports/football"))
+        let _reg_match43 = origin_a
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-43"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
-        assert_eq!(sub.existing_namespaces.len(), 2);
-        let paths: Vec<String> = sub
-            .existing_namespaces
+        // A tennis match on a different origin (should NOT match the football
+        // prefix, so origin-b must not appear as an upstream).
+        let _reg_tennis = origin_b
+            .register_namespace(
+                scope,
+                &ns("sports/tennis/open-7"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .unwrap();
+
+        // Subscribe to the football prefix from a third relay.
+        let sub = edge
+            .subscribe_namespace(
+                scope,
+                &prefix("sports/football"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .unwrap();
+
+        let urls: Vec<&str> = sub
+            .upstream_relays
             .iter()
-            .map(|n| n.namespace.to_utf8_path())
+            .map(|relay| relay.url.as_str())
             .collect();
-        assert!(paths.contains(&"/sports/football/match-42".to_string()));
-        assert!(paths.contains(&"/sports/football/match-43".to_string()));
+        assert_eq!(urls, vec!["https://origin-a.example.com/"]);
+    }
+
+    #[tokio::test]
+    async fn subscribe_namespace_empty_prefix_matches_all_namespaces() {
+        // An empty prefix matches every namespace, so the subscriber must be
+        // told to pull from every distinct hosting relay.
+        let origin_a = MockCoordinator::new("https://origin-a.example.com");
+        let origin_b = origin_a.peer("https://origin-b.example.com");
+        let edge = origin_a.peer("https://edge-us-west.example.com");
+        let scope = Some("content-provider-123");
+
+        let _football = origin_a
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .unwrap();
+        let _tennis = origin_b
+            .register_namespace(
+                scope,
+                &ns("sports/tennis/open-7"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .unwrap();
+
+        let sub = edge
+            .subscribe_namespace(
+                scope,
+                &TrackNamespacePrefix::new(),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .unwrap();
+
+        let mut urls: Vec<String> = sub
+            .upstream_relays
+            .iter()
+            .map(|relay| relay.url.to_string())
+            .collect();
+        urls.sort();
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://origin-a.example.com/".to_string(),
+                "https://origin-b.example.com/".to_string(),
+            ]
+        );
+
+        // The edge's interest also persists for the reverse (push) direction:
+        // origin-a's lookup finds the edge subscriber.
+        let interested = origin_a
+            .lookup_namespace_subscribers(
+                scope,
+                &ns("sports/football/match-44"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(interested.len(), 1);
+        assert_eq!(
+            interested[0].url.as_str(),
+            "https://edge-us-west.example.com/"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_subscribe_namespace_returns_no_upstream_relays() {
+        // A pull opened on another relay's behalf arrives as an internal
+        // session. Even though a peer hosts a matching namespace, the
+        // coordinator returns no upstream relays, so the pull is served from
+        // local state and does not recurse -- this is the loop-breaker. The
+        // source peer is deliberately a *third* relay that does not host the
+        // namespace, so only the interface (not caller/source exclusion) can
+        // explain the empty result.
+        let origin = MockCoordinator::new("https://origin.example.com");
+        let edge = origin.peer("https://edge.example.com");
+        let scope = Some("content-provider-123");
+
+        let _registration = origin
+            .register_namespace(scope, &ns("room/alice"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+
+        // A public subscribe from the edge is told to pull from the origin...
+        let public_sub = edge
+            .subscribe_namespace(scope, &prefix("room"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+        assert_eq!(
+            public_sub.upstream_relays.len(),
+            1,
+            "public sessions fan out to hosting relays"
+        );
+
+        // ...but an internal subscribe (a relay pulling on another's behalf) is
+        // given nothing to pull, so it serves from local state only.
+        let internal_sub = edge
+            .subscribe_namespace(
+                scope,
+                &prefix("room"),
+                &CoordinatorContext::internal(Some(RelayInfo::new(
+                    Url::parse("https://other.example.com").unwrap(),
+                ))),
+            )
+            .await
+            .unwrap();
+        assert!(
+            internal_sub.upstream_relays.is_empty(),
+            "internal sessions are served from local state, breaking the pull loop"
+        );
     }
 
     #[tokio::test]
@@ -1673,13 +2056,24 @@ mod tests {
 
         // Edge relay subscribes to the football prefix
         let _sub = coord
-            .subscribe_namespace(scope, &ns("sports/football"))
+            .subscribe_namespace(
+                scope,
+                &prefix("sports/football"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
-        // New match starts — who needs to know?
-        let interested = coord
-            .lookup_namespace_subscribers(scope, &ns("sports/football/match-44"))
+        // New match starts — the origin relay (a different relay than the
+        // subscribing edge) asks the oracle who needs to know. The edge
+        // subscriber is returned; the origin itself (the caller) is excluded.
+        let origin = coord.peer("https://origin.example.com");
+        let interested = origin
+            .lookup_namespace_subscribers(
+                scope,
+                &ns("sports/football/match-44"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -1691,29 +2085,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lookup_namespace_subscribers_excludes_caller() {
+        // A relay that subscribed and is now performing the lookup must not be
+        // returned to itself; otherwise it would forward PUBLISH_NAMESPACE to
+        // its own endpoint and loop forever.
+        let coord = MockCoordinator::new("https://edge-us-west.example.com");
+        let scope = Some("content-provider-123");
+
+        let _sub = coord
+            .subscribe_namespace(
+                scope,
+                &prefix("sports/football"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .unwrap();
+
+        let interested = coord
+            .lookup_namespace_subscribers(
+                scope,
+                &ns("sports/football/match-44"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            interested.is_empty(),
+            "caller relay must be excluded from its own lookup results"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_namespace_subscribers_excludes_source() {
+        // A PUBLISH_NAMESPACE that arrived from a peer relay must not be echoed
+        // back to that same peer.
+        let origin = MockCoordinator::new("https://origin.example.com");
+        let edge = origin.peer("https://edge-us-west.example.com");
+        let scope = Some("content-provider-123");
+
+        // The edge relay is the only subscriber.
+        let _sub = edge
+            .subscribe_namespace(
+                scope,
+                &prefix("sports/football"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .unwrap();
+
+        // With no source, the origin sees the edge subscriber.
+        let interested = origin
+            .lookup_namespace_subscribers(
+                scope,
+                &ns("sports/football/match-44"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(interested.len(), 1);
+
+        // When the PUBLISH_NAMESPACE arrived *from* the edge relay, it must not
+        // be echoed back to it.
+        let from_edge = CoordinatorContext::internal(Some(RelayInfo::new(
+            Url::parse("https://edge-us-west.example.com").unwrap(),
+        )));
+        let interested = origin
+            .lookup_namespace_subscribers(scope, &ns("sports/football/match-44"), &from_edge)
+            .await
+            .unwrap();
+        assert!(
+            interested.is_empty(),
+            "source relay must be excluded to avoid echoing PUBLISH_NAMESPACE back"
+        );
+    }
+
+    #[tokio::test]
     async fn namespace_subscription_cleaned_up_on_drop() {
         let coord = MockCoordinator::new("https://edge-us-west.example.com");
         let scope = Some("content-provider-123");
 
+        // The origin relay (distinct from the subscribing edge) performs the
+        // lookups, so the edge subscriber is visible until it disconnects.
+        let origin = coord.peer("https://origin.example.com");
         {
             let _sub = coord
-                .subscribe_namespace(scope, &ns("sports/football"))
+                .subscribe_namespace(
+                    scope,
+                    &prefix("sports/football"),
+                    &CoordinatorContext::public(),
+                )
                 .await
                 .unwrap();
 
-            let interested = coord
-                .lookup_namespace_subscribers(scope, &ns("sports/football/match-44"))
+            let interested = origin
+                .lookup_namespace_subscribers(
+                    scope,
+                    &ns("sports/football/match-44"),
+                    &CoordinatorContext::public(),
+                )
                 .await
                 .unwrap();
             assert_eq!(interested.len(), 1);
         }
         // _sub dropped — edge relay disconnected
 
-        let interested = coord
-            .lookup_namespace_subscribers(scope, &ns("sports/football/match-44"))
+        let interested = origin
+            .lookup_namespace_subscribers(
+                scope,
+                &ns("sports/football/match-44"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
         assert!(interested.is_empty());
+    }
+
+    // ========================================================================
+    // Cross-relay SUBSCRIBE_NAMESPACE choreography (two relays, one oracle)
+    //
+    // These integration-style tests play out the full two-relay handshake the
+    // relay performs across a shared coordinator oracle, in both orderings.
+    // Each step is annotated with the production call site that drives it, so
+    // the tests pin the oracle contract that `Consumer::serve` (consumer.rs) and
+    // `Producer::serve_subscribe_namespace` (producer.rs) rely on: which peer
+    // relay a subscriber pulls from (publish-before-subscribe) and which peer
+    // relays an origin pushes PUBLISH_NAMESPACE to (subscribe-before-publish).
+    //
+    // A live two-relay MoQT session is intentionally out of scope: there is no
+    // in-memory session harness, so `Consumer`/`Producer` cannot be built
+    // without standing up real QUIC endpoints. We validate the coordination
+    // decisions here; the transport plumbing is covered elsewhere.
+    // ========================================================================
+
+    #[tokio::test]
+    async fn two_relay_subscribe_before_publish_routes_publish_namespace() {
+        // Ordering: edge subscribes first, publisher arrives at the origin
+        // later. The origin's reverse lookup must discover the waiting edge so
+        // it pushes PUBLISH_NAMESPACE to it (the publish-after-subscribe path).
+        let origin = MockCoordinator::new("https://origin.example.com");
+        let edge = origin.peer("https://edge.example.com");
+        let scope = Some("content-provider-123");
+
+        // Edge relay: a client sent SUBSCRIBE_NAMESPACE, so the edge records its
+        // interest with the oracle. Maps to Producer::serve_subscribe_namespace
+        // -> coordinator.subscribe_namespace. Nothing is published yet, so there
+        // is no upstream relay to pull from.
+        let sub = edge
+            .subscribe_namespace(scope, &prefix("room"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+        assert!(
+            sub.upstream_relays.is_empty(),
+            "no namespaces exist yet, so there is no upstream relay to pull from"
+        );
+
+        // Origin relay: a publisher sent PUBLISH_NAMESPACE, registering the
+        // namespace. Maps to Consumer::serve -> coordinator.register_namespace.
+        let _registration = origin
+            .register_namespace(scope, &ns("room/alice"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+
+        // Origin relay: still inside Consumer::serve, it asks the oracle who is
+        // interested (coordinator.lookup_namespace_subscribers). The waiting edge
+        // must be returned and the origin (the caller) excluded, so the origin
+        // pushes exactly one PUBLISH_NAMESPACE — to the edge.
+        let interested = origin
+            .lookup_namespace_subscribers(scope, &ns("room/alice"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+        assert_eq!(interested.len(), 1);
+        assert_eq!(interested[0].url.as_str(), "https://edge.example.com/");
+    }
+
+    #[tokio::test]
+    async fn two_relay_publish_before_subscribe_returns_upstream_relay() {
+        // Ordering: the publisher is already live at the origin before any
+        // subscriber. This pins two independent oracle guarantees: the
+        // coordinator returns the origin as an upstream relay for the new
+        // subscriber to pull from, and the subscriber's interest persists so
+        // later namespaces still route to it via the reverse (push) lookup.
+        let origin = MockCoordinator::new("https://origin.example.com");
+        let edge = origin.peer("https://edge.example.com");
+        let scope = Some("content-provider-123");
+
+        // Origin relay: publisher registers the namespace first. Maps to
+        // Consumer::serve -> coordinator.register_namespace.
+        let _registration = origin
+            .register_namespace(scope, &ns("room/alice"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+
+        // Edge relay: a client subscribes to the prefix afterwards. Maps to
+        // Producer::serve_subscribe_namespace -> coordinator.subscribe_namespace.
+        // The oracle reports the origin as the upstream relay to open an upstream
+        // SUBSCRIBE_NAMESPACE session to (the pull path that carries the
+        // already-published namespace, plus live updates, downstream).
+        let sub = edge
+            .subscribe_namespace(scope, &prefix("room"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+        let urls: Vec<&str> = sub
+            .upstream_relays
+            .iter()
+            .map(|relay| relay.url.as_str())
+            .collect();
+        assert_eq!(urls, vec!["https://origin.example.com/"]);
+
+        // The edge's interest also persists for the reverse (push) direction: a
+        // *different* namespace published later under the same prefix must still
+        // discover the edge. Maps to Consumer::serve ->
+        // coordinator.lookup_namespace_subscribers.
+        let interested = origin
+            .lookup_namespace_subscribers(
+                scope,
+                &ns("room/beatrice"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(interested.len(), 1);
+        assert_eq!(interested[0].url.as_str(), "https://edge.example.com/");
     }
 
     // ========================================================================
@@ -1748,6 +2341,47 @@ mod tests {
         assert!(names.contains(&"video-1080p"));
         assert!(names.contains(&"video-480p"));
         assert!(names.contains(&"audio-en"));
+    }
+
+    #[tokio::test]
+    async fn lookup_track_finds_exact_registered_track() {
+        let coord = MockCoordinator::new("https://relay-1.example.com");
+        let scope = Some("content-provider-123");
+        let match_ns = ns("sports/football/match-42");
+
+        let _reg = coord
+            .register_track(scope, &match_ns, "video-1080p")
+            .await
+            .unwrap();
+
+        let (origin, client) = coord
+            .lookup_track(scope, &match_ns, "video-1080p")
+            .await
+            .unwrap();
+
+        assert_eq!(origin.namespace(), &match_ns);
+        assert_eq!(origin.url().as_str(), "https://relay-1.example.com/");
+        assert!(client.is_none());
+    }
+
+    #[tokio::test]
+    async fn lookup_track_falls_back_to_namespace_registration() {
+        let coord = MockCoordinator::new("https://relay-1.example.com");
+        let scope = Some("content-provider-123");
+        let match_ns = ns("sports/football/match-42");
+
+        let _namespace = coord
+            .register_namespace(scope, &match_ns, &CoordinatorContext::public())
+            .await
+            .unwrap();
+
+        let (origin, client) = coord
+            .lookup_track(scope, &match_ns, "video-1080p")
+            .await
+            .unwrap();
+        assert_eq!(origin.namespace(), &match_ns);
+        assert_eq!(origin.url().as_str(), "https://relay-1.example.com/");
+        assert!(client.is_none());
     }
 
     #[tokio::test]
@@ -1859,7 +2493,11 @@ mod tests {
 
         // Register the match namespace
         let _match_reg = origin
-            .register_namespace(scope, &ns("sports/football/match-42"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -1881,7 +2519,11 @@ mod tests {
 
         // Edge subscribes to all football events (SUBSCRIBE_NAMESPACE)
         let _football_sub = edge
-            .subscribe_namespace(scope, &ns("sports/football"))
+            .subscribe_namespace(
+                scope,
+                &prefix("sports/football"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -1939,6 +2581,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             _namespace: &TrackNamespace,
+            _context: &CoordinatorContext,
         ) -> CoordinatorResult<NamespaceRegistration> {
             Ok(NamespaceRegistration::new(()))
         }
@@ -1992,17 +2635,25 @@ mod tests {
     async fn default_subscribe_namespace_returns_empty() {
         let coord = MinimalCoordinator;
         let sub = coord
-            .subscribe_namespace(Some("scope"), &ns("sports/football"))
+            .subscribe_namespace(
+                Some("scope"),
+                &prefix("sports/football"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
-        assert!(sub.existing_namespaces.is_empty());
+        assert!(sub.upstream_relays.is_empty());
     }
 
     #[tokio::test]
     async fn default_lookup_namespace_subscribers_returns_empty() {
         let coord = MinimalCoordinator;
         let relays = coord
-            .lookup_namespace_subscribers(Some("scope"), &ns("sports/football/match-42"))
+            .lookup_namespace_subscribers(
+                Some("scope"),
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
         assert!(relays.is_empty());

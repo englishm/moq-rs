@@ -4,12 +4,16 @@
 
 use anyhow::{self, Context};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use moq_transport::serve::{SubgroupWriter, SubgroupsWriter, TrackWriter, TracksWriter};
+use moq_transport::{
+    coding::TrackName,
+    serve::{SubgroupWriter, SubgroupsWriter, TrackWriter, TracksWriter},
+};
 use mp4::{self, ReadBox, TrackType};
 use std::cmp::max;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::time;
+use tokio::sync::mpsc;
 
 pub struct Media {
     // Tracks based on their track ID.
@@ -28,10 +32,16 @@ pub struct Media {
 
     // The current track name
     current: Option<u32>,
+
+    // Optional notification for tracks as they become available.
+    track_tx: Option<mpsc::UnboundedSender<TrackName>>,
 }
 
 impl Media {
-    pub fn new(mut broadcast: TracksWriter) -> anyhow::Result<Self> {
+    pub fn new(
+        mut broadcast: TracksWriter,
+        track_tx: Option<mpsc::UnboundedSender<TrackName>>,
+    ) -> anyhow::Result<Self> {
         let catalog = broadcast
             .create(".catalog")
             .context("broadcast closed")?
@@ -41,6 +51,11 @@ impl Media {
             .context("broadcast closed")?
             .subgroups()?;
 
+        if let Some(tx) = &track_tx {
+            let _ = tx.send(TrackName::from(".catalog"));
+            let _ = tx.send(TrackName::from("0.mp4"));
+        }
+
         Ok(Media {
             tracks: Default::default(),
             broadcast,
@@ -49,6 +64,7 @@ impl Media {
             ftyp: None,
             moov: None,
             current: None,
+            track_tx,
         })
     }
 
@@ -251,6 +267,9 @@ impl Media {
 
             // Store the track publisher in a map so we can update it later.
             let track = self.broadcast.create(&name).context("broadcast closed")?;
+            if let Some(tx) = &self.track_tx {
+                let _ = tx.send(TrackName::from(name.clone()));
+            }
             let track = Track::new(track, handler, timescale);
             self.tracks.insert(id, track);
         }

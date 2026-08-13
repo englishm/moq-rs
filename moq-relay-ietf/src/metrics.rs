@@ -29,7 +29,12 @@
 //! | `moq_relay_subscribers_total` | - | Total subscribers (SUBSCRIBE requests) received |
 //! | `moq_relay_subscribe_not_found_total` | - | Track not found after checking all sources |
 //! | `moq_relay_subscribe_route_errors_total` | - | Infrastructure failure when routing to remote |
+//! | `moq_relay_subscribe_upstream_errors_total` | - | Upstream subscription could not be established, so the downstream SUBSCRIBE was rejected |
 //! | `moq_relay_upstream_errors_total` | `stage` | Upstream connection failures (stage: connect, session) |
+//! | `moq_relay_namespace_transition_timeouts_total` | - | Namespace pull streams reset after graceful transition timeout |
+//! | `moq_relay_cache_idle_evictions_total` | `source` | Unwatched cache entries evicted, releasing an upstream subscription (source: local, remote) |
+//! | `moq_relay_change_channel_lagged_total` | `channel` | Change notifications skipped by a lagging receiver, forcing a resync (channel: namespace, track) |
+//! | `moq_relay_lease_registry_lock_poisoned_total` | `operation` | Upstream namespace lease registry lock found poisoned (operation: acquire, release) |
 //!
 //! ## Gauges
 //!
@@ -46,7 +51,7 @@
 //!
 //! | Name | Labels | Description |
 //! |------|--------|-------------|
-//! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, route_error) |
+//! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, route_error, upstream_error, downstream_left) |
 
 use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
 
@@ -77,6 +82,14 @@ pub fn describe_metrics() {
         "Total publishers (PUBLISH_NAMESPACE requests) received"
     );
     describe_counter!(
+        "moq_relay_published_tracks_total",
+        "Total publisher-initiated PUBLISH track requests received"
+    );
+    describe_counter!(
+        "moq_relay_publish_errors_total",
+        "Publisher-initiated PUBLISH failures by phase (take_reader, local_register, coordinator_register, send_ok)"
+    );
+    describe_counter!(
         "moq_relay_announce_ok_total",
         "Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE"
     );
@@ -97,8 +110,28 @@ pub fn describe_metrics() {
         "Infrastructure failure when routing to remote"
     );
     describe_counter!(
+        "moq_relay_subscribe_upstream_errors_total",
+        "Upstream subscription could not be established, so the downstream SUBSCRIBE was rejected"
+    );
+    describe_counter!(
         "moq_relay_upstream_errors_total",
         "Upstream connection failures by stage (connect, session)"
+    );
+    describe_counter!(
+        "moq_relay_namespace_transition_timeouts_total",
+        "Namespace pull streams reset after graceful transition timeout"
+    );
+    describe_counter!(
+        "moq_relay_cache_idle_evictions_total",
+        "Unwatched cache entries evicted, releasing an upstream subscription, by source (local, remote)"
+    );
+    describe_counter!(
+        "moq_relay_change_channel_lagged_total",
+        "Change notifications skipped by a lagging receiver, forcing a resync, by channel (namespace, track)"
+    );
+    describe_counter!(
+        "moq_relay_lease_registry_lock_poisoned_total",
+        "Upstream namespace lease registry lock found poisoned by operation (acquire, release)"
     );
 
     // Gauges
@@ -119,6 +152,10 @@ pub fn describe_metrics() {
         "Current number of tracks being served"
     );
     describe_gauge!(
+        "moq_relay_active_published_tracks",
+        "Current number of exact tracks registered from PUBLISH"
+    );
+    describe_gauge!(
         "moq_relay_announced_namespaces",
         "Current number of registered namespaces"
     );
@@ -131,7 +168,7 @@ pub fn describe_metrics() {
     describe_histogram!(
         "moq_relay_subscribe_latency_seconds",
         Unit::Seconds,
-        "Time to resolve subscription by source (local, remote, not_found, route_error)"
+        "Time to resolve subscription by source (local, remote, not_found, route_error, upstream_error, downstream_left)"
     );
 }
 

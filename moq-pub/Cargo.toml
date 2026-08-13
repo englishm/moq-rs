@@ -9,7 +9,7 @@ authors = ["moq-rs contributors"]
 repository = "https://github.com/cloudflare/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.9.1"
+version = "0.9.3"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
@@ -18,7 +18,7 @@ categories = ["multimedia", "network-programming", "web-programming"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-moq-native-ietf = { path = "../moq-native-ietf", version = "0.9" }
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
 moq-transport = { path = "../moq-transport", version = "0.16" }
 moq-catalog = { path = "../moq-catalog", version = "0.2" }
 

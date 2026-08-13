@@ -1,15 +1,20 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{future::Future, net, path::PathBuf, pin::Pin, sync::Arc};
+use std::{future::Future, net, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::Context;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
+use moq_transport::session::SessionConfig;
 use url::Url;
 
-use crate::{metrics::GaugeGuard, Consumer, Coordinator, Locals, Producer, RemoteManager, Session};
+use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
+use crate::{
+    metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
+    RelayInfo, RemoteManager, Session, SessionContext, DEFAULT_CACHE_IDLE_TIMEOUT,
+};
 
 // A type alias for boxed future
 type ServerFuture = Pin<
@@ -49,36 +54,79 @@ pub struct RelayConfig {
 
     /// The coordinator for namespace/track registration and discovery.
     pub coordinator: Arc<dyn Coordinator>,
+
+    /// MoQT session configuration used for inbound and relay-to-relay sessions.
+    pub session: SessionConfig,
+
+    /// Classifies inbound connections as public clients or internal relay
+    /// peers via connection tags (the well-known `interface` tag). Consulted
+    /// once per accepted connection with the peer's socket address and
+    /// connection path.
+    ///
+    /// When `None`, every inbound connection is treated as a public client.
+    /// Outbound connections the relay dials itself (`--announce`,
+    /// [`RemoteManager`]) are always tagged internal and bypass this.
+    pub connection_tagger: Option<Arc<dyn ConnectionTagger>>,
+}
+
+impl RelayConfig {
+    /// Build a relay from this configuration.
+    pub fn build(self) -> anyhow::Result<Relay> {
+        Relay::new(self)
+    }
+
+    /// Build a relay with a custom pull-through cache idle timeout.
+    ///
+    /// See [`Relay::new_with_cache_idle_timeout`]. This is a separate
+    /// constructor rather than a `RelayConfig` field so that adding it does not
+    /// break existing struct-literal construction of [`RelayConfig`].
+    pub fn build_with_cache_idle_timeout(
+        self,
+        cache_idle_timeout: Duration,
+    ) -> anyhow::Result<Relay> {
+        Relay::new_with_cache_idle_timeout(self, cache_idle_timeout)
+    }
 }
 
 /// MoQ Relay server.
 pub struct Relay {
-    quic_endpoints: Vec<Endpoint>,
-    announce_url: Option<Url>,
-    mlog_dir: Option<PathBuf>,
+    config: RelayConfig,
     locals: Locals,
     remotes: RemoteManager,
-    coordinator: Arc<dyn Coordinator>,
+    upstream_namespaces: UpstreamNamespaces,
+    upstream_namespaces_runner: UpstreamNamespacesRunner,
 }
 
 impl Relay {
     pub fn new(config: RelayConfig) -> anyhow::Result<Self> {
+        Self::new_with_cache_idle_timeout(config, DEFAULT_CACHE_IDLE_TIMEOUT)
+    }
+
+    /// Create a relay that releases upstream subscriptions for cached tracks that
+    /// have had no downstream subscribers for `cache_idle_timeout`.
+    ///
+    /// The relay caches tracks it does not publish itself so multiple downstream
+    /// subscribers can share one upstream subscription. Without a timeout that
+    /// subscription outlives the last subscriber and the relay keeps receiving a
+    /// track nobody is watching. A zero timeout restores that behaviour.
+    pub fn new_with_cache_idle_timeout(
+        mut config: RelayConfig,
+        cache_idle_timeout: Duration,
+    ) -> anyhow::Result<Self> {
         if config.bind.is_some() && !config.endpoints.is_empty() {
             anyhow::bail!("cannot specify both bind and endpoints");
         }
 
-        let endpoints = if let Some(bind) = config.bind {
+        if let Some(bind) = config.bind.take() {
             let endpoint = quic::Endpoint::new(quic::Config::new(
                 bind,
                 config.qlog_dir.clone(),
                 config.tls.clone(),
             )?)?;
-            vec![endpoint]
-        } else {
-            config.endpoints
-        };
+            config.endpoints = vec![endpoint];
+        }
 
-        if endpoints.is_empty() {
+        if config.endpoints.is_empty() {
             anyhow::bail!("no endpoints available to start the server");
         }
 
@@ -93,40 +141,63 @@ impl Relay {
             tracing::info!("mlog output enabled: {}", mlog_dir.display());
         }
 
-        let locals = Locals::new();
+        let locals = Locals::with_cache_idle_timeout(cache_idle_timeout);
 
         // FIXME(itzmanish): have a generic filter to find endpoints for forward, remote etc.
-        let remote_clients = endpoints
+        let remote_clients = config
+            .endpoints
             .iter()
             .map(|endpoint| endpoint.client.clone())
             .collect::<Vec<_>>();
 
         // Create remote manager - uses coordinator for namespace lookups
-        let remotes = RemoteManager::new(config.coordinator.clone(), remote_clients);
+        let remotes = RemoteManager::new_with_session_config(
+            config.coordinator.clone(),
+            remote_clients,
+            config.session,
+        )
+        .with_cache_idle_timeout(cache_idle_timeout);
+        let (upstream_namespaces, upstream_namespaces_runner) =
+            UpstreamNamespaces::new(locals.clone(), remotes.clone(), config.coordinator.clone());
 
         Ok(Self {
-            quic_endpoints: endpoints,
-            announce_url: config.announce,
-            mlog_dir: config.mlog_dir,
+            config,
             locals,
             remotes,
-            coordinator: config.coordinator,
+            upstream_namespaces,
+            upstream_namespaces_runner,
         })
     }
 
     /// Run the relay server.
     pub async fn run(self) -> anyhow::Result<()> {
         let Self {
-            quic_endpoints,
-            announce_url,
-            mlog_dir,
+            config,
             locals,
             remotes,
-            coordinator,
+            upstream_namespaces,
+            upstream_namespaces_runner,
         } = self;
+
+        let RelayConfig {
+            endpoints: quic_endpoints,
+            announce: announce_url,
+            mlog_dir,
+            coordinator,
+            session: session_config,
+            connection_tagger,
+            ..
+        } = config;
 
         let run_result = async {
             let mut tasks = FuturesUnordered::new();
+            tasks.push(
+                async move {
+                    upstream_namespaces_runner.run().await;
+                    Ok::<(), anyhow::Error>(())
+                }
+                .boxed(),
+            );
 
             // Use the remote manager for routing to remote relays.
             let remote_manager = remotes.clone();
@@ -143,10 +214,14 @@ impl Relay {
                     .context("failed to establish forward connection")?;
 
                 // Create the MoQ session over the connection
-                let (session, publisher, subscriber) =
-                    moq_transport::session::Session::connect(session, None, transport)
-                        .await
-                        .context("failed to establish forward session")?;
+                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config(
+                    session,
+                    None,
+                    transport,
+                    session_config,
+                )
+                .await
+                .context("failed to establish forward session")?;
 
                 // Use the connection path already validated and stored by Session::connect().
                 // The forward session is scoped to whatever path the announce URL specifies.
@@ -162,22 +237,28 @@ impl Relay {
                 // Multi-scope forwarding (routing different incoming scopes to different
                 // upstream paths) would require per-scope forward connections.
                 let forward_scope = session.connection_path().map(|s| s.to_string());
+                let forward_context = SessionContext::internal(
+                    forward_scope,
+                    Some(RelayInfo::new(url.clone())),
+                );
 
                 let forward_coordinator = coordinator.clone();
                 let session = Session {
                     session,
-                    producer: Some(Producer::new(
+                    producer: Some(Producer::new_with_upstream_namespaces(
                         publisher,
                         locals.clone(),
                         remote_manager.clone(),
-                        forward_scope.clone(),
+                        upstream_namespaces.clone(),
+                        forward_context.clone(),
                     )),
                     consumer: Some(Consumer::new(
                         subscriber,
                         locals.clone(),
                         forward_coordinator,
+                        remote_manager.clone(),
                         None,
-                        forward_scope,
+                        forward_context,
                     )),
                     // Forward connections are always full read-write relay peers,
                     // so no reject loops needed.
@@ -228,9 +309,17 @@ impl Relay {
                             .boxed(),
                         );
 
-                        let (conn, conn_info) = conn_result.context("failed to accept QUIC connection")?;
-                        let connection_id = conn_info.id;
-                        let transport = conn_info.transport;
+                        let (conn, info) = conn_result.context("failed to accept QUIC connection")?;
+                        let quic::ConnInfo {
+                            id: connection_id,
+                            transport,
+                            remote_address: remote_addr,
+                            // The local IP the connection was accepted on
+                            // (destination IP the peer targeted); forwarded to the
+                            // connection tagger for inbound-interface classification.
+                            local_ip,
+                            server_name,
+                        } = info;
 
                         metrics::counter!("moq_relay_connections_total").increment(1);
 
@@ -242,6 +331,8 @@ impl Relay {
                         let remotes = remote_manager.clone();
                         let forward = forward_producer.clone();
                         let coordinator = coordinator.clone();
+                        let upstream_namespaces = upstream_namespaces.clone();
+                        let connection_tagger = connection_tagger.clone();
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
@@ -253,7 +344,7 @@ impl Relay {
                             let raw_conn = conn.clone();
 
                             // Create the MoQ session over the connection (setup handshake etc)
-                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path, transport).await {
+                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config(conn, mlog_path, transport, session_config).await {
                                 Ok(session) => session,
                                 Err(err) => {
                                     tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
@@ -292,9 +383,32 @@ impl Relay {
                                 }
                             };
 
-                            let scope_id = scope_info.as_ref().map(|s| s.scope_id.clone());
                             let can_publish = scope_info.as_ref().is_none_or(|s| s.permissions.can_publish());
                             let can_subscribe = scope_info.as_ref().is_none_or(|s| s.permissions.can_subscribe());
+
+                            // Classify the connection interface (public client vs internal
+                            // relay peer). This is deliberately separate from scope
+                            // resolution above: resolve_scope() returns identity +
+                            // permissions, while the embedder-supplied tagger decides the
+                            // transport interface from the peer socket address, TLS SNI, and
+                            // connection path. With no tagger configured every inbound
+                            // connection is treated as a public client. For connections
+                            // classified internal, the peer relay identity is derived from
+                            // the inbound socket address (see RelayInfo::from_socket_addr).
+                            let scope = scope_info.as_ref().map(|info| info.scope_id.clone());
+                            let context = match connection_tagger.as_ref() {
+                                Some(tagger) => {
+                                    let meta = ConnectionMeta::new(
+                                        Some(remote_addr),
+                                        server_name,
+                                        moq_session.connection_path().map(str::to_string),
+                                    )
+                                    .with_local_ip(local_ip);
+                                    let tags = tagger.tag(&meta);
+                                    SessionContext::from_tags(scope, &tags, Some(remote_addr))
+                                }
+                                None => SessionContext::public(scope),
+                            };
 
                             if let Some(ref info) = scope_info {
                                 tracing::debug!(
@@ -314,13 +428,13 @@ impl Relay {
                             // to the Session's reject fields so unauthorized messages get
                             // an explicit error response instead of being silently ignored.
                             let (producer, reject_subscribes) = if can_subscribe {
-                                (publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, scope_id.clone())), None)
+                                (publisher.map(|publisher| Producer::new_with_upstream_namespaces(publisher, locals.clone(), remotes.clone(), upstream_namespaces, context.clone())), None)
                             } else {
                                 (None, publisher)
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id)), None)
+                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context)), None)
                             } else {
                                 (None, subscriber)
                             };
