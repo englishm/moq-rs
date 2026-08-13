@@ -17,8 +17,9 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::interest::{TrackInterest, TrackInterestGuard};
-use crate::local::DEFAULT_CACHE_IDLE_TIMEOUT;
-use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError, RelayInfo, SessionContext};
+use crate::{
+    metrics::GaugeGuard, Coordinator, CoordinatorError, RelayInfo, RelayTuning, SessionContext,
+};
 
 /// Cache key for upstream relay-to-relay connections.
 ///
@@ -51,9 +52,8 @@ pub struct RemoteManager {
     session_config: SessionConfig,
     remotes: Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
 
-    /// How long an unwatched cross-relay cache entry is retained before its
-    /// upstream subscription is released. Zero disables eviction.
-    cache_idle_timeout: Duration,
+    /// Timeouts applied to this relay's upstream track subscriptions.
+    tuning: RelayTuning,
 }
 
 #[cfg(test)]
@@ -104,6 +104,32 @@ mod tests {
             RemoteManager::new_with_session_config(Arc::new(NoopCoordinator), vec![], config);
 
         assert_eq!(manager.session_config, config);
+    }
+
+    #[test]
+    fn new_uses_default_tuning() {
+        let manager = RemoteManager::new(Arc::new(NoopCoordinator), vec![]);
+
+        assert_eq!(manager.tuning, RelayTuning::default());
+    }
+
+    /// Both knobs are `Duration`, so a builder assigning to the wrong field would
+    /// compile and silently mis-tune the peer connections.
+    #[test]
+    fn each_builder_sets_only_its_own_knob() {
+        let manager = RemoteManager::new(Arc::new(NoopCoordinator), vec![])
+            .with_subscribe_timeout(Duration::from_secs(3));
+
+        assert_eq!(manager.tuning.subscribe_timeout, Duration::from_secs(3));
+        assert_eq!(
+            manager.tuning.cache_idle_timeout,
+            RelayTuning::default().cache_idle_timeout
+        );
+
+        let manager = manager.with_cache_idle_timeout(Duration::from_secs(7));
+
+        assert_eq!(manager.tuning.cache_idle_timeout, Duration::from_secs(7));
+        assert_eq!(manager.tuning.subscribe_timeout, Duration::from_secs(3));
     }
 
     #[test]
@@ -271,7 +297,7 @@ impl RemoteManager {
             clients,
             session_config,
             remotes: Arc::new(Mutex::new(HashMap::new())),
-            cache_idle_timeout: DEFAULT_CACHE_IDLE_TIMEOUT,
+            tuning: RelayTuning::default(),
         }
     }
 
@@ -281,7 +307,13 @@ impl RemoteManager {
     /// A zero timeout disables idle eviction, holding subscriptions to peer
     /// relays for as long as the peer session lives.
     pub fn with_cache_idle_timeout(mut self, cache_idle_timeout: Duration) -> Self {
-        self.cache_idle_timeout = cache_idle_timeout;
+        self.tuning.cache_idle_timeout = cache_idle_timeout;
+        self
+    }
+
+    /// Override how long to wait for a peer relay to acknowledge a SUBSCRIBE.
+    pub fn with_subscribe_timeout(mut self, subscribe_timeout: Duration) -> Self {
+        self.tuning.subscribe_timeout = subscribe_timeout;
         self
     }
 
@@ -454,7 +486,7 @@ impl RemoteManager {
                 cache_key.1,
                 client,
                 self.session_config,
-                self.cache_idle_timeout,
+                self.tuning,
                 RemoteCacheHandle {
                     remotes: Arc::downgrade(&self.remotes),
                     key: cache_key.clone(),
@@ -609,8 +641,8 @@ struct Remote {
     connected: Arc<AtomicBool>,
     /// Cancellation token for the session task.
     cancel: CancellationToken,
-    /// Idle timeout applied to this peer's cached track readers.
-    cache_idle_timeout: Duration,
+    /// Timeouts applied to this peer's track subscriptions.
+    tuning: RelayTuning,
 }
 
 /// Where a connection caches itself, so the session task can evict its own slot
@@ -628,7 +660,7 @@ impl Remote {
         addr: Option<SocketAddr>,
         client: &quic::Client,
         session_config: SessionConfig,
-        cache_idle_timeout: Duration,
+        tuning: RelayTuning,
         cache: RemoteCacheHandle,
     ) -> anyhow::Result<Self> {
         let RemoteCacheHandle {
@@ -721,7 +753,7 @@ impl Remote {
             tracks: Arc::new(Mutex::new(HashMap::new())),
             connected,
             cancel,
-            cache_idle_timeout,
+            tuning,
         })
     }
 
@@ -817,8 +849,15 @@ impl Remote {
             tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
 
             let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
+
+            // `subscribe_open` waits for the peer to answer, which it is under no
+            // obligation to ever do, so the handshake is bounded three ways: the
+            // peer connection closing, a wall-clock timeout, and — once the entry
+            // exists — idle eviction. Dropping the in-flight future drops the
+            // `Subscribe`, whose `Drop` sends UNSUBSCRIBE, so giving up here
+            // leaves nothing dangling on the peer.
             let subscribe_result = tokio::select! {
-                result = subscriber.subscribe_open(writer) => result,
+                result = tokio::time::timeout(self.tuning.subscribe_timeout, subscriber.subscribe_open(writer)) => result,
                 _ = cancel.cancelled() => {
                     drop(cached);
                     remove_empty_track_slot(&self.tracks, &key, &slot).await;
@@ -827,11 +866,23 @@ impl Remote {
             };
 
             let subscribe = match subscribe_result {
-                Ok(subscribe) => subscribe,
-                Err(err) => {
+                Ok(Ok(subscribe)) => subscribe,
+                Ok(Err(err)) => {
                     drop(cached);
                     remove_empty_track_slot(&self.tracks, &key, &slot).await;
                     return Err(err.into());
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(remote_url = %url, namespace = %key.0, track = %key.1, timeout = ?self.tuning.subscribe_timeout, "remote relay did not acknowledge SUBSCRIBE in time");
+                    metrics::counter!("moq_relay_subscribe_timeouts_total", "source" => "remote")
+                        .increment(1);
+                    drop(cached);
+                    remove_empty_track_slot(&self.tracks, &key, &slot).await;
+                    anyhow::bail!(
+                        "remote relay {} did not acknowledge SUBSCRIBE within {:?}",
+                        self.url,
+                        self.tuning.subscribe_timeout
+                    );
                 }
             };
 
@@ -856,7 +907,7 @@ impl Remote {
             let cleanup_key = key.clone();
             let cleanup_reader = reader.clone();
             let cleanup_slot = slot.clone();
-            let idle_timeout = self.cache_idle_timeout;
+            let idle_timeout = self.tuning.cache_idle_timeout;
             tokio::spawn(async move {
                 tokio::select! {
                     result = subscribe.closed() => {
