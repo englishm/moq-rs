@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -35,6 +35,174 @@ struct CachedTrack {
     interest: TrackInterest,
 }
 
+/// Live users of one pooled peer connection.
+///
+/// Eviction only reclaims an entry whose count is zero, so a connection can
+/// never be closed out from under something still using it. Guards are taken
+/// under the pool lock — the same lock eviction runs under — or by a caller
+/// that already holds one, so a connection cannot be handed out and evicted at
+/// the same time.
+#[derive(Clone, Debug, Default)]
+struct RemoteUsers {
+    count: Arc<AtomicUsize>,
+}
+
+impl RemoteUsers {
+    fn guard(&self) -> RemoteUseGuard {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        RemoteUseGuard {
+            users: self.clone(),
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.count.load(Ordering::Acquire) == 0
+    }
+}
+
+/// Held for as long as a caller is using a pooled connection to a peer relay.
+///
+/// Dropping it only makes the connection eligible for eviction again; it never
+/// closes anything by itself.
+#[derive(Debug)]
+struct RemoteUseGuard {
+    users: RemoteUsers,
+}
+
+impl RemoteUseGuard {
+    /// The counter behind this guard, so a longer lived user of the same
+    /// connection can take its own guard.
+    fn users(&self) -> RemoteUsers {
+        self.users.clone()
+    }
+}
+
+impl Drop for RemoteUseGuard {
+    fn drop(&mut self) {
+        // Saturating because an underflow here would make a connection look
+        // permanently busy, pinning it in the pool forever.
+        let _ = self
+            .users
+            .count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                Some(count.saturating_sub(1))
+            });
+    }
+}
+
+/// One pooled peer connection: the slot holding it plus its LRU bookkeeping.
+struct RemoteEntry {
+    slot: RemoteSlot,
+    users: RemoteUsers,
+
+    /// Tick of the last time this entry was handed out; the lowest tick is the
+    /// least recently used entry.
+    used: u64,
+}
+
+/// Bounded pool of connections to peer relays.
+///
+/// Recency is a monotonic tick rather than an intrusive list: the pool holds a
+/// few hundred entries at most and only a new connection — already a QUIC
+/// handshake — can trigger a scan, so the linear walk is not worth a second
+/// data structure to keep in sync.
+#[derive(Default)]
+struct RemoteCache {
+    entries: HashMap<RemoteCacheKey, RemoteEntry>,
+    clock: u64,
+}
+
+impl RemoteCache {
+    /// Get or create the slot for `key`, mark it most recently used, and take a
+    /// use guard so it cannot be evicted while the caller works with it.
+    fn acquire(&mut self, key: &RemoteCacheKey) -> (RemoteSlot, RemoteUseGuard) {
+        self.clock += 1;
+        let used = self.clock;
+
+        let entry = self
+            .entries
+            .entry(key.clone())
+            .or_insert_with(|| RemoteEntry {
+                slot: Arc::new(Mutex::new(None)),
+                users: RemoteUsers::default(),
+                used,
+            });
+
+        // Recency is refreshed on a hit, not just on insertion.
+        entry.used = used;
+
+        (entry.slot.clone(), entry.users.guard())
+    }
+
+    /// The slot cached for `key`, without touching its recency.
+    fn slot(&self, key: &RemoteCacheKey) -> Option<&RemoteSlot> {
+        self.entries.get(key).map(|entry| &entry.slot)
+    }
+
+    fn is_current(&self, key: &RemoteCacheKey, slot: &RemoteSlot) -> bool {
+        matches!(self.slot(key), Some(current) if Arc::ptr_eq(current, slot))
+    }
+
+    fn remove(&mut self, key: &RemoteCacheKey) {
+        self.entries.remove(key);
+    }
+
+    fn drain(&mut self) -> Vec<(RemoteCacheKey, RemoteSlot)> {
+        self.entries
+            .drain()
+            .map(|(key, entry)| (key, entry.slot))
+            .collect()
+    }
+
+    /// Take the least recently used unused connections until at most `capacity`
+    /// entries remain. A zero `capacity` disables the bound.
+    ///
+    /// An entry with a live user is skipped, as is one whose slot lock is held
+    /// (a connect or teardown is in flight), so the pool is left over capacity
+    /// rather than cutting off a connection that is still serving someone. The
+    /// evicted connections are returned instead of closed here because shutdown
+    /// is async and this runs under the pool lock.
+    fn evict_over_capacity(&mut self, capacity: usize) -> Vec<(RemoteCacheKey, Option<Remote>)> {
+        if capacity == 0 {
+            return Vec::new();
+        }
+
+        let mut evicted = Vec::new();
+
+        while self.entries.len() > capacity {
+            let mut candidates: Vec<(u64, RemoteCacheKey)> = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.users.is_idle())
+                .map(|(key, entry)| (entry.used, key.clone()))
+                .collect();
+            candidates.sort_unstable_by_key(|(used, _)| *used);
+
+            let victim = candidates.into_iter().find_map(|(_, key)| {
+                // try_lock never blocks, so probing a slot while holding the
+                // pool lock cannot deadlock against a task that takes the slot
+                // lock first.
+                let mut cached = self.entries.get(&key)?.slot.try_lock().ok()?;
+                Some((key, cached.take()))
+            });
+
+            let Some((key, remote)) = victim else {
+                tracing::debug!(
+                    entries = self.entries.len(),
+                    capacity,
+                    "remote connection pool is over capacity but every connection is in use"
+                );
+                break;
+            };
+
+            self.entries.remove(&key);
+            evicted.push((key, remote));
+        }
+
+        evicted
+    }
+}
+
 /// Manages connections to remote relays.
 ///
 /// When a subscription request comes in for a namespace that isn't local,
@@ -44,9 +212,9 @@ struct CachedTrack {
 pub struct RemoteManager {
     coordinator: Arc<dyn Coordinator>,
     clients: Vec<quic::Client>,
-    remotes: Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
+    remotes: Arc<Mutex<RemoteCache>>,
 
-    /// Timeouts applied to this relay's upstream track subscriptions.
+    /// Timeouts and limits applied to this relay's upstream connections.
     tuning: RelayTuning,
 }
 
@@ -56,7 +224,7 @@ impl RemoteManager {
         Self {
             coordinator,
             clients,
-            remotes: Arc::new(Mutex::new(HashMap::new())),
+            remotes: Arc::new(Mutex::new(RemoteCache::default())),
             tuning: RelayTuning::default(),
         }
     }
@@ -74,6 +242,21 @@ impl RemoteManager {
     /// Override how long to wait for a peer relay to acknowledge a SUBSCRIBE.
     pub fn with_subscribe_timeout(mut self, subscribe_timeout: Duration) -> Self {
         self.tuning.subscribe_timeout = subscribe_timeout;
+        self
+    }
+
+    /// Override how many peer relay connections are pooled.
+    ///
+    /// Adding a connection to a full pool closes the least recently used
+    /// connection that nothing is using. Connections still serving a
+    /// subscription are never closed, so the pool may exceed this limit while
+    /// every entry is in use. Zero disables the bound, restoring the previous
+    /// behaviour of caching a connection per peer for the life of the process.
+    ///
+    /// A connection counts as unused once every subscription over it has been
+    /// released, which for cached tracks is governed by the cache idle timeout.
+    pub fn with_max_remote_connections(mut self, max_remote_connections: usize) -> Self {
+        self.tuning.max_remote_connections = max_remote_connections;
         self
     }
 
@@ -98,7 +281,9 @@ impl RemoteManager {
         let url = origin.url();
         let cache_key = (url.clone(), origin.addr());
 
-        let remote = match self
+        // The guard keeps this connection out of the pool's eviction candidate
+        // set until the upstream subscription has taken one of its own.
+        let (remote, _peer_use) = match self
             .get_or_connect(cache_key.clone(), client.as_ref())
             .await
         {
@@ -124,11 +309,14 @@ impl RemoteManager {
     }
 
     /// Get an existing remote connection or create a new one.
+    ///
+    /// The returned guard keeps the connection in the pool: it is only evicted
+    /// once every guard on it has been dropped.
     async fn get_or_connect(
         &self,
         cache_key: RemoteCacheKey,
         client: Option<&quic::Client>,
-    ) -> anyhow::Result<Remote> {
+    ) -> anyhow::Result<(Remote, RemoteUseGuard)> {
         let client = match client {
             Some(client) => client,
             None => self.clients.first().ok_or_else(|| {
@@ -137,21 +325,21 @@ impl RemoteManager {
         };
 
         loop {
-            // The manager lock only protects the map. The per-key slot lock protects
+            // The manager lock only protects the pool. The per-key slot lock protects
             // that key's connection state, so unrelated remotes can connect in parallel.
-            let slot = {
+            // The use guard is taken under the manager lock, which is also where
+            // eviction picks its victims, so this entry cannot be evicted from
+            // under us.
+            let (slot, peer_use) = {
                 let mut remotes = self.remotes.lock().await;
-                remotes
-                    .entry(cache_key.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(None)))
-                    .clone()
+                remotes.acquire(&cache_key)
             };
 
             let mut cached = slot.lock().await;
 
             let is_current_slot = {
                 let remotes = self.remotes.lock().await;
-                matches!(remotes.get(&cache_key), Some(current) if Arc::ptr_eq(current, &slot))
+                remotes.is_current(&cache_key, &slot)
             };
 
             if !is_current_slot {
@@ -160,7 +348,7 @@ impl RemoteManager {
 
             if let Some(remote) = cached.as_ref() {
                 if remote.is_connected() {
-                    return Ok(remote.clone());
+                    return Ok((remote.clone(), peer_use));
                 }
 
                 tracing::info!(remote_url = %cache_key.0, "removing dead connection to remote relay");
@@ -179,6 +367,7 @@ impl RemoteManager {
                 Arc::downgrade(&self.remotes),
                 cache_key.clone(),
                 Arc::downgrade(&slot),
+                peer_use.users(),
             )
             .await
             {
@@ -191,14 +380,40 @@ impl RemoteManager {
             };
 
             *cached = Some(remote.clone());
-            return Ok(remote);
+            drop(cached);
+
+            // This connection may have pushed the pool over its limit. Run after
+            // releasing the slot lock so nobody waits on this key while the
+            // evicted connections are shut down.
+            self.evict_over_capacity().await;
+
+            return Ok((remote, peer_use));
+        }
+    }
+
+    /// Close pooled connections that nothing is using, least recently used
+    /// first, until the pool is back within its limit.
+    async fn evict_over_capacity(&self) {
+        let evicted = {
+            let mut remotes = self.remotes.lock().await;
+            remotes.evict_over_capacity(self.tuning.max_remote_connections)
+        };
+
+        // Shutdown is async, so it happens after the pool lock is released.
+        for (cache_key, remote) in evicted {
+            tracing::info!(remote_url = %cache_key.0, "evicting least recently used peer relay from the connection pool");
+            metrics::counter!("moq_relay_remote_cache_evictions_total").increment(1);
+
+            if let Some(remote) = remote {
+                remote.shutdown().await;
+            }
         }
     }
 
     async fn remove_if_same_remote(&self, cache_key: &RemoteCacheKey, remote: &Remote) {
         let slot = {
             let remotes = self.remotes.lock().await;
-            remotes.get(cache_key).cloned()
+            remotes.slot(cache_key).cloned()
         };
 
         if let Some(slot) = slot {
@@ -221,7 +436,7 @@ impl RemoteManager {
     pub(crate) async fn shutdown(&self) {
         let remotes = {
             let mut remotes = self.remotes.lock().await;
-            remotes.drain().collect::<Vec<_>>()
+            remotes.drain()
         };
 
         for (cache_key, slot) in remotes {
@@ -235,7 +450,7 @@ impl RemoteManager {
 }
 
 async fn remove_empty_remote_slot(
-    remotes: &Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
+    remotes: &Arc<Mutex<RemoteCache>>,
     cache_key: &RemoteCacheKey,
     slot: &RemoteSlot,
 ) {
@@ -245,7 +460,7 @@ async fn remove_empty_remote_slot(
     }
 
     let mut remotes = remotes.lock().await;
-    if matches!(remotes.get(cache_key), Some(current) if Arc::ptr_eq(current, slot)) {
+    if remotes.is_current(cache_key, slot) {
         remotes.remove(cache_key);
     }
 }
@@ -325,6 +540,8 @@ struct Remote {
     cancel: CancellationToken,
     /// Timeouts applied to this peer's track subscriptions.
     tuning: RelayTuning,
+    /// Live users of this pooled connection, shared with its cache entry.
+    users: RemoteUsers,
 }
 
 impl Remote {
@@ -334,9 +551,10 @@ impl Remote {
         addr: Option<SocketAddr>,
         client: &quic::Client,
         tuning: RelayTuning,
-        remotes: Weak<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
+        remotes: Weak<Mutex<RemoteCache>>,
         cache_key: RemoteCacheKey,
         cache_slot: Weak<Mutex<Option<Remote>>>,
+        users: RemoteUsers,
     ) -> anyhow::Result<Self> {
         let (session, _quic_client_initial_cid, transport) = match client.connect(&url, addr).await
         {
@@ -409,6 +627,7 @@ impl Remote {
             connected,
             cancel,
             tuning,
+            users,
         })
     }
 
@@ -539,7 +758,17 @@ impl Remote {
             let cleanup_reader = reader.clone();
             let cleanup_slot = slot.clone();
             let idle_timeout = self.tuning.cache_idle_timeout;
+
+            // Pins the peer connection for as long as this upstream subscription
+            // lives, so pool eviction cannot close it underneath a downstream
+            // subscriber. Taken before the task is spawned, while the caller's
+            // own guard is still alive, so the connection is never momentarily
+            // unused.
+            let peer_use = self.users.guard();
+
             tokio::spawn(async move {
+                let _peer_use = peer_use;
+
                 tokio::select! {
                     result = subscribe.closed() => {
                         match result {
@@ -599,6 +828,112 @@ mod tests {
     use super::*;
 
     const GRACE: Duration = Duration::from_secs(30);
+
+    fn pool_key(host: &str) -> RemoteCacheKey {
+        (
+            Url::parse(&format!("https://{host}.example.com/live")).unwrap(),
+            None,
+        )
+    }
+
+    /// Insert `hosts` in order, releasing each use guard so every entry is
+    /// evictable, and return the pool.
+    fn unused_pool(hosts: &[&str]) -> RemoteCache {
+        let mut cache = RemoteCache::default();
+        for host in hosts {
+            let (_slot, _peer_use) = cache.acquire(&pool_key(host));
+        }
+        cache
+    }
+
+    fn evicted_keys(evicted: Vec<(RemoteCacheKey, Option<Remote>)>) -> Vec<RemoteCacheKey> {
+        evicted.into_iter().map(|(key, _)| key).collect()
+    }
+
+    #[test]
+    fn acquire_reuses_the_slot_for_a_key() {
+        let mut cache = RemoteCache::default();
+
+        let (first, _) = cache.acquire(&pool_key("a"));
+        let (second, _) = cache.acquire(&pool_key("a"));
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn insertion_beyond_capacity_evicts_the_least_recently_used() {
+        let mut cache = unused_pool(&["a", "b", "c"]);
+
+        assert_eq!(evicted_keys(cache.evict_over_capacity(2)), [pool_key("a")]);
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.slot(&pool_key("a")).is_none());
+        assert!(cache.slot(&pool_key("b")).is_some());
+        assert!(cache.slot(&pool_key("c")).is_some());
+    }
+
+    #[test]
+    fn a_cache_hit_refreshes_recency() {
+        let mut cache = unused_pool(&["a", "b", "c"]);
+
+        // Reusing the oldest connection makes the next oldest the victim.
+        let (_slot, _peer_use) = cache.acquire(&pool_key("a"));
+
+        assert_eq!(evicted_keys(cache.evict_over_capacity(2)), [pool_key("b")]);
+        assert!(cache.slot(&pool_key("a")).is_some());
+    }
+
+    #[test]
+    fn an_entry_in_use_is_not_torn_down() {
+        let mut cache = unused_pool(&["a"]);
+        let (_slot, in_use) = cache.acquire(&pool_key("a"));
+        let (_newer, _) = cache.acquire(&pool_key("b"));
+
+        // "a" is the least recently used but is still serving someone, so the
+        // newer unused entry is reclaimed instead.
+        assert_eq!(evicted_keys(cache.evict_over_capacity(1)), [pool_key("b")]);
+        assert!(cache.slot(&pool_key("a")).is_some());
+
+        // ...and it becomes evictable again once its last user goes away.
+        drop(in_use);
+        let (_newer, _) = cache.acquire(&pool_key("c"));
+
+        assert_eq!(evicted_keys(cache.evict_over_capacity(1)), [pool_key("a")]);
+    }
+
+    #[test]
+    fn a_pool_of_connections_in_use_is_left_over_capacity() {
+        let mut cache = RemoteCache::default();
+        let (_a, _a_use) = cache.acquire(&pool_key("a"));
+        let (_b, _b_use) = cache.acquire(&pool_key("b"));
+
+        assert!(cache.evict_over_capacity(1).is_empty());
+        assert_eq!(
+            cache.entries.len(),
+            2,
+            "an entry in use must never be evicted"
+        );
+    }
+
+    #[test]
+    fn a_busy_slot_is_skipped() {
+        let mut cache = unused_pool(&["a", "b"]);
+        let slot = cache.slot(&pool_key("a")).unwrap().clone();
+
+        // A connect or teardown holds the slot lock; leave that entry alone.
+        let _connecting = slot.try_lock().unwrap();
+
+        assert_eq!(evicted_keys(cache.evict_over_capacity(1)), [pool_key("b")]);
+        assert!(cache.slot(&pool_key("a")).is_some());
+    }
+
+    #[test]
+    fn a_zero_capacity_disables_the_bound() {
+        let mut cache = unused_pool(&["a", "b", "c"]);
+
+        assert!(cache.evict_over_capacity(0).is_empty());
+        assert_eq!(cache.entries.len(), 3);
+    }
 
     fn cached_track() -> (TrackSlot, TrackInterest) {
         let (_writer, reader) = Track::new(

@@ -13,7 +13,9 @@ use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
-use moq_relay_ietf::{Coordinator, Relay, RelayConfig, RelayTuning, Web, WebConfig};
+use moq_relay_ietf::{
+    Coordinator, Relay, RelayConfig, RelayTuning, Web, WebConfig, DEFAULT_MAX_REMOTE_CONNECTIONS,
+};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -49,6 +51,13 @@ pub struct Cli {
     /// exists to prevent, so there is no "disabled" setting.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     pub subscribe_timeout: u64,
+
+    /// Maximum number of peer relay connections kept open. Adding one to a full
+    /// pool closes the least recently used connection that nothing is using;
+    /// connections still serving a subscription are never closed. 0 disables the
+    /// bound, keeping a connection per peer for the life of the process.
+    #[arg(long, default_value_t = DEFAULT_MAX_REMOTE_CONNECTIONS)]
+    pub max_remote_connections: usize,
 
     /// The URL of the moq-api server in order to run a cluster.
     /// Must be used in conjunction with --node to advertise the origin
@@ -207,7 +216,8 @@ async fn main() -> anyhow::Result<()> {
         },
         RelayTuning::default()
             .with_cache_idle_timeout(Duration::from_secs(cli.cache_idle_timeout))
-            .with_subscribe_timeout(Duration::from_secs(cli.subscribe_timeout)),
+            .with_subscribe_timeout(Duration::from_secs(cli.subscribe_timeout))
+            .with_max_remote_connections(cli.max_remote_connections),
     )?;
 
     if cli.dev {

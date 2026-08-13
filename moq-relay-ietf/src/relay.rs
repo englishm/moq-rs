@@ -65,6 +65,15 @@ pub struct RelayConfig {
 /// subscriber waiting long past the point it has given up.
 pub const DEFAULT_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default maximum number of peer relay connections kept in the pool.
+///
+/// Every entry holds an open QUIC connection with its own keep-alive, so the
+/// pool must not grow with the number of peers a long-lived relay has ever
+/// talked to. This is well above the number of peers a relay talks to at once
+/// in practice, so eviction is a backstop rather than part of the steady state.
+/// Zero disables the bound.
+pub const DEFAULT_MAX_REMOTE_CONNECTIONS: usize = 256;
+
 /// Tuning knobs for a [`Relay`].
 ///
 /// Deliberately separate from [`RelayConfig`]: embedders construct `RelayConfig`
@@ -82,6 +91,11 @@ pub struct RelayTuning {
     /// How long to wait for an upstream to acknowledge a SUBSCRIBE before giving
     /// up. Must be non-zero; [`Relay::new_with_tuning`] rejects zero.
     pub subscribe_timeout: Duration,
+
+    /// How many peer relay connections are pooled. Connections still serving a
+    /// subscription are never evicted, so the pool may exceed this while every
+    /// entry is in use. Zero disables the bound.
+    pub max_remote_connections: usize,
 }
 
 impl Default for RelayTuning {
@@ -89,6 +103,7 @@ impl Default for RelayTuning {
         Self {
             cache_idle_timeout: DEFAULT_CACHE_IDLE_TIMEOUT,
             subscribe_timeout: DEFAULT_SUBSCRIBE_TIMEOUT,
+            max_remote_connections: DEFAULT_MAX_REMOTE_CONNECTIONS,
         }
     }
 }
@@ -104,6 +119,15 @@ impl RelayTuning {
     /// Set how long to wait for an upstream to acknowledge a SUBSCRIBE.
     pub fn with_subscribe_timeout(mut self, subscribe_timeout: Duration) -> Self {
         self.subscribe_timeout = subscribe_timeout;
+        self
+    }
+
+    /// Set how many peer relay connections are pooled. Zero disables the bound.
+    ///
+    /// See [`RemoteManager::with_max_remote_connections`], which documents what
+    /// eviction does and does not close.
+    pub fn with_max_remote_connections(mut self, max_remote_connections: usize) -> Self {
+        self.max_remote_connections = max_remote_connections;
         self
     }
 }
@@ -180,7 +204,8 @@ impl Relay {
         // Create remote manager - uses coordinator for namespace lookups
         let remotes = RemoteManager::new(config.coordinator.clone(), remote_clients)
             .with_cache_idle_timeout(tuning.cache_idle_timeout)
-            .with_subscribe_timeout(tuning.subscribe_timeout);
+            .with_subscribe_timeout(tuning.subscribe_timeout)
+            .with_max_remote_connections(tuning.max_remote_connections);
 
         Ok(Self {
             quic_endpoints: endpoints,
@@ -517,10 +542,14 @@ mod tests {
         assert_eq!(tuning.cache_idle_timeout, DEFAULT_CACHE_IDLE_TIMEOUT);
         assert_eq!(tuning.subscribe_timeout, DEFAULT_SUBSCRIBE_TIMEOUT);
         assert_eq!(tuning.subscribe_timeout, Duration::from_secs(10));
+        assert_eq!(
+            tuning.max_remote_connections,
+            DEFAULT_MAX_REMOTE_CONNECTIONS
+        );
     }
 
-    /// Both knobs are `Duration`, so a builder assigning to the wrong field would
-    /// compile and silently mis-tune the relay.
+    /// The timeouts are both `Duration`, so a builder assigning to the wrong
+    /// field would compile and silently mis-tune the relay.
     #[test]
     fn each_builder_sets_only_its_own_knob() {
         let base = RelayTuning::default();
@@ -532,6 +561,11 @@ mod tests {
         let subscribe = base.with_subscribe_timeout(Duration::from_secs(3));
         assert_eq!(subscribe.subscribe_timeout, Duration::from_secs(3));
         assert_eq!(subscribe.cache_idle_timeout, base.cache_idle_timeout);
+
+        let pooled = base.with_max_remote_connections(4);
+        assert_eq!(pooled.max_remote_connections, 4);
+        assert_eq!(pooled.cache_idle_timeout, base.cache_idle_timeout);
+        assert_eq!(pooled.subscribe_timeout, base.subscribe_timeout);
     }
 
     /// There is deliberately no "disabled" setting: an unbounded wait on a peer is
