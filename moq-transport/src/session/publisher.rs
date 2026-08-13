@@ -10,7 +10,7 @@ use std::{
 use futures::{stream::FuturesUnordered, StreamExt};
 
 use crate::{
-    coding::TrackNamespace,
+    coding::{ReasonPhrase, TrackNamespace},
     message::{self, Message},
     mlog,
     serve::{ServeError, TracksReader},
@@ -21,6 +21,12 @@ use crate::watch::Queue;
 use super::{
     Announce, AnnounceRecv, Session, SessionError, Subscribed, SubscribedRecv, TrackStatusRequested,
 };
+
+/// Error code used to reject a request this implementation does not serve.
+/// Draft-14 §13.1 assigns NOT_SUPPORTED = 0x3 in every per-request registry.
+const NOT_SUPPORTED: u64 = 0x3;
+
+const NOT_SUPPORTED_REASON: &str = "not supported";
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -234,17 +240,7 @@ impl Publisher {
             message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg),
             message::Subscriber::SubscribeUpdate(msg) => self.recv_subscribe_update(msg),
             message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg),
-            message::Subscriber::Fetch(_msg) => Err(SessionError::unimplemented("FETCH")),
-            message::Subscriber::FetchCancel(_msg) => {
-                Err(SessionError::unimplemented("FETCH_CANCEL"))
-            }
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg),
-            message::Subscriber::SubscribeNamespace(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE"))
-            }
-            message::Subscriber::UnsubscribeNamespace(_msg) => {
-                Err(SessionError::unimplemented("UNSUBSCRIBE_NAMESPACE"))
-            }
             message::Subscriber::PublishNamespaceCancel(msg) => {
                 self.recv_publish_namespace_cancel(msg)
             }
@@ -252,10 +248,12 @@ impl Publisher {
             message::Subscriber::PublishNamespaceError(msg) => {
                 self.recv_publish_namespace_error(msg)
             }
-            message::Subscriber::PublishOk(_msg) => Err(SessionError::unimplemented("PUBLISH_OK")),
-            message::Subscriber::PublishError(_msg) => {
-                Err(SessionError::unimplemented("PUBLISH_ERROR"))
-            }
+            msg @ (message::Subscriber::Fetch(_)
+            | message::Subscriber::FetchCancel(_)
+            | message::Subscriber::SubscribeNamespace(_)
+            | message::Subscriber::UnsubscribeNamespace(_)
+            | message::Subscriber::PublishOk(_)
+            | message::Subscriber::PublishError(_)) => self.recv_unsupported(msg),
         };
 
         if let Err(err) = res {
@@ -263,6 +261,51 @@ impl Publisher {
         }
 
         Ok(())
+    }
+
+    /// Answer a request we do not implement, leaving the rest of the session alone.
+    ///
+    /// The peer is entitled to send any request the draft defines; failing just
+    /// that request keeps its other subscriptions running.
+    fn recv_unsupported(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
+        match Self::not_supported_response(&msg) {
+            Some(response) => {
+                tracing::debug!("rejecting unsupported request: {:?}", msg);
+                self.send_message(response);
+            }
+            None => tracing::debug!("ignoring unsupported message: {:?}", msg),
+        }
+
+        Ok(())
+    }
+
+    /// The per-request error rejecting an unsupported request, if draft-14 defines
+    /// a response for it.
+    ///
+    /// FETCH_CANCEL, UNSUBSCRIBE_NAMESPACE, PUBLISH_OK and PUBLISH_ERROR all refer
+    /// to an earlier request that we never accepted, so there is nothing to reject.
+    fn not_supported_response(msg: &message::Subscriber) -> Option<message::Publisher> {
+        let reason_phrase = ReasonPhrase(NOT_SUPPORTED_REASON.to_string());
+
+        match msg {
+            message::Subscriber::Fetch(msg) => Some(
+                message::FetchError {
+                    id: msg.id,
+                    error_code: NOT_SUPPORTED,
+                    reason_phrase,
+                }
+                .into(),
+            ),
+            message::Subscriber::SubscribeNamespace(msg) => Some(
+                message::SubscribeNamespaceError {
+                    id: msg.id,
+                    error_code: NOT_SUPPORTED,
+                    reason_phrase,
+                }
+                .into(),
+            ),
+            _ => None,
+        }
     }
 
     fn recv_publish_namespace_ok(
@@ -451,5 +494,83 @@ impl Publisher {
 
     pub(super) async fn send_datagram(&mut self, data: bytes::Bytes) -> Result<(), SessionError> {
         Ok(self.webtransport.send_datagram(data).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::coding::{KeyValuePairs, Location};
+    use crate::message::{FetchType, GroupOrder, StandaloneFetch};
+
+    fn fetch(id: u64) -> message::Subscriber {
+        message::Fetch {
+            id,
+            subscriber_priority: 127,
+            group_order: GroupOrder::Publisher,
+            fetch_type: FetchType::Standalone,
+            standalone_fetch: Some(StandaloneFetch {
+                track_namespace: TrackNamespace::from_utf8_path("test"),
+                track_name: "video".to_string(),
+                start_location: Location::new(0, 0),
+                end_location: Location::new(1, 0),
+            }),
+            joining_fetch: None,
+            params: KeyValuePairs::new(),
+        }
+        .into()
+    }
+
+    fn subscribe_namespace(id: u64) -> message::Subscriber {
+        message::SubscribeNamespace {
+            id,
+            track_namespace_prefix: TrackNamespace::from_utf8_path("test"),
+            params: KeyValuePairs::new(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn fetch_is_rejected_with_fetch_error() {
+        match Publisher::not_supported_response(&fetch(4)) {
+            Some(message::Publisher::FetchError(err)) => {
+                assert_eq!(err.id, 4);
+                assert_eq!(err.error_code, NOT_SUPPORTED);
+            }
+            other => panic!("expected FETCH_ERROR, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subscribe_namespace_is_rejected_with_subscribe_namespace_error() {
+        match Publisher::not_supported_response(&subscribe_namespace(7)) {
+            Some(message::Publisher::SubscribeNamespaceError(err)) => {
+                assert_eq!(err.id, 7);
+                assert_eq!(err.error_code, NOT_SUPPORTED);
+            }
+            other => panic!("expected SUBSCRIBE_NAMESPACE_ERROR, got {:?}", other),
+        }
+    }
+
+    /// Messages that reference an earlier request have no error response of their
+    /// own, so they are ignored instead.
+    #[test]
+    fn messages_without_a_response_are_ignored() {
+        let cancel = message::FetchCancel { id: 4 }.into();
+        assert!(Publisher::not_supported_response(&cancel).is_none());
+
+        let unsubscribe = message::UnsubscribeNamespace {
+            track_namespace_prefix: TrackNamespace::from_utf8_path("test"),
+        }
+        .into();
+        assert!(Publisher::not_supported_response(&unsubscribe).is_none());
+    }
+
+    /// Supported requests must keep going through their own handlers.
+    #[test]
+    fn supported_requests_are_not_rejected() {
+        let unsubscribe = message::Unsubscribe { id: 2 }.into();
+        assert!(Publisher::not_supported_response(&unsubscribe).is_none());
     }
 }
