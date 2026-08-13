@@ -75,16 +75,65 @@ impl RelayConfig {
         Relay::new(self)
     }
 
-    /// Build a relay with a custom pull-through cache idle timeout.
+    /// Build a relay with non-default tuning.
     ///
-    /// See [`Relay::new_with_cache_idle_timeout`]. This is a separate
-    /// constructor rather than a `RelayConfig` field so that adding it does not
-    /// break existing struct-literal construction of [`RelayConfig`].
-    pub fn build_with_cache_idle_timeout(
-        self,
-        cache_idle_timeout: Duration,
-    ) -> anyhow::Result<Relay> {
-        Relay::new_with_cache_idle_timeout(self, cache_idle_timeout)
+    /// See [`Relay::new_with_tuning`]. Tuning is passed here rather than as
+    /// `RelayConfig` fields so that adding a knob does not break existing
+    /// struct-literal construction of [`RelayConfig`].
+    pub fn build_with_tuning(self, tuning: RelayTuning) -> anyhow::Result<Relay> {
+        Relay::new_with_tuning(self, tuning)
+    }
+}
+
+/// How long to wait for an upstream to acknowledge a SUBSCRIBE before giving up.
+///
+/// MoQ does not bound the response to a SUBSCRIBE, so this is a policy choice
+/// rather than a protocol constant. A downstream subscriber is blocked for the
+/// whole window, and upstream is normally a nearby relay or origin for which a
+/// control round trip is well under a second, so ten seconds is generous without
+/// leaving a subscriber waiting long past the point it has given up.
+pub const DEFAULT_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Tuning knobs for a [`Relay`].
+///
+/// Deliberately separate from [`RelayConfig`]: embedders construct `RelayConfig`
+/// as an exhaustive struct literal, so adding a field there is a breaking change.
+/// This struct is `#[non_exhaustive]` with a `Default` and builder methods, so
+/// future knobs can be added without breaking anyone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct RelayTuning {
+    /// How long a cached track with no downstream subscribers is retained before
+    /// its upstream subscription is released. Zero disables eviction, holding
+    /// upstream subscriptions for the lifetime of the upstream session.
+    pub cache_idle_timeout: Duration,
+
+    /// How long to wait for an upstream to acknowledge a SUBSCRIBE before giving
+    /// up. Must be non-zero; [`Relay::new_with_tuning`] rejects zero.
+    pub subscribe_timeout: Duration,
+}
+
+impl Default for RelayTuning {
+    fn default() -> Self {
+        Self {
+            cache_idle_timeout: DEFAULT_CACHE_IDLE_TIMEOUT,
+            subscribe_timeout: DEFAULT_SUBSCRIBE_TIMEOUT,
+        }
+    }
+}
+
+impl RelayTuning {
+    /// Set how long an unwatched cached track is retained before its upstream
+    /// subscription is released. Zero disables eviction.
+    pub fn with_cache_idle_timeout(mut self, cache_idle_timeout: Duration) -> Self {
+        self.cache_idle_timeout = cache_idle_timeout;
+        self
+    }
+
+    /// Set how long to wait for an upstream to acknowledge a SUBSCRIBE.
+    pub fn with_subscribe_timeout(mut self, subscribe_timeout: Duration) -> Self {
+        self.subscribe_timeout = subscribe_timeout;
+        self
     }
 }
 
@@ -95,24 +144,31 @@ pub struct Relay {
     remotes: RemoteManager,
     upstream_namespaces: UpstreamNamespaces,
     upstream_namespaces_runner: UpstreamNamespacesRunner,
+    tuning: RelayTuning,
 }
 
 impl Relay {
     pub fn new(config: RelayConfig) -> anyhow::Result<Self> {
-        Self::new_with_cache_idle_timeout(config, DEFAULT_CACHE_IDLE_TIMEOUT)
+        Self::new_with_tuning(config, RelayTuning::default())
     }
 
-    /// Create a relay that releases upstream subscriptions for cached tracks that
-    /// have had no downstream subscribers for `cache_idle_timeout`.
+    /// Create a relay with non-default [`RelayTuning`].
     ///
     /// The relay caches tracks it does not publish itself so multiple downstream
-    /// subscribers can share one upstream subscription. Without a timeout that
-    /// subscription outlives the last subscriber and the relay keeps receiving a
-    /// track nobody is watching. A zero timeout restores that behaviour.
-    pub fn new_with_cache_idle_timeout(
-        mut config: RelayConfig,
-        cache_idle_timeout: Duration,
-    ) -> anyhow::Result<Self> {
+    /// subscribers can share one upstream subscription. Without an idle timeout
+    /// that subscription outlives the last subscriber and the relay keeps
+    /// receiving a track nobody is watching; a zero `cache_idle_timeout` restores
+    /// that behaviour.
+    ///
+    /// Returns an error if `tuning.subscribe_timeout` is zero. Waiting forever
+    /// for an upstream to acknowledge a SUBSCRIBE is never the intent, and an
+    /// unbounded wait on a peer is what this timeout exists to prevent, so there
+    /// is deliberately no "disabled" setting.
+    pub fn new_with_tuning(mut config: RelayConfig, tuning: RelayTuning) -> anyhow::Result<Self> {
+        if tuning.subscribe_timeout.is_zero() {
+            anyhow::bail!("subscribe_timeout must be non-zero");
+        }
+
         if config.bind.is_some() && !config.endpoints.is_empty() {
             anyhow::bail!("cannot specify both bind and endpoints");
         }
@@ -141,7 +197,7 @@ impl Relay {
             tracing::info!("mlog output enabled: {}", mlog_dir.display());
         }
 
-        let locals = Locals::with_cache_idle_timeout(cache_idle_timeout);
+        let locals = Locals::with_cache_idle_timeout(tuning.cache_idle_timeout);
 
         // FIXME(itzmanish): have a generic filter to find endpoints for forward, remote etc.
         let remote_clients = config
@@ -156,7 +212,8 @@ impl Relay {
             remote_clients,
             config.session,
         )
-        .with_cache_idle_timeout(cache_idle_timeout);
+        .with_cache_idle_timeout(tuning.cache_idle_timeout)
+        .with_subscribe_timeout(tuning.subscribe_timeout);
         let (upstream_namespaces, upstream_namespaces_runner) =
             UpstreamNamespaces::new(locals.clone(), remotes.clone(), config.coordinator.clone());
 
@@ -166,6 +223,7 @@ impl Relay {
             remotes,
             upstream_namespaces,
             upstream_namespaces_runner,
+            tuning,
         })
     }
 
@@ -177,6 +235,7 @@ impl Relay {
             remotes,
             upstream_namespaces,
             upstream_namespaces_runner,
+            tuning,
         } = self;
 
         let RelayConfig {
@@ -252,14 +311,17 @@ impl Relay {
                         upstream_namespaces.clone(),
                         forward_context.clone(),
                     )),
-                    consumer: Some(Consumer::new(
-                        subscriber,
-                        locals.clone(),
-                        forward_coordinator,
-                        remote_manager.clone(),
-                        None,
-                        forward_context,
-                    )),
+                    consumer: Some(
+                        Consumer::new(
+                            subscriber,
+                            locals.clone(),
+                            forward_coordinator,
+                            remote_manager.clone(),
+                            None,
+                            forward_context,
+                        )
+                        .with_subscribe_timeout(tuning.subscribe_timeout),
+                    ),
                     // Forward connections are always full read-write relay peers,
                     // so no reject loops needed.
                     reject_publishes: None,
@@ -434,7 +496,7 @@ impl Relay {
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context)), None)
+                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context).with_subscribe_timeout(tuning.subscribe_timeout)), None)
                             } else {
                                 (None, subscriber)
                             };
@@ -476,5 +538,142 @@ impl Relay {
 
         remotes.shutdown().await;
         run_result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use moq_transport::coding::TrackNamespace;
+
+    use crate::{
+        CoordinatorContext, CoordinatorError, CoordinatorResult, NamespaceOrigin,
+        NamespaceRegistration,
+    };
+
+    /// Enough of a coordinator to construct a `RelayConfig`.
+    struct StubCoordinator;
+
+    #[async_trait::async_trait]
+    impl Coordinator for StubCoordinator {
+        async fn register_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+            _context: &CoordinatorContext,
+        ) -> CoordinatorResult<NamespaceRegistration> {
+            Ok(NamespaceRegistration::new(()))
+        }
+
+        async fn unregister_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> CoordinatorResult<()> {
+            Ok(())
+        }
+
+        async fn lookup(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+            Err(CoordinatorError::NamespaceNotFound)
+        }
+    }
+
+    /// No `bind` and no `endpoints`, so construction always fails — the point is
+    /// *which* error it fails with.
+    fn minimal_config() -> RelayConfig {
+        RelayConfig {
+            bind: None,
+            endpoints: vec![],
+            tls: moq_native_ietf::tls::Args::default()
+                .load()
+                .expect("default TLS config"),
+            qlog_dir: None,
+            mlog_dir: None,
+            announce: None,
+            node: None,
+            coordinator: Arc::new(StubCoordinator),
+            session: SessionConfig::default(),
+            connection_tagger: None,
+        }
+    }
+
+    /// `Relay` is not `Debug`, so `expect_err` is unavailable.
+    fn construction_error(result: anyhow::Result<Relay>) -> String {
+        match result {
+            Ok(_) => panic!("expected relay construction to fail"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn default_tuning_matches_the_documented_defaults() {
+        let tuning = RelayTuning::default();
+        assert_eq!(tuning.cache_idle_timeout, DEFAULT_CACHE_IDLE_TIMEOUT);
+        assert_eq!(tuning.subscribe_timeout, DEFAULT_SUBSCRIBE_TIMEOUT);
+        assert_eq!(tuning.subscribe_timeout, Duration::from_secs(10));
+    }
+
+    /// Both knobs are `Duration`, so a builder assigning to the wrong field would
+    /// compile and silently mis-tune the relay.
+    #[test]
+    fn each_builder_sets_only_its_own_knob() {
+        let base = RelayTuning::default();
+
+        let idle = base.with_cache_idle_timeout(Duration::from_secs(7));
+        assert_eq!(idle.cache_idle_timeout, Duration::from_secs(7));
+        assert_eq!(idle.subscribe_timeout, base.subscribe_timeout);
+
+        let subscribe = base.with_subscribe_timeout(Duration::from_secs(3));
+        assert_eq!(subscribe.subscribe_timeout, Duration::from_secs(3));
+        assert_eq!(subscribe.cache_idle_timeout, base.cache_idle_timeout);
+    }
+
+    /// There is deliberately no "disabled" setting: an unbounded wait on a peer is
+    /// exactly what the timeout exists to prevent.
+    #[test]
+    fn a_zero_subscribe_timeout_is_rejected() {
+        let tuning = RelayTuning::default().with_subscribe_timeout(Duration::ZERO);
+
+        let err = construction_error(Relay::new_with_tuning(minimal_config(), tuning));
+
+        assert!(
+            err.contains("subscribe_timeout"),
+            "expected a subscribe_timeout error, got: {err}"
+        );
+    }
+
+    /// The counterpart to the above: with a valid timeout, construction gets far
+    /// enough to fail on the missing endpoints instead. This pins the rejection to
+    /// the timeout rather than to any config being invalid.
+    #[test]
+    fn a_nonzero_subscribe_timeout_passes_validation() {
+        let err = construction_error(Relay::new_with_tuning(
+            minimal_config(),
+            RelayTuning::default(),
+        ));
+
+        assert!(
+            err.contains("no endpoints"),
+            "expected to fail past timeout validation, got: {err}"
+        );
+    }
+
+    /// A zero cache idle timeout stays legal: it means "never evict", which is the
+    /// pre-existing behaviour and a reasonable thing to ask for.
+    #[test]
+    fn a_zero_cache_idle_timeout_is_still_allowed() {
+        let tuning = RelayTuning::default().with_cache_idle_timeout(Duration::ZERO);
+
+        let err = construction_error(Relay::new_with_tuning(minimal_config(), tuning));
+
+        assert!(
+            err.contains("no endpoints"),
+            "a zero cache idle timeout must not be rejected, got: {err}"
+        );
     }
 }

@@ -12,7 +12,7 @@ use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
-use moq_relay_ietf::{Coordinator, Relay, RelayConfig, SessionConfig, Web, WebConfig};
+use moq_relay_ietf::{Coordinator, Relay, RelayConfig, RelayTuning, SessionConfig, Web, WebConfig};
 use std::time::Duration;
 
 #[derive(Parser, Clone)]
@@ -42,6 +42,12 @@ pub struct Cli {
     /// subscriptions for the lifetime of the upstream session.
     #[arg(long, default_value_t = 30)]
     pub cache_idle_timeout: u64,
+
+    /// Seconds to wait for an upstream to acknowledge a SUBSCRIBE before giving
+    /// up. Must be at least 1: an unbounded wait on a peer is what this timeout
+    /// exists to prevent, so there is no "disabled" setting.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
+    pub subscribe_timeout: u64,
 
     /// Forward all PUBLISH_NAMESPACE messages to the provided server for auth/routing.
     /// If not provided, the relay accepts every unique namespace publish.
@@ -195,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create a QUIC server for media.
-    let relay = Relay::new_with_cache_idle_timeout(
+    let relay = Relay::new_with_tuning(
         RelayConfig {
             tls: tls.clone(),
             bind: Some(cli.bind),
@@ -213,7 +219,9 @@ async fn main() -> anyhow::Result<()> {
             // meshes supply a tagger to mark internal peers.
             connection_tagger: None,
         },
-        Duration::from_secs(cli.cache_idle_timeout),
+        RelayTuning::default()
+            .with_cache_idle_timeout(Duration::from_secs(cli.cache_idle_timeout))
+            .with_subscribe_timeout(Duration::from_secs(cli.subscribe_timeout)),
     )?;
 
     if cli.dev {
@@ -243,5 +251,21 @@ mod tests {
         let cli = Cli::try_parse_from(["moq-relay-ietf", "--max-request-id", "7"]).unwrap();
 
         assert_eq!(cli.max_request_id, 7);
+    }
+
+    #[test]
+    fn subscribe_timeout_defaults_to_ten_seconds() {
+        let cli = Cli::try_parse_from(["moq-relay-ietf"]).unwrap();
+
+        assert_eq!(cli.subscribe_timeout, 10);
+    }
+
+    /// Unlike --cache-idle-timeout, where zero meaningfully means "never evict",
+    /// a zero subscribe timeout would restore the unbounded wait this flag exists
+    /// to prevent.
+    #[test]
+    fn a_zero_subscribe_timeout_is_rejected() {
+        assert!(Cli::try_parse_from(["moq-relay-ietf", "--subscribe-timeout", "0"]).is_err());
+        assert!(Cli::try_parse_from(["moq-relay-ietf", "--cache-idle-timeout", "0"]).is_ok());
     }
 }

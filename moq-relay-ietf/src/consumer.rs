@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
@@ -13,7 +14,8 @@ use moq_transport::{
 use tokio::sync::Semaphore;
 
 use crate::{
-    metrics::GaugeGuard, Coordinator, Locals, Producer, RemoteManager, SessionContext, TrackRequest,
+    metrics::GaugeGuard, Coordinator, Locals, Producer, RemoteManager, SessionContext,
+    TrackRequest, DEFAULT_SUBSCRIBE_TIMEOUT,
 };
 
 const MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION: usize = 1024;
@@ -31,6 +33,9 @@ pub struct Consumer {
     /// Relay-level context for this MoQT session.
     context: SessionContext,
     publish_track_permits: Arc<Semaphore>,
+    /// How long to wait for the upstream to acknowledge a SUBSCRIBE before
+    /// giving up. Never zero.
+    subscribe_timeout: Duration,
 }
 
 impl Consumer {
@@ -50,7 +55,17 @@ impl Consumer {
             forward,
             context,
             publish_track_permits: Arc::new(Semaphore::new(MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION)),
+            subscribe_timeout: DEFAULT_SUBSCRIBE_TIMEOUT,
         }
+    }
+
+    /// Set how long to wait for the upstream to acknowledge a SUBSCRIBE.
+    ///
+    /// A builder method rather than a `new()` parameter so that existing callers
+    /// of [`Consumer::new`] keep compiling.
+    pub fn with_subscribe_timeout(mut self, subscribe_timeout: Duration) -> Self {
+        self.subscribe_timeout = subscribe_timeout;
+        self
     }
 
     /// Run the consumer to handle inbound PUBLISH_NAMESPACE and PUBLISH requests.
@@ -258,6 +273,7 @@ impl Consumer {
                 },
                 Some(TrackRequest { writer, lease, upstream }) = requests.recv() => {
                     let mut subscriber = self.subscriber.clone();
+                    let subscribe_timeout = self.subscribe_timeout;
 
                     tasks.push(async move {
                         let info = writer.info.clone();
@@ -276,22 +292,62 @@ impl Consumer {
                         // `subscribe_open` resolves once the upstream publisher
                         // answers, so its outcome is exactly what downstream
                         // subscribers are waiting on to satisfy draft-16 §8.4.
-                        let subscribe = match subscriber.subscribe_open(writer).await {
-                            Ok(subscribe) => {
-                                upstream.established();
-                                subscribe
-                            }
-                            Err(err) => {
-                                tracing::warn!(
+                        // An upstream is under no obligation to ever answer, so
+                        // the handshake is bounded two ways. Left unbounded it
+                        // would pin this task, the `TrackWriter` it carries, and
+                        // every downstream subscriber waiting on `upstream`, until
+                        // the session died.
+                        //
+                        // - `lease.released()` covers "nobody downstream is waiting
+                        //   for this track any more", which is the condition that
+                        //   actually matters and needs no arbitrary constant.
+                        // - `subscribe_timeout` covers the rest: a subscriber that
+                        //   is still waiting cannot wait forever on a peer that
+                        //   never answers.
+                        //
+                        // Either way the in-flight future is dropped, which drops
+                        // the `Subscribe`, whose `Drop` sends UNSUBSCRIBE — so
+                        // giving up mid-handshake leaves nothing dangling upstream.
+                        let subscribe = tokio::select! {
+                            result = tokio::time::timeout(subscribe_timeout, subscriber.subscribe_open(writer)) => match result {
+                                Ok(Ok(subscribe)) => {
+                                    upstream.established();
+                                    subscribe
+                                }
+                                Ok(Err(err)) => {
+                                    tracing::warn!(
+                                        namespace = %namespace,
+                                        track = %track_name,
+                                        error = %err,
+                                        "failed forwarding subscribe: {:?}", info
+                                    );
+                                    // Release waiting downstream subscribers with the
+                                    // upstream reason so they get a REQUEST_ERROR that
+                                    // matches it, rather than a premature accept.
+                                    upstream.failed(err);
+                                    return Ok(());
+                                }
+                                Err(_elapsed) => {
+                                    tracing::warn!(
+                                        namespace = %namespace,
+                                        track = %track_name,
+                                        timeout = ?subscribe_timeout,
+                                        "upstream did not acknowledge SUBSCRIBE in time: {:?}", info
+                                    );
+                                    metrics::counter!("moq_relay_subscribe_timeouts_total", "source" => "local").increment(1);
+                                    upstream.failed(ServeError::Closed(RequestErrorCode::Timeout as u64));
+                                    return Ok(());
+                                }
+                            },
+                            // Counted by the eviction itself in `Locals`. Dropping
+                            // `upstream` unresolved releases any straggler
+                            // downstream subscriber with an error.
+                            _ = lease.released() => {
+                                tracing::info!(
                                     namespace = %namespace,
                                     track = %track_name,
-                                    error = %err,
-                                    "failed forwarding subscribe: {:?}", info
+                                    "abandoning upstream subscribe for idle cached track"
                                 );
-                                // Release waiting downstream subscribers with the
-                                // upstream reason so they get a REQUEST_ERROR that
-                                // matches it, rather than a premature accept.
-                                upstream.failed(err);
                                 return Ok(());
                             }
                         };
