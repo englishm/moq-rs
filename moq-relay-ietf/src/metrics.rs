@@ -108,6 +108,10 @@ pub fn describe_metrics() {
         "moq_relay_subscribe_timeouts_total",
         "Upstream subscriptions abandoned because SUBSCRIBE was not acknowledged within the configured timeout, by source (local, remote)"
     );
+    describe_counter!(
+        "moq_relay_remote_cache_evictions_total",
+        "Peer relay connections closed to keep the connection pool within its limit"
+    );
 
     // Gauges
     describe_gauge!(
