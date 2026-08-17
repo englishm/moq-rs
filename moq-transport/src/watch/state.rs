@@ -63,6 +63,31 @@ pub enum StateError {
     Poisoned,
 }
 
+/// Take the inner lock, recovering if a previous holder panicked.
+///
+/// Poisoning means another task panicked while holding this state, which has
+/// already failed whatever that task was doing. One `State` is shared by every
+/// subscription, track reader and waiter hanging off it, so propagating the
+/// poison would turn one failed request into a panic in every unrelated task that
+/// later touches the same state. Recovering keeps the damage where it started.
+///
+/// The state may be a half-finished update, which is why this is logged rather
+/// than passed over in silence. The poison flag is cleared so the log records one
+/// line per incident instead of one per access for the rest of the process's life.
+///
+/// Callers that would rather decide for themselves have [`State::try_lock`] and
+/// [`State::try_lock_mut`], which still report [`StateError::Poisoned`].
+fn lock_recovering<T>(state: &Mutex<StateInner<T>>) -> MutexGuard<'_, StateInner<T>> {
+    match state.lock() {
+        Ok(lock) => lock,
+        Err(poisoned) => {
+            state.clear_poison();
+            tracing::error!("recovered a poisoned watch state: a task panicked while holding it");
+            poisoned.into_inner()
+        }
+    }
+}
+
 impl<T> State<T> {
     pub fn new(initial: T) -> Self {
         let state = Arc::new(Mutex::new(StateInner::new(initial)));
@@ -77,7 +102,7 @@ impl<T> State<T> {
         StateRef {
             state: self.state.clone(),
             drop: self.drop.clone(),
-            lock: self.state.lock().unwrap(),
+            lock: lock_recovering(&self.state),
         }
     }
 
@@ -91,7 +116,7 @@ impl<T> State<T> {
     }
 
     pub fn lock_mut(&self) -> Option<StateMut<'_, T>> {
-        let lock = self.state.lock().unwrap();
+        let lock = lock_recovering(&self.state);
         lock.dropped?;
         Some(StateMut {
             lock,
@@ -244,7 +269,7 @@ impl<T> Future for StateChanged<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
         // TODO is there an API we can make that doesn't drop this lock?
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock_recovering(&self.state);
 
         if state.epoch > self.epoch {
             task::Poll::Ready(())
@@ -285,11 +310,93 @@ struct StateDrop<T> {
 
 impl<T> Drop for StateDrop<T> {
     fn drop(&mut self) {
-        let Ok(mut state) = self.state.lock() else {
-            tracing::error!("watch state lock poisoned while dropping state");
-            return;
-        };
+        // Recovering rather than bailing out: skipping the notify below would
+        // leave every task awaiting this state parked forever, so one panic
+        // elsewhere would hang the subscriptions built on it.
+        let mut state = lock_recovering(&self.state);
         state.dropped = None;
         state.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run `f` on another thread and let it panic there, returning once the panic
+    /// has unwound. The state's mutex is poisoned from then on.
+    fn panic_while_holding(f: impl FnOnce() + Send + 'static) {
+        let previous = std::panic::take_hook();
+        // The panic is the point of the test, so keep its backtrace out of the
+        // test output.
+        std::panic::set_hook(Box::new(|_| {}));
+        let joined = std::thread::spawn(f).join();
+        std::panic::set_hook(previous);
+        assert!(joined.is_err(), "the helper thread was supposed to panic");
+    }
+
+    /// A panic while holding the state used to poison the mutex and turn every
+    /// later access into a panic of its own. One state is shared by every reader
+    /// and waiter built on it, so that spread a single failed request across all
+    /// of them.
+    #[test]
+    fn a_panic_under_the_lock_does_not_spread() {
+        let state = State::new(1u32);
+
+        let poisoner = state.clone();
+        panic_while_holding(move || {
+            let mut guard = poisoner.lock_mut().expect("state is live");
+            *guard = 2;
+            panic!("while holding the state");
+        });
+
+        assert_eq!(*state.lock(), 2, "the completed write is still visible");
+
+        let mut guard = state.lock_mut().expect("mutation still works afterwards");
+        *guard = 3;
+        drop(guard);
+        assert_eq!(*state.lock(), 3);
+    }
+
+    /// Callers that want to know are still told, which is what `queue.rs` and the
+    /// PUBLISH paths rely on. Only the first recovery clears the flag, so this
+    /// runs before anything calls `lock`.
+    #[test]
+    fn try_lock_still_reports_poisoning() {
+        let state = State::new(1u32);
+
+        let poisoner = state.clone();
+        panic_while_holding(move || {
+            let _guard = poisoner.lock_mut().expect("state is live");
+            panic!("while holding the state");
+        });
+
+        assert_eq!(state.try_lock().err(), Some(StateError::Poisoned));
+    }
+
+    /// Dropping the state has to wake its waiters even when the lock was
+    /// poisoned first. Bailing out of the drop instead skipped the notify, so
+    /// anything awaiting the state waited for a change that could never come.
+    ///
+    /// The panic here holds a shared `StateRef` on purpose. A `StateMut` notifies
+    /// as it unwinds, which wakes the waiter for an unrelated reason and would
+    /// let this pass either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_poisoned_state_still_wakes_waiters() {
+        let (writer, reader) = State::new(1u32).split();
+
+        let changed = reader.lock().modified().expect("state is live");
+
+        let poisoner = reader.clone();
+        panic_while_holding(move || {
+            let _guard = poisoner.lock();
+            panic!("while holding the state");
+        });
+
+        drop(writer);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), changed)
+            .await
+            .expect("dropping the state wakes the waiter");
     }
 }
