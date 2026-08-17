@@ -12,22 +12,148 @@ use std::{
 use tokio::sync::Notify;
 
 use crate::{
-    coding::{Decode, TrackName, TrackNamespace},
+    coding::{Decode, KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix},
     data,
-    message::{self, Message},
+    message::{self, Message, SubscribeOptions},
     mlog,
-    serve::{self, ServeError},
+    serve::{self, FullTrackName, ServeError},
 };
 
 use crate::watch::Queue;
 
 use super::{
-    PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, Session, SessionError,
-    Subscribe, SubscribeRecv, Writer,
+    PublishReceived, PublishReceivedRecv, PublishedNamespace, PublishedNamespaceRecv, Reader,
+    RequestId, Session, SessionError, Subscribe, SubscribeNamespace, SubscribeNamespaceInfo,
+    SubscribeRecv, Writer,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
 const DEFAULT_ALIAS_WAIT_TIME_MS: u64 = 1000;
+
+/// Rolls back a SUBSCRIBE_NAMESPACE prefix reservation if the request never
+/// gets off the ground.
+///
+/// `subscribe_namespace()` reserves the prefix before opening the request
+/// stream so concurrent callers see the overlap immediately. If the open then
+/// fails, dropping this guard releases the reservation. On success the guard is
+/// [`disarm`](Self::disarm)ed and cleanup passes to `SubscribeNamespaceRecv`,
+/// whose `Drop` removes the entry when the subscription ends.
+struct SubscribeNamespaceCleanup {
+    subscriber: Subscriber,
+    request_id: u64,
+    active: bool,
+}
+
+impl SubscribeNamespaceCleanup {
+    fn new(subscriber: Subscriber, request_id: u64) -> Self {
+        Self {
+            subscriber,
+            request_id,
+            active: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for SubscribeNamespaceCleanup {
+    fn drop(&mut self) {
+        if self.active {
+            self.subscriber.remove_subscribe_namespace(self.request_id);
+        }
+    }
+}
+
+/// Which subscription owns a given Track Alias (draft-16 §10.1).
+///
+/// SUBSCRIBE and PUBLISH share one session-scoped alias namespace, so a single
+/// registry keyed by alias resolves inbound streams and datagrams to the right
+/// receiver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrackOrigin {
+    /// Alias belongs to an outbound SUBSCRIBE; carries the subscribe request id.
+    Subscribe(u64),
+    /// Alias belongs to an inbound PUBLISH; carries the PUBLISH request id.
+    Publish(u64),
+}
+
+impl TrackOrigin {
+    fn request_id(self) -> u64 {
+        match self {
+            Self::Subscribe(id) | Self::Publish(id) => id,
+        }
+    }
+}
+
+#[derive(Default)]
+struct TrackAliasRegistry {
+    by_alias: HashMap<u64, TrackOrigin>,
+    by_request_id: HashMap<u64, u64>,
+}
+
+impl TrackAliasRegistry {
+    fn contains_alias(&self, alias: u64) -> bool {
+        self.by_alias.contains_key(&alias)
+    }
+
+    fn get(&self, alias: u64) -> Option<TrackOrigin> {
+        self.by_alias.get(&alias).copied()
+    }
+
+    fn insert(&mut self, alias: u64, origin: TrackOrigin) -> Result<(), SessionError> {
+        if self.by_alias.contains_key(&alias) {
+            return Err(SessionError::Duplicate);
+        }
+
+        if let Some(old_alias) = self.by_request_id.insert(origin.request_id(), alias) {
+            self.by_alias.remove(&old_alias);
+        }
+        self.by_alias.insert(alias, origin);
+        Ok(())
+    }
+
+    fn remove_by_request_id(&mut self, request_id: u64) -> Option<TrackOrigin> {
+        let alias = self.by_request_id.remove(&request_id)?;
+        self.by_alias.remove(&alias)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.by_alias.is_empty() && self.by_request_id.is_empty()
+    }
+}
+
+/// Tracks that this endpoint already subscribes to, whether via an outbound
+/// SUBSCRIBE or an inbound PUBLISH. Draft-16 §5.1 allows only one
+/// subscriber-role subscription per track.
+#[derive(Default)]
+struct SubscriberNameRegistry {
+    by_name: HashMap<FullTrackName, u64>,
+    by_request_id: HashMap<u64, FullTrackName>,
+}
+
+impl SubscriberNameRegistry {
+    fn contains_name(&self, name: &FullTrackName) -> bool {
+        self.by_name.contains_key(name)
+    }
+
+    fn insert(&mut self, name: FullTrackName, request_id: u64) {
+        if let Some(old_name) = self.by_request_id.insert(request_id, name.clone()) {
+            self.by_name.remove(&old_name);
+        }
+        if let Some(old_id) = self.by_name.insert(name, request_id) {
+            self.by_request_id.remove(&old_id);
+        }
+    }
+
+    fn remove_by_request_id(&mut self, request_id: u64) -> Option<FullTrackName> {
+        let name = self.by_request_id.remove(&request_id)?;
+        self.by_name.remove(&name);
+        Some(name)
+    }
+}
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -41,11 +167,26 @@ pub struct Subscriber {
     /// The currently active outbound subscribes, keyed by request id.
     subscribes: Arc<Mutex<HashMap<u64, SubscribeRecv>>>,
 
-    /// Map of track alias to subscription id for quick lookup when receiving streams/datagrams.
-    subscribe_alias_map: Arc<Mutex<HashMap<u64, u64>>>,
+    /// Prefixes of active outbound SUBSCRIBE_NAMESPACE requests, keyed by
+    /// request id. Used to reject locally-overlapping prefixes (§5.1).
+    subscribe_namespaces: Arc<Mutex<HashMap<u64, TrackNamespacePrefix>>>,
 
-    /// Notify when subscribe alias map is updated
-    subscribe_alias_notify: Arc<Notify>,
+    /// Track Alias to owning subscription, for routing inbound streams and
+    /// datagrams. Shared by outbound SUBSCRIBE and inbound PUBLISH.
+    track_alias_map: Arc<Mutex<TrackAliasRegistry>>,
+
+    /// Notify when `track_alias_map` is updated, for stream and datagram
+    /// routing that can arrive before the alias is registered.
+    track_alias_notify: Arc<Notify>,
+
+    /// Tracks this endpoint subscribes to, for the §5.1 duplicate check.
+    subscriber_names: Arc<Mutex<SubscriberNameRegistry>>,
+
+    /// Transport-side state for inbound PUBLISH requests, keyed by request id.
+    publishes_received: Arc<Mutex<HashMap<u64, PublishReceivedRecv>>>,
+
+    /// Inbound PUBLISH requests waiting to be consumed by the application.
+    publish_received_queue: Queue<PublishReceived>,
 
     /// The queue we will write any outbound control messages we want to send, the session run_send task
     /// will process the queue and send the message on the control stream.
@@ -82,12 +223,16 @@ impl Subscriber {
             published_namespaces: Default::default(),
             published_namespace_queue: Default::default(),
             subscribes: Default::default(),
-            subscribe_alias_map: Default::default(),
+            subscribe_namespaces: Default::default(),
             outgoing,
             webtransport,
             request_id,
             mlog,
-            subscribe_alias_notify: Arc::new(Notify::new()),
+            track_alias_map: Default::default(),
+            track_alias_notify: Arc::new(Notify::new()),
+            subscriber_names: Default::default(),
+            publishes_received: Default::default(),
+            publish_received_queue: Default::default(),
             bidi_task_tx,
         }
     }
@@ -214,6 +359,26 @@ impl Subscriber {
         let request_id = self
             .get_next_request_id()
             .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
+
+        // §5.1: at most one subscriber-role subscription per track. Outbound
+        // SUBSCRIBE and inbound PUBLISH both make this endpoint the subscriber,
+        // so they share one registry. Reserved before the stream is opened;
+        // `remove_subscribe` releases it.
+        let full_name = FullTrackName {
+            namespace: track.namespace.clone(),
+            name: track.name.clone(),
+        };
+        {
+            let mut names = self
+                .subscriber_names
+                .lock()
+                .map_err(|_| ServeError::internal_ctx("subscriber_names lock poisoned"))?;
+            if names.contains_name(&full_name) {
+                return Err(ServeError::Duplicate);
+            }
+            names.insert(full_name, request_id);
+        }
+
         let (send, recv, subscribe) = Subscribe::new(self.clone(), request_id, track);
 
         // Open a bidi stream and send the SUBSCRIBE message BEFORE
@@ -222,12 +387,19 @@ impl Subscriber {
         // Subscribe::new, so it is not reconstructed here. The request writer
         // (send side) is held here so error paths can finish it explicitly.
         let subscribe_msg: Message = subscribe.into();
-        let (mut request_writer, mut response_reader) = self
-            .open_request_stream(&subscribe_msg)
-            .await
-            .map_err(|e| {
-                ServeError::internal_ctx(format!("failed to open request stream: {}", e))
-            })?;
+        let (mut request_writer, mut response_reader) =
+            match self.open_request_stream(&subscribe_msg).await {
+                Ok(streams) => streams,
+                Err(e) => {
+                    if let Ok(mut names) = self.subscriber_names.lock() {
+                        names.remove_by_request_id(request_id);
+                    }
+                    return Err(ServeError::internal_ctx(format!(
+                        "failed to open request stream: {}",
+                        e
+                    )));
+                }
+            };
 
         // Register the response state. If the lock is poisoned after the stream
         // is open, cleanly finish the send side (FIN) before bailing instead of
@@ -241,7 +413,10 @@ impl Subscriber {
                     request_id,
                     "subscribes lock poisoned after bidi stream open; finishing stream"
                 );
-                request_writer.finish();
+                if let Ok(mut names) = self.subscriber_names.lock() {
+                    names.remove_by_request_id(request_id);
+                }
+                let _ = request_writer.finish();
                 return Err(ServeError::internal_ctx("subscribe lock poisoned"));
             }
         }
@@ -251,22 +426,27 @@ impl Subscriber {
         // No task is spawned; the future is dropped/cancelled on session exit.
         let mut subscriber_clone = self.clone();
         let _ = self.bidi_task_tx.send(Box::pin(async move {
-            loop {
+            let result = loop {
                 match Session::decode_bidi_response(&mut response_reader, request_id).await {
                     Ok(msg) => {
                         if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg) {
-                            if let Err(e) = subscriber_clone.recv_message(pub_msg) {
-                                tracing::warn!(error = %e, "error handling bidi response");
-                                break;
+                            // Returning rather than breaking lets Session::run decide:
+                            // a protocol violation closes the session, anything else is
+                            // logged there and only this stream ends.
+                            if let Err(err) = subscriber_clone.recv_message(pub_msg) {
+                                break Err(err);
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::debug!(error = %e, request_id, "bidi response reader ended");
-                        break;
-                    }
+                    Err(err) if err.is_stream_ended() => break Ok(()),
+                    Err(err) => break Err(err),
                 }
-            }
+            };
+
+            // Runs on every exit path. Harmless once the subscription is
+            // established, since the entry is gone by then.
+            subscriber_clone.abort_subscribe(request_id);
+            result
         }));
 
         // Cleanly finish (FIN) the request stream's send side now that the
@@ -274,10 +454,91 @@ impl Subscriber {
         // Placed before `send.ok().await?` so the FIN is sent on every exit
         // path that holds the writer — both the happy path and a failed ack —
         // rather than letting the drop emit RESET_STREAM(0).
-        request_writer.finish();
+        if let Err(err) = request_writer.finish() {
+            tracing::debug!(request_id, error = %err, "failed to FIN SUBSCRIBE request stream");
+        }
 
         send.ok().await?;
         Ok(send)
+    }
+
+    /// Subscribe to namespace announcements under a prefix (draft-18 §10.18).
+    ///
+    /// The request gets its own bidirectional stream. REQUEST_OK / REQUEST_ERROR
+    /// and the subsequent NAMESPACE / NAMESPACE_DONE feed all arrive on that
+    /// stream, so the returned handle only progresses while `Session::run` is
+    /// being polled.
+    pub async fn subscribe_namespace(
+        &mut self,
+        namespace_prefix: TrackNamespacePrefix,
+        subscribe_options: SubscribeOptions,
+        params: KeyValuePairs,
+    ) -> Result<SubscribeNamespace, SessionError> {
+        let request_id = self.get_next_request_id()?;
+
+        {
+            let mut prefixes = self
+                .subscribe_namespaces
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            if prefixes
+                .values()
+                .any(|existing| existing.overlaps(&namespace_prefix))
+            {
+                return Err(SessionError::Serve(ServeError::Duplicate));
+            }
+            prefixes.insert(request_id, namespace_prefix.clone());
+        }
+        let cleanup = SubscribeNamespaceCleanup::new(self.clone(), request_id);
+
+        let msg = message::SubscribeNamespace {
+            id: request_id,
+            track_namespace_prefix: namespace_prefix.clone(),
+            subscribe_options,
+            params,
+        };
+        self.add_mlog_event(|time| mlog::events::subscribe_namespace_created(time, 0, &msg));
+
+        let (writer, reader) = self
+            .open_request_stream(&Message::SubscribeNamespace(msg))
+            .await?;
+
+        let info = SubscribeNamespaceInfo {
+            request_id,
+            namespace_prefix,
+            subscribe_options,
+        };
+        let (send, recv) = SubscribeNamespace::new(self.clone(), info, writer);
+
+        // The response reader is polled by `Session::run` (structured
+        // concurrency): no task is spawned, so it cannot outlive the session.
+        let mlog = self.mlog.clone();
+        if self
+            .bidi_task_tx
+            .send(Box::pin(async move {
+                match recv.run(reader, mlog).await {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.is_stream_ended() => {
+                        tracing::debug!(request_id, error = %err, "SUBSCRIBE_NAMESPACE response reader ended");
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                }
+            }))
+            .is_err()
+        {
+            return Err(SessionError::Internal);
+        }
+
+        cleanup.disarm();
+        Ok(send)
+    }
+
+    /// Drop the prefix reservation for an outbound SUBSCRIBE_NAMESPACE.
+    pub(super) fn remove_subscribe_namespace(&self, request_id: u64) {
+        if let Ok(mut prefixes) = self.subscribe_namespaces.lock() {
+            prefixes.remove(&request_id);
+        }
     }
 
     /// Send a message to the publisher via the control stream.
@@ -302,11 +563,7 @@ impl Subscriber {
             message::Publisher::PublishNamespaceDone(msg) => {
                 self.recv_publish_namespace_done(msg)?;
             }
-            // PUBLISH (publisher-initiated subscription) not yet implemented.
-            // Send REQUEST_ERROR NOT_SUPPORTED so the publisher knows we cannot accept it.
-            message::Publisher::Publish(msg) => {
-                self.send_not_supported(msg.id, "publish");
-            }
+            message::Publisher::Publish(msg) => self.recv_publish(msg)?,
             message::Publisher::PublishDone(msg) => self.recv_publish_done(msg)?,
             message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg)?,
             // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
@@ -323,27 +580,6 @@ impl Subscriber {
         }
 
         Ok(())
-    }
-
-    /// Send REQUEST_ERROR NOT_SUPPORTED for an incoming request we do not implement.
-    ///
-    /// Draft-16 §4: limited endpoints SHOULD respond with NOT_SUPPORTED rather
-    /// than ignoring unsupported request types.
-    fn send_not_supported(&mut self, request_id: u64, request_kind: &str) {
-        tracing::debug!(
-            target: "moq_transport::control",
-            request_id,
-            "sending REQUEST_ERROR NOT_SUPPORTED for unimplemented request"
-        );
-        self.send_request_error(
-            request_kind,
-            message::RequestError {
-                id: request_id,
-                error_code: crate::message::RequestErrorCode::NotSupported as u64,
-                retry_interval: 0,
-                reason: crate::coding::ReasonPhrase("not supported".to_string()),
-            },
-        );
     }
 
     /// Handle reception of an inbound PUBLISH_NAMESPACE from the publisher.
@@ -393,14 +629,22 @@ impl Subscriber {
             .map_err(|_| SessionError::Internal)?
             .get_mut(&msg.id)
         {
-            // Map track alias to subscription id for quick lookup when receiving streams/datagrams
-            self.subscribe_alias_map
-                .lock()
-                .map_err(|_| SessionError::Internal)?
-                .insert(msg.track_alias, msg.id);
+            // Track Aliases are session-scoped (§10.1), so the alias in
+            // SUBSCRIBE_OK must not already be bound by another SUBSCRIBE or an
+            // inbound PUBLISH.
+            {
+                let mut aliases = self
+                    .track_alias_map
+                    .lock()
+                    .map_err(|_| SessionError::Internal)?;
+                if aliases.contains_alias(msg.track_alias) {
+                    return Err(SessionError::Duplicate);
+                }
+                aliases.insert(msg.track_alias, TrackOrigin::Subscribe(msg.id))?;
+            }
 
             // Notify waiting tasks that the alias map has been updated
-            self.subscribe_alias_notify.notify_waiters();
+            self.track_alias_notify.notify_waiters();
 
             // Notify the subscribe of the successful subscription
             subscribe.ok(msg.track_alias)?;
@@ -409,23 +653,63 @@ impl Subscriber {
         Ok(())
     }
 
-    /// Remove a subscribe from our map of active subscribes, and the alias map if present.
+    /// Remove a subscribe from the active map, along with its alias and name
+    /// reservations.
     pub(super) fn remove_subscribe(&mut self, id: u64) -> Option<SubscribeRecv> {
         let subscribe = self.subscribes.lock().ok().and_then(|mut s| s.remove(&id));
-        if let Some(ref sub) = subscribe {
-            if let Some(track_alias) = sub.track_alias() {
-                if let Ok(mut alias_map) = self.subscribe_alias_map.lock() {
-                    alias_map.remove(&track_alias);
-                }
-            }
+        if let Ok(mut aliases) = self.track_alias_map.lock() {
+            aliases.remove_by_request_id(id);
+        }
+        if let Ok(mut names) = self.subscriber_names.lock() {
+            names.remove_by_request_id(id);
         }
         subscribe
     }
 
+    /// Fail an outbound SUBSCRIBE whose request stream ended before the publisher
+    /// answered. Without this an application awaiting `Subscribe::ok()` waits for
+    /// the life of the session on a request that can never be answered. A no-op
+    /// once the subscription has been established and removed by other means.
+    pub(super) fn abort_subscribe(&mut self, id: u64) {
+        let Some(subscribe) = self.remove_subscribe(id) else {
+            return;
+        };
+
+        tracing::debug!(
+            request_id = id,
+            "SUBSCRIBE request stream closed before the publisher responded"
+        );
+        if let Err(err) = subscribe.error(ServeError::Cancel) {
+            tracing::debug!(request_id = id, error = %err, "failed to fail aborted SUBSCRIBE");
+        }
+    }
+
     /// Handle the reception of a PublishDone message from the publisher.
+    ///
+    /// PUBLISH_DONE terminates either a SUBSCRIBE-created subscription or a
+    /// PUBLISH-created one. The request id alone does not say which, so both
+    /// maps are checked.
     fn recv_publish_done(&mut self, msg: &message::PublishDone) -> Result<(), SessionError> {
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
             subscribe.error(ServeError::Closed(msg.status_code))?;
+            return Ok(());
+        }
+
+        let recv = self
+            .publishes_received
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .remove(&msg.id);
+        match recv {
+            Some(mut recv) => {
+                recv.recv_done(msg.status_code);
+                self.clear_subscription_reservations(msg.id)?;
+            }
+            None => tracing::debug!(
+                target: "moq_transport::control",
+                request_id = msg.id,
+                "received PUBLISH_DONE for unknown subscription — ignoring"
+            ),
         }
 
         Ok(())
@@ -474,6 +758,206 @@ impl Subscriber {
         Ok(())
     }
 
+    /// Handle an inbound PUBLISH (draft-16 §9.13).
+    ///
+    /// This establishes a publisher-initiated subscription: the peer offers a
+    /// track and this endpoint becomes its subscriber.
+    fn recv_publish(&mut self, msg: &message::Publish) -> Result<(), SessionError> {
+        // First-cut policy: reject non-empty TrackExtensions. They are not
+        // carried through TrackReader/TrackWriter yet, so accepting them would
+        // silently drop relay-visible metadata (§8.6).
+        if !msg.track_extensions.is_empty() {
+            self.send_request_error(
+                "publish",
+                message::RequestError {
+                    id: msg.id,
+                    error_code: message::RequestErrorCode::NotSupported as u64,
+                    retry_interval: 0,
+                    reason: crate::coding::ReasonPhrase(
+                        "track extensions not supported".to_string(),
+                    ),
+                },
+            );
+            return Ok(());
+        }
+
+        let full_name = FullTrackName {
+            namespace: msg.track_namespace.clone(),
+            name: msg.track_name.clone(),
+        };
+
+        // Parse FORWARD and LARGEST_OBJECT before reserving any session state,
+        // so malformed parameters cannot leave stale alias or name entries.
+        let initial_forward = msg
+            .params
+            .forward()
+            .map_err(SessionError::Decode)?
+            .unwrap_or(true);
+        let largest_location = msg.params.largest_object().map_err(SessionError::Decode)?;
+
+        // Reserve the track name first. The duplicate-subscription check runs
+        // before the alias check on purpose: a duplicate PUBLISH for the same
+        // track is a request error, not a session-closing alias collision.
+        {
+            let mut names = self
+                .subscriber_names
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            if names.contains_name(&full_name) {
+                drop(names);
+                self.send_request_error(
+                    "publish",
+                    message::RequestError {
+                        id: msg.id,
+                        error_code: message::RequestErrorCode::DuplicateSubscription as u64,
+                        retry_interval: 0,
+                        reason: crate::coding::ReasonPhrase("duplicate subscription".to_string()),
+                    },
+                );
+                return Ok(());
+            }
+
+            names.insert(full_name, msg.id);
+        }
+
+        // Reserve the alias without holding subscriber_names, so cleanup and
+        // inbound PUBLISH handling have no lock-order dependency.
+        let alias_result = match self.track_alias_map.lock() {
+            Ok(mut aliases) => {
+                if aliases.contains_alias(msg.track_alias) {
+                    // §9.13: a duplicate Track Alias for a different track
+                    // closes the session.
+                    Err(SessionError::Duplicate)
+                } else {
+                    aliases.insert(msg.track_alias, TrackOrigin::Publish(msg.id))
+                }
+            }
+            Err(_) => Err(SessionError::Internal),
+        };
+        if let Err(err) = alias_result {
+            if let Ok(mut names) = self.subscriber_names.lock() {
+                names.remove_by_request_id(msg.id);
+            }
+            return Err(err);
+        }
+
+        // Allocate the track. The transport owns the writer; the application
+        // gets the reader from PublishReceived::ok.
+        let (writer, reader) =
+            serve::Track::new(msg.track_namespace.clone(), msg.track_name.clone()).produce();
+
+        let (publish_received, recv) = PublishReceivedRecv::produce(
+            self.clone(),
+            msg.id,
+            msg.track_alias,
+            msg.track_namespace.clone(),
+            msg.track_name.clone(),
+            initial_forward,
+            largest_location,
+            writer,
+            reader,
+        );
+
+        // The alias is live before the handle is queued, so Object streams that
+        // race the PUBLISH (§5.1 permits delivery before PUBLISH_OK) resolve.
+        self.track_alias_notify.notify_waiters();
+
+        match self.publishes_received.lock() {
+            Ok(mut publishes_received) => {
+                publishes_received.insert(msg.id, recv);
+            }
+            Err(_) => {
+                self.clear_subscription_reservations(msg.id)?;
+                return Err(SessionError::Internal);
+            }
+        }
+
+        tracing::debug!(
+            target: "moq_transport::control",
+            request_id = msg.id,
+            track_alias = msg.track_alias,
+            namespace = %msg.track_namespace,
+            name = %msg.track_name,
+            forward = initial_forward,
+            "received PUBLISH"
+        );
+
+        // If the application is no longer listening, dropping the handle sends
+        // REQUEST_ERROR back to the publisher.
+        if self.publish_received_queue.push(publish_received).is_err() {
+            self.remove_publish_received(msg.id);
+        }
+
+        Ok(())
+    }
+
+    /// Wait for the next inbound PUBLISH from the peer, if any.
+    ///
+    /// The returned [`PublishReceived`] must be accepted with
+    /// [`PublishReceived::ok`] or dropped to reject.
+    pub async fn publish_received(&mut self) -> Option<PublishReceived> {
+        self.publish_received_queue.pop().await
+    }
+
+    /// Abandon an inbound PUBLISH whose request stream closed without
+    /// PUBLISH_DONE.
+    ///
+    /// Without this the track writer, the Track Alias, and the name
+    /// reservation would all stay held for the life of the session, and the
+    /// application's `PublishReceived::closed()` would never resolve.
+    pub(super) fn abort_publish_received(&self, request_id: u64) {
+        let recv = match self.publishes_received.lock() {
+            Ok(mut map) => map.remove(&request_id),
+            Err(_) => {
+                tracing::error!(request_id, "publishes_received lock poisoned");
+                return;
+            }
+        };
+
+        let Some(mut recv) = recv else {
+            return;
+        };
+
+        tracing::debug!(
+            request_id,
+            "PUBLISH request stream closed without PUBLISH_DONE"
+        );
+        recv.recv_done(message::PublishDoneCode::InternalError as u64);
+        if let Err(err) = self.clear_subscription_reservations(request_id) {
+            tracing::error!(request_id, error = %err, "failed to release inbound PUBLISH reservations");
+        }
+    }
+
+    /// Remove all subscriber-side state for an inbound PUBLISH.
+    ///
+    /// Called by `PublishReceived::drop` when the app did not call `ok()`.
+    pub(super) fn remove_publish_received(&self, request_id: u64) {
+        if let Err(err) = self.remove_publish_received_state(request_id) {
+            tracing::error!(request_id, error = %err, "failed to remove inbound PUBLISH state");
+        }
+    }
+
+    fn remove_publish_received_state(&self, request_id: u64) -> Result<(), SessionError> {
+        self.publishes_received
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .remove(&request_id);
+        self.clear_subscription_reservations(request_id)
+    }
+
+    /// Release the alias and track-name reservations held by one subscription.
+    fn clear_subscription_reservations(&self, request_id: u64) -> Result<(), SessionError> {
+        self.track_alias_map
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .remove_by_request_id(request_id);
+        self.subscriber_names
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .remove_by_request_id(request_id);
+        Ok(())
+    }
+
     /// Map a REQUEST_ERROR to a semantic ServeError so callers see
     /// meaningful variants (e.g. NotFound) instead of opaque error codes.
     fn request_error_to_serve_error(msg: &message::RequestError) -> ServeError {
@@ -506,25 +990,25 @@ impl Subscriber {
         None
     }
 
-    /// Get a subscribe id by track alias, waiting up to the specified timeout if not present.
-    /// If timeout_ms is None, only check if already present and return None if not.
-    async fn get_subscribe_id_by_alias(
+    /// Resolve a Track Alias to its owning subscription, waiting up to the
+    /// given timeout for it to appear. With `None`, check once and return.
+    async fn get_track_origin_by_alias(
         &self,
         track_alias: u64,
         timeout_ms: Option<u64>,
-    ) -> Result<Option<u64>, SessionError> {
+    ) -> Result<Option<TrackOrigin>, SessionError> {
         // If no timeout specified, don't wait
         let timeout_ms = match timeout_ms {
             Some(ms) => ms,
             None => {
                 // Just check once
-                return match self.subscribe_alias_map.lock() {
-                    Ok(aliases) => Ok(aliases.get(&track_alias).cloned()),
+                return match self.track_alias_map.lock() {
+                    Ok(aliases) => Ok(aliases.get(track_alias)),
                     Err(_) => {
                         tracing::error!(
                             target: "moq_transport::control",
                             track_alias,
-                            "subscribe alias map lock poisoned"
+                            "track alias map lock poisoned"
                         );
                         Err(SessionError::Internal)
                     }
@@ -536,24 +1020,24 @@ impl Subscriber {
         let timeout_duration = Duration::from_millis(timeout_ms);
         tokio::time::timeout(timeout_duration, async {
             loop {
-                // Register for notification before checking map
-                let notified = self.subscribe_alias_notify.notified();
+                // Register for notification before checking, to close the
+                // window where the alias lands between check and wait.
+                let notified = self.track_alias_notify.notified();
 
-                // Check Map for alias
-                let id = match self.subscribe_alias_map.lock() {
-                    Ok(aliases) => aliases.get(&track_alias).cloned(),
+                let origin = match self.track_alias_map.lock() {
+                    Ok(aliases) => aliases.get(track_alias),
                     Err(_) => {
                         tracing::error!(
                             target: "moq_transport::control",
                             track_alias,
-                            "subscribe alias map lock poisoned"
+                            "track alias map lock poisoned"
                         );
                         return Err(SessionError::Internal);
                     }
                 };
 
-                if let Some(id) = id {
-                    return Ok(Some(id));
+                if let Some(origin) = origin {
+                    return Ok(Some(origin));
                 }
 
                 // Alias not present yet, wait for notification
@@ -562,6 +1046,39 @@ impl Subscriber {
         })
         .await
         .unwrap_or(Ok(None))
+    }
+
+    /// Open the subgroup writer for whichever subscription owns this alias.
+    fn open_subgroup_writer(
+        &self,
+        origin: TrackOrigin,
+        header: &data::SubgroupHeader,
+    ) -> Result<serve::SubgroupWriter, SessionError> {
+        match origin {
+            TrackOrigin::Subscribe(subscribe_id) => {
+                let mut map = self.subscribes.lock().map_err(|_| SessionError::Internal)?;
+                let recv = map.get_mut(&subscribe_id).ok_or_else(|| {
+                    ServeError::not_found_ctx(format!(
+                        "subscribe_id={} not found for track_alias={}",
+                        subscribe_id, header.track_alias
+                    ))
+                })?;
+                Ok(recv.subgroup(header.clone())?)
+            }
+            TrackOrigin::Publish(publish_id) => {
+                let mut map = self
+                    .publishes_received
+                    .lock()
+                    .map_err(|_| SessionError::Internal)?;
+                let recv = map.get_mut(&publish_id).ok_or_else(|| {
+                    ServeError::not_found_ctx(format!(
+                        "publish_id={} not found for track_alias={}",
+                        publish_id, header.track_alias
+                    ))
+                })?;
+                Ok(recv.subgroup(header.clone())?)
+            }
+        }
     }
 
     /// Handle reception of a new stream from the QUIC session.
@@ -612,7 +1129,9 @@ impl Subscriber {
             );
             // The writer is closed, so we should terminate.
             // TODO it would be nice to do this immediately when the Writer is closed.
-            if let Some(subscribe_id) = self.get_subscribe_id_by_alias(track_alias, None).await? {
+            if let Some(TrackOrigin::Subscribe(subscribe_id)) =
+                self.get_track_origin_by_alias(track_alias, None).await?
+            {
                 if let Some(subscribe) = self.remove_subscribe(subscribe_id) {
                     subscribe.error(err.clone())?;
                 }
@@ -635,8 +1154,8 @@ impl Subscriber {
             track_alias
         );
 
-        let Some(subscribe_id) = self
-            .get_subscribe_id_by_alias(track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
+        let Some(origin) = self
+            .get_track_origin_by_alias(track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
             .await?
         else {
             return Err(SessionError::Serve(ServeError::not_found_ctx(format!(
@@ -646,10 +1165,13 @@ impl Subscriber {
         };
 
         tracing::trace!("[SUBSCRIBER] recv_stream_inner: receiving subgroup data");
+        let subgroup_header = stream_header
+            .subgroup_header
+            .ok_or(SessionError::Internal)?;
         self.recv_subgroup(
             stream_header.header_type,
-            stream_header.subgroup_header.unwrap(),
-            subscribe_id,
+            subgroup_header,
+            origin,
             reader,
             mlog,
         )
@@ -667,7 +1189,7 @@ impl Subscriber {
         &mut self,
         stream_header_type: data::StreamHeaderType,
         mut subgroup_header: data::SubgroupHeader,
-        subscribe_id: u64,
+        origin: TrackOrigin,
         mut reader: Reader,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
@@ -790,15 +1312,7 @@ impl Subscriber {
                     subgroup_header.subgroup_id = Some(current_object_id);
                 }
 
-                let mut subscribes = self.subscribes.lock().map_err(|_| SessionError::Internal)?;
-                let subscribe = subscribes.get_mut(&subscribe_id).ok_or_else(|| {
-                    ServeError::not_found_ctx(format!(
-                        "subscribe_id={} not found for track_alias={}",
-                        subscribe_id, subgroup_header.track_alias
-                    ))
-                })?;
-
-                subgroup_writer = Some(subscribe.subgroup(subgroup_header.clone())?);
+                subgroup_writer = Some(self.open_subgroup_writer(origin, &subgroup_header)?);
             }
 
             // Log subgroup object parsed/received
@@ -939,38 +1453,60 @@ impl Subscriber {
             }
         }
 
-        // Look up the subscribe id for this track alias
-        if let Some(subscribe_id) = self
-            .get_subscribe_id_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
-            .await?
-        {
-            // Look up the subscribe by id
-            if let Some(subscribe) = self
-                .subscribes
-                .lock()
-                .ok()
-                .as_mut()
-                .and_then(|s| s.get_mut(&subscribe_id))
-            {
-                tracing::trace!(
-                    "[SUBSCRIBER] recv_datagram: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+        // Route to whichever subscription owns this track alias.
+        let origin = self
+            .get_track_origin_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
+            .await?;
+
+        match origin {
+            Some(TrackOrigin::Subscribe(subscribe_id)) => {
+                if let Some(subscribe) = self
+                    .subscribes
+                    .lock()
+                    .ok()
+                    .as_mut()
+                    .and_then(|s| s.get_mut(&subscribe_id))
+                {
+                    tracing::trace!(
+                        "[SUBSCRIBER] recv_datagram (SUBSCRIBE): track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                        datagram.track_alias,
+                        datagram.group_id,
+                        datagram.object_id.unwrap_or(0),
+                        datagram.publisher_priority,
+                        datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
+                        datagram.payload.as_ref().map_or(0, |p| p.len()));
+                    subscribe.datagram(datagram)?;
+                }
+            }
+            Some(TrackOrigin::Publish(publish_id)) => {
+                if let Some(recv) = self
+                    .publishes_received
+                    .lock()
+                    .ok()
+                    .as_mut()
+                    .and_then(|m| m.get_mut(&publish_id))
+                {
+                    tracing::trace!(
+                        "[SUBSCRIBER] recv_datagram (PUBLISH): track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                        datagram.track_alias,
+                        datagram.group_id,
+                        datagram.object_id.unwrap_or(0),
+                        datagram.publisher_priority,
+                        datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
+                        datagram.payload.as_ref().map_or(0, |p| p.len()));
+                    recv.datagram(datagram)?;
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
                     datagram.track_alias,
                     datagram.group_id,
                     datagram.object_id.unwrap_or(0),
                     datagram.publisher_priority,
                     datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
                     datagram.payload.as_ref().map_or(0, |p| p.len()));
-                subscribe.datagram(datagram)?;
             }
-        } else {
-            tracing::warn!(
-                "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
-                datagram.track_alias,
-                datagram.group_id,
-                datagram.object_id.unwrap_or(0),
-                datagram.publisher_priority,
-                datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
-                datagram.payload.as_ref().map_or(0, |p| p.len()));
         }
 
         Ok(())
@@ -980,64 +1516,7 @@ impl Subscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Establish a real `web_transport::Session` over an in-process QUIC
-    /// loopback so we can construct a `Subscriber` and exercise the actual
-    /// cleanup paths (`Subscribe::Drop` and `Subscriber::remove_subscribe`).
-    ///
-    /// The session is never dialed by these tests — the cleanup logic only
-    /// touches the in-memory maps and the outgoing queue — but `Subscriber`
-    /// holds a concrete `web_transport::Session`, so a live connection is the
-    /// only honest way to build one. The accepted server side is parked for
-    /// the lifetime of the test to keep the client session established.
-    async fn loopback_session() -> web_transport::Session {
-        use web_transport::quinn::{ClientBuilder, ServerBuilder};
-
-        // Under `cargo test --workspace`, feature unification links both the
-        // `ring` and `aws-lc-rs` rustls providers, leaving no unambiguous
-        // process default. Install one explicitly (idempotent across tests).
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .expect("generate self-signed certificate");
-        let cert_der = cert.cert.der().clone();
-        let key = cert
-            .key_pair
-            .serialize_der()
-            .try_into()
-            .expect("serialize private key");
-
-        let mut server = ServerBuilder::new()
-            .with_addr("127.0.0.1:0".parse().expect("server addr"))
-            .with_certificate(vec![cert_der], key)
-            .expect("build loopback server");
-        let addr = server.local_addr().expect("server local addr");
-
-        tokio::spawn(async move {
-            if let Some(request) = server.accept().await {
-                // Hold the accepted server session open for the lifetime of the
-                // test so the client side stays established; the spawned task is
-                // cancelled at runtime shutdown when the test returns.
-                if let Ok(_session) = request.ok().await {
-                    std::future::pending::<()>().await;
-                }
-            }
-        });
-
-        let client = ClientBuilder::new()
-            .dangerous()
-            .with_no_certificate_verification()
-            .expect("build loopback client");
-        let url = url::Url::parse(&format!("https://127.0.0.1:{}/", addr.port()))
-            .expect("parse loopback url");
-
-        // Fail fast rather than hang CI if the loopback handshake ever stalls.
-        tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(url))
-            .await
-            .expect("loopback connect timed out")
-            .expect("connect loopback session")
-            .into()
-    }
+    use crate::session::test_support::loopback_session;
 
     fn test_subscriber(session: web_transport::Session) -> Subscriber {
         let outgoing = Queue::default().split().0;
@@ -1087,7 +1566,7 @@ mod tests {
         );
     }
 
-    /// `remove_subscribe` must clear both `subscribes` and `subscribe_alias_map`.
+    /// `remove_subscribe` must clear the subscribes map and release the alias.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remove_subscribe_clears_alias_map() {
         let mut subscriber = test_subscriber(loopback_session().await);
@@ -1108,10 +1587,11 @@ mod tests {
             .unwrap()
             .insert(request_id, recv);
         subscriber
-            .subscribe_alias_map
+            .track_alias_map
             .lock()
             .unwrap()
-            .insert(track_alias, request_id);
+            .insert(track_alias, TrackOrigin::Subscribe(request_id))
+            .unwrap();
 
         let removed = subscriber.remove_subscribe(request_id);
 
@@ -1128,12 +1608,194 @@ mod tests {
             "remove_subscribe should clear the subscribes map"
         );
         assert!(
+            subscriber.track_alias_map.lock().unwrap().is_empty(),
+            "remove_subscribe should release the track alias"
+        );
+    }
+
+    /// An inbound PUBLISH must claim its Track Alias so racing Object streams
+    /// route to the PUBLISH receiver, not to a SUBSCRIBE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recv_publish_registers_alias_and_queues_handle() {
+        let mut subscriber = test_subscriber(loopback_session().await);
+
+        subscriber
+            .recv_publish(&message::Publish {
+                id: 1,
+                track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+                track_name: "video".into(),
+                track_alias: 7,
+                params: Default::default(),
+                track_extensions: Default::default(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            subscriber.track_alias_map.lock().unwrap().get(7),
+            Some(TrackOrigin::Publish(1))
+        );
+        assert!(subscriber
+            .publishes_received
+            .lock()
+            .unwrap()
+            .contains_key(&1));
+
+        let publish = subscriber.publish_received().await.expect("queued PUBLISH");
+        assert_eq!(publish.track_alias(), 7);
+        assert_eq!(publish.name(), &TrackName::from("video"));
+    }
+
+    /// A second PUBLISH for a track we already subscribe to is rejected as a
+    /// request error, leaving the first subscription intact (§5.1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_publish_for_same_track_is_rejected() {
+        let mut subscriber = test_subscriber(loopback_session().await);
+        let publish = |id, alias| message::Publish {
+            id,
+            track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+            track_name: "video".into(),
+            track_alias: alias,
+            params: Default::default(),
+            track_extensions: Default::default(),
+        };
+
+        subscriber.recv_publish(&publish(1, 7)).unwrap();
+        subscriber.recv_publish(&publish(3, 9)).unwrap();
+
+        assert!(
             !subscriber
-                .subscribe_alias_map
+                .publishes_received
                 .lock()
                 .unwrap()
-                .contains_key(&track_alias),
-            "remove_subscribe should clear the subscribe_alias_map"
+                .contains_key(&3),
+            "duplicate PUBLISH must not create a second subscription"
         );
+        assert_eq!(subscriber.track_alias_map.lock().unwrap().get(9), None);
+    }
+
+    /// A PUBLISH request stream that dies without PUBLISH_DONE must still
+    /// release its state, or the track writer, alias, and name reservation
+    /// leak for the life of the session and `closed()` never resolves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_inbound_publish_releases_state_and_unblocks_closed() {
+        let mut subscriber = test_subscriber(loopback_session().await);
+        subscriber
+            .recv_publish(&message::Publish {
+                id: 1,
+                track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+                track_name: "video".into(),
+                track_alias: 7,
+                params: Default::default(),
+                track_extensions: Default::default(),
+            })
+            .unwrap();
+        let publish = subscriber.publish_received().await.expect("queued PUBLISH");
+
+        subscriber.abort_publish_received(1);
+
+        assert!(subscriber.publishes_received.lock().unwrap().is_empty());
+        assert!(subscriber.track_alias_map.lock().unwrap().is_empty());
+        assert!(
+            publish.closed().await.is_err(),
+            "an aborted PUBLISH must surface as a failure, not a clean end"
+        );
+    }
+
+    /// An outbound SUBSCRIBE claims the track name, so a PUBLISH offering the
+    /// same track is rejected rather than creating a second subscriber-role
+    /// subscription for it (§5.1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_for_already_subscribed_track_is_rejected() {
+        let mut subscriber = test_subscriber(loopback_session().await);
+        subscriber.subscriber_names.lock().unwrap().insert(
+            FullTrackName {
+                namespace: TrackNamespace::from_utf8_path("test/ns"),
+                name: "video".into(),
+            },
+            0,
+        );
+
+        subscriber
+            .recv_publish(&message::Publish {
+                id: 1,
+                track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+                track_name: "video".into(),
+                track_alias: 7,
+                params: Default::default(),
+                track_extensions: Default::default(),
+            })
+            .unwrap();
+
+        assert!(subscriber.publishes_received.lock().unwrap().is_empty());
+        assert_eq!(subscriber.track_alias_map.lock().unwrap().get(7), None);
+    }
+
+    /// Track Aliases are session-scoped (§10.1), so a second PUBLISH reusing a
+    /// live alias for a different track is a session-closing condition, not a
+    /// per-request error. Draft-18 assigns DUPLICATE_TRACK_ALIAS (0x5).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_track_alias_closes_the_session() {
+        let mut subscriber = test_subscriber(loopback_session().await);
+
+        subscriber
+            .recv_publish(&message::Publish {
+                id: 1,
+                track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+                track_name: "first".into(),
+                track_alias: 7,
+                params: Default::default(),
+                track_extensions: Default::default(),
+            })
+            .unwrap();
+
+        let err = subscriber
+            .recv_publish(&message::Publish {
+                id: 2,
+                track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+                track_name: "second".into(),
+                track_alias: 7,
+                params: Default::default(),
+                track_extensions: Default::default(),
+            })
+            .expect_err("reusing a live alias must be rejected");
+
+        assert!(matches!(err, SessionError::Duplicate));
+        assert!(err.is_session_fatal());
+        assert_eq!(err.code(), 0x5);
+
+        // The collision must not disturb the binding that already owned the alias.
+        assert_eq!(
+            subscriber.track_alias_map.lock().unwrap().get(7),
+            Some(TrackOrigin::Publish(1))
+        );
+    }
+
+    /// PUBLISH_DONE must tear down the inbound PUBLISH state, including its
+    /// alias and name reservations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_done_clears_inbound_publish_state() {
+        let mut subscriber = test_subscriber(loopback_session().await);
+        subscriber
+            .recv_publish(&message::Publish {
+                id: 1,
+                track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+                track_name: "video".into(),
+                track_alias: 7,
+                params: Default::default(),
+                track_extensions: Default::default(),
+            })
+            .unwrap();
+
+        subscriber
+            .recv_publish_done(&message::PublishDone {
+                id: 1,
+                status_code: message::PublishDoneCode::TrackEnded as u64,
+                stream_count: 0,
+                reason: crate::coding::ReasonPhrase(String::new()),
+            })
+            .unwrap();
+
+        assert!(subscriber.publishes_received.lock().unwrap().is_empty());
+        assert!(subscriber.track_alias_map.lock().unwrap().is_empty());
     }
 }
