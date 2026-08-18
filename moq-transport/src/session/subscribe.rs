@@ -307,11 +307,6 @@ impl SubscribeRecv {
         Ok(())
     }
 
-    pub fn track_alias(&self) -> Option<u64> {
-        let state = self.state.lock();
-        state.track_alias
-    }
-
     pub fn error(mut self, err: ServeError) -> Result<(), ServeError> {
         if let Some(writer) = self.writer.take() {
             writer.close(err.clone())?;

@@ -91,7 +91,15 @@ impl Writer {
     }
 
     /// Signal that no more data will be written (sends QUIC FIN).
-    pub fn finish(&mut self) {
-        let _ = self.stream.finish();
+    pub fn finish(&mut self) -> Result<(), SessionError> {
+        self.stream.finish()?;
+        Ok(())
+    }
+
+    /// Abort the send half with RESET_STREAM, discarding unsent data.
+    ///
+    /// Used to tear down a single request stream without closing the session.
+    pub fn reset(&mut self, code: u32) {
+        self.stream.reset(code);
     }
 }

@@ -10,10 +10,15 @@
 //! for correlation with relay-side mlog files.
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use tokio::time::{timeout, Duration};
 
 use moq_native_ietf::quic;
-use moq_transport::{coding::TrackNamespace, serve::Tracks, session::Session};
+use moq_transport::{
+    coding::{KeyValuePairs, TrackNamespace},
+    serve::{Track, TrackReaderMode, TrackWriter, Tracks},
+    session::Session,
+};
 
 use crate::Args;
 
@@ -25,6 +30,12 @@ const TEST_NAMESPACE: &str = "moq-test/interop";
 
 /// Track name used for test operations
 const TEST_TRACK: &str = "test-track";
+
+/// Namespace used for direct PUBLISH test operations
+const PUBLISH_NAMESPACE: &str = "moq-test/publish";
+
+/// Track name used for direct PUBLISH test operations
+const PUBLISH_TRACK: &str = "published-track";
 
 /// Helper to connect to a relay and establish a session
 /// Returns (session, connection_id, transport) so we can report CIDs for mlog correlation
@@ -52,6 +63,17 @@ impl TestConnectionIds {
     pub fn add(&mut self, cid: String) {
         self.cids.push(cid);
     }
+}
+
+fn write_test_subgroup(track: TrackWriter, payload: &'static [u8]) -> Result<()> {
+    let mut subgroups = track.subgroups().context("failed to enter subgroup mode")?;
+    let mut subgroup = subgroups.append(128).context("failed to create subgroup")?;
+    subgroup
+        .write(Bytes::from_static(payload))
+        .context("failed to write subgroup object")?;
+    drop(subgroup);
+    drop(subgroups);
+    Ok(())
 }
 
 /// T0.1: Setup Only
@@ -294,6 +316,158 @@ pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionId
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         tracing::info!("PUBLISH_NAMESPACE_DONE sent successfully");
+        Ok(cids)
+    })
+    .await
+    .context("test timed out")?
+}
+
+/// T0.7: Publish Track Only
+///
+/// Publisher sends direct PUBLISH for one track, receives PUBLISH_OK, serves one
+/// object, and completes with PUBLISH_DONE.
+pub async fn test_publish_track_only(args: &Args) -> Result<TestConnectionIds> {
+    timeout(TEST_TIMEOUT, async {
+        let (session, cid, transport) = connect(args)
+            .await
+            .context("publisher failed to connect to relay")?;
+        let mut cids = TestConnectionIds::default();
+        cids.add(cid);
+
+        let (session, mut publisher, _subscriber) = Session::connect(session, None, transport)
+            .await
+            .context("publisher SETUP failed")?;
+
+        let namespace = TrackNamespace::from_utf8_path(PUBLISH_NAMESPACE);
+        let (track_writer, track_reader) = Track::new(namespace.clone(), PUBLISH_TRACK).produce();
+
+        tracing::info!(
+            namespace = %namespace,
+            track = PUBLISH_TRACK,
+            "Publisher sending direct PUBLISH"
+        );
+
+        let result: Result<()> = tokio::select! {
+            res = async {
+                let mut published = publisher
+                    .publish(track_reader, KeyValuePairs::default())
+                    .await
+                    .context("failed to send PUBLISH")?;
+                published.ok().await.context("PUBLISH was rejected")?;
+                tracing::info!(namespace = %namespace, track = PUBLISH_TRACK, "PUBLISH accepted");
+
+                write_test_subgroup(track_writer, b"publish-track-only")?;
+                published.serve().await.context("failed serving PUBLISH track")?;
+                tracing::info!(namespace = %namespace, track = PUBLISH_TRACK, "PUBLISH completed");
+                Ok(())
+            } => res,
+            res = session.run() => {
+                res.context("publisher session error")?;
+                anyhow::bail!("publisher session ended before PUBLISH completed");
+            }
+        };
+
+        result?;
+        Ok(cids)
+    })
+    .await
+    .context("test timed out")?
+}
+
+/// T0.8: Publish Track + Subscribe
+///
+/// Publisher sends direct PUBLISH for one track; after PUBLISH_OK, a subscriber
+/// subscribes to the exact track and receives the relayed object stream.
+pub async fn test_publish_track_subscribe(args: &Args) -> Result<TestConnectionIds> {
+    timeout(TEST_TIMEOUT, async {
+        let mut cids = TestConnectionIds::default();
+
+        let (pub_session, pub_cid, pub_transport) = connect(args)
+            .await
+            .context("publisher failed to connect")?;
+        cids.add(pub_cid);
+        let (pub_session, mut publisher, _pub_subscriber) =
+            Session::connect(pub_session, None, pub_transport)
+                .await
+                .context("publisher SETUP failed")?;
+
+        let (sub_session, sub_cid, sub_transport) = connect(args)
+            .await
+            .context("subscriber failed to connect")?;
+        cids.add(sub_cid);
+        let (sub_session, _sub_publisher, mut subscriber) =
+            Session::connect(sub_session, None, sub_transport)
+                .await
+                .context("subscriber SETUP failed")?;
+
+        let namespace = TrackNamespace::from_utf8_path(PUBLISH_NAMESPACE);
+        let (track_writer, track_reader) = Track::new(namespace.clone(), PUBLISH_TRACK).produce();
+        let (mut sub_tracks, _, mut sub_reader) = Tracks::new(namespace.clone()).produce();
+        let sub_track = sub_tracks
+            .create(PUBLISH_TRACK)
+            .ok_or_else(|| anyhow::anyhow!("failed to create subscriber track"))?;
+        let received_track = sub_reader
+            .get_track_reader(&namespace, PUBLISH_TRACK)
+            .ok_or_else(|| anyhow::anyhow!("failed to read subscriber track"))?;
+
+        tracing::info!(
+            namespace = %namespace,
+            track = PUBLISH_TRACK,
+            "Publisher sending direct PUBLISH before subscriber subscribes"
+        );
+
+        let result: Result<()> = tokio::select! {
+            res = async {
+                let mut published = publisher
+                    .publish(track_reader, KeyValuePairs::default())
+                    .await
+                    .context("failed to send PUBLISH")?;
+                published.ok().await.context("PUBLISH was rejected")?;
+                tracing::info!(namespace = %namespace, track = PUBLISH_TRACK, "PUBLISH accepted; starting subscriber");
+
+                let subscribe = async {
+                    subscriber
+                        .subscribe(sub_track)
+                        .await
+                        .context("subscriber failed to receive direct PUBLISH track")
+                };
+
+                let receive = async {
+                    let mut subgroups = match received_track.mode().await.context("subscriber track mode failed")? {
+                        TrackReaderMode::Subgroups(subgroups) => subgroups,
+                        _ => anyhow::bail!("subscriber track used non-subgroup delivery"),
+                    };
+                    let mut subgroup = subgroups.next().await.context("subscriber subgroup failed")?
+                        .ok_or_else(|| anyhow::anyhow!("subscriber did not receive a subgroup"))?;
+                    let payload = subgroup.read_next().await.context("subscriber object failed")?
+                        .ok_or_else(|| anyhow::anyhow!("subscriber did not receive an object"))?;
+                    if payload.as_ref() != b"publish-track-subscribe" {
+                        anyhow::bail!("subscriber received unexpected payload");
+                    }
+                    Ok(())
+                };
+
+                let publish = async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    write_test_subgroup(track_writer, b"publish-track-subscribe")?;
+                    published.serve().await.context("failed serving PUBLISH track")
+                };
+
+                tokio::try_join!(subscribe, receive, publish)?;
+                tracing::info!(namespace = %namespace, track = PUBLISH_TRACK, "Subscriber received direct PUBLISH track");
+                Ok(())
+            } => res,
+            res = pub_session.run() => {
+                res.context("publisher session error")?;
+                anyhow::bail!("publisher session ended before PUBLISH/subscriber flow completed");
+            },
+            res = sub_session.run() => {
+                res.context("subscriber session error")?;
+                anyhow::bail!("subscriber session ended before PUBLISH/subscriber flow completed");
+            }
+        };
+
+        result?;
         Ok(cids)
     })
     .await

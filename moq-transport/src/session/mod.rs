@@ -4,23 +4,33 @@
 
 mod error;
 mod publish_namespace;
+mod publish_received;
+mod published;
 mod published_namespace;
 mod publisher;
 mod reader;
 mod request_id;
 mod subscribe;
+mod subscribe_namespace;
 mod subscribed;
+mod subscribed_namespace;
 mod subscriber;
 mod track_status_requested;
 mod writer;
 
 pub use error::*;
 pub use publish_namespace::*;
+pub use publish_received::PublishReceived;
+pub(crate) use publish_received::PublishReceivedRecv;
+pub(crate) use published::{split_published_state, PublishedRecv, RequestStreamSink};
+pub use published::{Published, PublishedInfo};
 pub use published_namespace::*;
 pub use publisher::*;
 pub use request_id::RequestId;
 pub use subscribe::*;
+pub use subscribe_namespace::*;
 pub use subscribed::*;
+pub use subscribed_namespace::*;
 pub use subscriber::*;
 pub use track_status_requested::*;
 
@@ -49,7 +59,7 @@ type BidiResponseMap = Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender
 /// A bidi response reader future handed from Publisher/Subscriber to
 /// `Session::run`. Boxed so the publisher and subscriber reader loops can
 /// share one channel and one `FuturesUnordered` type.
-type BidiReaderFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type BidiReaderFuture = Pin<Box<dyn Future<Output = Result<(), SessionError>> + Send + 'static>>;
 
 /// Channel for bidi response reader futures. Publisher/Subscriber send boxed
 /// futures here; `Session::run` polls them cooperatively under structured
@@ -73,6 +83,32 @@ pub enum Transport {
     /// Raw QUIC with MoQT framing directly on QUIC streams.
     /// ALPN: "moqt-16". Path carried in SETUP PATH parameter.
     RawQuic,
+}
+
+/// Session-level configuration supplied at connect/accept time.
+///
+/// Draft-18 removed MAX_REQUEST_ID and REQUESTS_BLOCKED, so there is no longer
+/// a negotiated request budget to advertise in SETUP. `max_request_id` is
+/// retained so callers that were written against the draft-16 API (including
+/// the relay's `--max-request-id` flag) keep working, but it is not sent on the
+/// wire and does not bound anything on this branch. Inbound request IDs are
+/// still bounded per session by `request_id::MAX_REQUEST_IDS_PER_SESSION`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SessionConfig {
+    /// Accepted for source compatibility with draft-16 callers. Unused.
+    pub max_request_id: u64,
+}
+
+/// The draft-16 default, kept so `SessionConfig::default()` compares equal to
+/// what existing callers construct.
+const DEFAULT_MAX_REQUEST_ID: u64 = 100;
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            max_request_id: DEFAULT_MAX_REQUEST_ID,
+        }
+    }
 }
 
 /// Session object for managing all communications in a single QUIC connection.
@@ -484,6 +520,20 @@ impl Session {
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_config(session, mlog_path, transport, SessionConfig::default()).await
+    }
+
+    /// Create an outbound/client QUIC connection with explicit session config.
+    ///
+    /// See [`SessionConfig`]: draft-18 has no negotiated request budget, so the
+    /// config currently carries nothing that affects the connection. The entry
+    /// point exists so callers can keep passing one.
+    pub async fn connect_with_config(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        _config: SessionConfig,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let url = session.url().clone();
         let url_path = url.path();
         let path = Self::normalize_connection_path(url_path)?;
@@ -565,6 +615,18 @@ impl Session {
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
+    ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
+        Self::accept_with_config(session, mlog_path, transport, SessionConfig::default()).await
+    }
+
+    /// Accept an inbound server connection with explicit session config.
+    ///
+    /// See [`SessionConfig`] for why the config is currently inert under draft-18.
+    pub async fn accept_with_config(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        _config: SessionConfig,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|p| {
             mlog::MlogWriter::new(p)
@@ -654,13 +716,13 @@ impl Session {
         let result = tokio::select! {
             res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.outgoing.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone(), self.bidi_response_map.clone()) => res,
-            res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone()) => res,
+            res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone(), self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
             // Collect bidi reader futures and poll them cooperatively as part of
             // this select. They progress only while run() is polled, so they
             // cannot outlive the session (true structured concurrency).
-            () = async {
+            res = async {
                 loop {
                     tokio::select! {
                         fut = bidi_task_rx.recv() => {
@@ -669,10 +731,21 @@ impl Session {
                                 None => break, // all senders dropped
                             }
                         }
-                        Some(_) = reader_tasks.next() => {}
+                        Some(res) = reader_tasks.next() => {
+                            // A reader ending is normal; a protocol violation is not.
+                            // Surfacing the latter here is what closes the session with
+                            // the registered code instead of logging and carrying on.
+                            if let Err(err) = res {
+                                if err.is_session_fatal() {
+                                    return Err(err);
+                                }
+                                tracing::debug!(error = %err, "bidi response reader ended");
+                            }
+                        }
                     }
                 }
-            } => Ok(()),
+                Ok(())
+            } => res,
         };
 
         // Dropping reader_tasks (FuturesUnordered<BidiReaderFuture>) drops every
@@ -783,6 +856,7 @@ impl Session {
         subscriber: Option<Subscriber>,
         request_id: RequestId,
         bidi_response_map: BidiResponseMap,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
 
@@ -794,17 +868,26 @@ impl Session {
                     let mut sub_clone = subscriber.clone();
                     let rid = request_id.clone();
                     let map = bidi_response_map.clone();
+                    let mlog = mlog.clone();
 
                     tasks.push(async move {
-                        if let Err(e) = Self::handle_bidi_request(
+                        Self::handle_bidi_request(
                             send_stream, recv_stream,
-                            &mut pub_clone, &mut sub_clone, &rid, &map,
-                        ).await {
-                            tracing::debug!(error = %e, "bidi request stream ended");
-                        }
+                            &mut pub_clone, &mut sub_clone, &rid, &map, mlog,
+                        ).await
                     });
                 }
-                Some(()) = tasks.next() => {}
+                Some(res) = tasks.next() => {
+                    // Same split as the outbound readers: an inbound request stream
+                    // ending is routine, but a peer that violated a MUST rule has to
+                    // take the session down, which cannot happen if we only log here.
+                    if let Err(err) = res {
+                        if err.is_session_fatal() {
+                            return Err(err);
+                        }
+                        tracing::debug!(error = %err, "bidi request stream ended");
+                    }
+                }
             }
         }
     }
@@ -819,6 +902,7 @@ impl Session {
         subscriber: &mut Option<Subscriber>,
         request_id: &RequestId,
         bidi_response_map: &BidiResponseMap,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         let mut reader = Reader::new(recv_stream);
         let mut writer = Writer::new(send_stream);
@@ -845,10 +929,31 @@ impl Session {
                 }
             };
 
+        // SUBSCRIBE_NAMESPACE owns its stream for the whole life of the request:
+        // the reply is not one terminal message but an open-ended NAMESPACE /
+        // NAMESPACE_DONE feed. Hand both halves straight to the publisher-side
+        // handler rather than routing through `bidi_response_map`, which can
+        // only key on messages that carry a Request ID — NAMESPACE does not.
+        if let Message::SubscribeNamespace(msg) = msg {
+            if let Some(ref mlog) = mlog {
+                if let Ok(mut mlog) = mlog.lock() {
+                    let time = mlog.elapsed_ms();
+                    let _ = mlog.add_event(mlog::events::subscribe_namespace_parsed(time, 0, &msg));
+                }
+            }
+
+            request_id.validate_incoming(msg.id)?;
+            let recv = publisher
+                .as_mut()
+                .ok_or(SessionError::RoleViolation)?
+                .recv_subscribe_namespace(msg)?;
+            return recv.run(writer, reader, mlog).await;
+        }
+
         // Classify the request. One-shot request/response flows are bounded in
         // the response phase below; long-lived flows (SUBSCRIBE, PUBLISH,
-        // PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, FETCH) may legitimately stay
-        // open until an explicit terminal message and are therefore not bounded.
+        // PUBLISH_NAMESPACE, FETCH) may legitimately stay open until an explicit
+        // terminal message and are therefore not bounded.
         let bounded_response = matches!(&msg, Message::TrackStatus(_) | Message::RequestUpdate(_));
 
         let req_id = msg.sequenced_request_id();
@@ -869,7 +974,7 @@ impl Session {
 
         // Dispatch to the appropriate role handler (same as run_recv).
         // Capture the result so cleanup runs unconditionally on error.
-        let dispatch_result = (|| -> Result<(), SessionError> {
+        let mut dispatch_result = (|| -> Result<(), SessionError> {
             let msg = match TryInto::<message::Publisher>::try_into(msg) {
                 Ok(msg) => {
                     subscriber
@@ -900,61 +1005,185 @@ impl Session {
         // Wait for responses only if dispatch succeeded; otherwise the
         // handlers didn't register anything to respond to.
         if dispatch_result.is_ok() {
-            if let Some(ref mut rx) = rx {
-                let pump = async {
-                    while let Some(response) = rx.recv().await {
-                        let is_terminal = matches!(
-                            response,
-                            Message::RequestError(_)
-                                | Message::PublishDone(_)
-                                | Message::PublishNamespaceDone(_)
-                                | Message::Unsubscribe(_)
-                        );
-                        if let Err(e) = Self::encode_bidi_response(&mut writer, &response).await {
-                            tracing::warn!(error = %e, "failed to write bidi response");
-                            break;
+            if let Some(id) = req_id {
+                if let Some(ref mut rx) = rx {
+                    let pump = async {
+                        while let Some(response) = rx.recv().await {
+                            // One-shot requests (TRACK_STATUS, REQUEST_UPDATE) get
+                            // exactly one reply, so REQUEST_OK ends them just as
+                            // REQUEST_ERROR does. Draft-18 requires the stream be
+                            // FINned after TRACK_STATUS_OK or REQUEST_ERROR
+                            // (§10.14). Treating only the error as terminal held the
+                            // handler slot until BIDI_REQUEST_TIMEOUT, so 128 cheap
+                            // TRACK_STATUS requests could occupy every slot for 30s
+                            // even when the application answered immediately.
+                            let is_terminal = matches!(
+                                response,
+                                Message::RequestError(_)
+                                    | Message::PublishDone(_)
+                                    | Message::PublishNamespaceDone(_)
+                                    | Message::Unsubscribe(_)
+                            ) || (bounded_response
+                                && matches!(response, Message::RequestOk(_)));
+                            if let Err(e) = Self::encode_bidi_response(&mut writer, &response).await
+                            {
+                                tracing::warn!(error = %e, "failed to write bidi response");
+                                break;
+                            }
+                            if is_terminal {
+                                // Give Quinn's connection driver a scheduling
+                                // opportunity to transmit the STREAM data before
+                                // the Writer is dropped (which sends FIN).
+                                tokio::time::sleep(std::time::Duration::ZERO).await;
+                                break;
+                            }
                         }
-                        if is_terminal {
-                            // Give Quinn's connection driver a scheduling
-                            // opportunity to transmit the STREAM data before
-                            // the Writer is dropped (which sends FIN).
-                            tokio::time::sleep(std::time::Duration::ZERO).await;
-                            break;
-                        }
-                    }
-                };
+                    };
 
-                // One-shot requests are bounded so a stalled peer cannot pin a
-                // slot after the request is accepted. Long-lived requests wait
-                // as long as needed; the QUIC idle timeout backstops a dead peer.
-                if bounded_response {
-                    if tokio::time::timeout(Self::BIDI_REQUEST_TIMEOUT, pump)
-                        .await
-                        .is_err()
-                    {
-                        tracing::debug!(
-                            ?req_id,
-                            "one-shot bidi request timed out awaiting response; reclaiming slot"
-                        );
-                    }
-                } else {
-                    pump.await;
+                    let follow_ups =
+                        Self::read_request_follow_ups(&mut reader, id, publisher, subscriber);
+
+                    // Whichever side finishes first ends the request, so the
+                    // other is cancelled. `follow_ups` is not cancellation-safe
+                    // (a partly-read frame is lost), which is fine only because
+                    // neither `reader` nor `writer` is used again afterwards.
+                    let both = async {
+                        tokio::select! {
+                            () = pump => Ok(()),
+                            res = follow_ups => res,
+                        }
+                    };
+
+                    // One-shot requests are bounded so a stalled peer cannot pin a
+                    // slot after the request is accepted. Long-lived requests wait
+                    // as long as needed; the QUIC idle timeout backstops a dead peer.
+                    // A protocol violation seen while reading follow-ups has to
+                    // reach the caller, which closes the session. Timing out is
+                    // not a violation: the slot is reclaimed and the session lives.
+                    dispatch_result = if bounded_response {
+                        match tokio::time::timeout(Self::BIDI_REQUEST_TIMEOUT, both).await {
+                            Ok(res) => res,
+                            Err(_) => {
+                                tracing::debug!(
+                                    ?req_id,
+                                    "one-shot bidi request timed out awaiting response; reclaiming slot"
+                                );
+                                Ok(())
+                            }
+                        }
+                    } else {
+                        both.await
+                    };
                 }
             }
         }
 
-        // Always clean up — runs on both success and error paths.
+        // The request stream is over. Release everything keyed by this request
+        // ID — a stream that dies without a terminal message would otherwise
+        // leak its state (and leave the application blocked on `closed()`) for
+        // the life of the session. Runs on both success and error paths.
         if let Some(id) = req_id {
+            if let Some(subscriber) = subscriber.as_ref() {
+                subscriber.abort_publish_received(id);
+            }
             if let Ok(mut map) = bidi_response_map.lock() {
                 map.remove(&id);
             }
         }
 
         // Explicitly finish the stream and yield for Quinn to flush.
-        writer.finish();
+        let _ = writer.finish();
         tokio::task::yield_now().await;
 
         dispatch_result
+    }
+
+    /// Read messages the requester sends after its opening request on the same
+    /// bidi stream, and dispatch them like any other inbound control message.
+    ///
+    /// Draft-18 puts the whole life of a request on one stream, so terminal
+    /// follow-ups such as PUBLISH_DONE (ending an inbound PUBLISH) and
+    /// UNSUBSCRIBE (ending an inbound SUBSCRIBE) arrive here rather than on the
+    /// control stream. Like every other message after the request, they omit
+    /// the Request ID, which is why the stream's known `request_id` is injected.
+    ///
+    /// Returns when the request ends: the requester reset the stream, or sent
+    /// something terminal. A clean FIN of the requester's send half is not an
+    /// ending, so this parks instead: this endpoint FINs its own SUBSCRIBE stream
+    /// immediately after sending the request and a conformant peer may do the
+    /// same, and the caller keeps the response side running.
+    ///
+    /// `Err` means the peer violated the protocol, which the caller turns into a
+    /// session close.
+    async fn read_request_follow_ups(
+        reader: &mut Reader,
+        request_id: u64,
+        publisher: &mut Option<Publisher>,
+        subscriber: &mut Option<Subscriber>,
+    ) -> Result<(), SessionError> {
+        loop {
+            let msg = match Self::decode_bidi_response(reader, request_id).await {
+                Ok(msg) => msg,
+                // A reset or STOP_SENDING ends the request itself, so returning
+                // here is what releases the handler slot. Parking on this would
+                // let a peer pin one slot per reset stream.
+                Err(err) if err.is_stream_error() => {
+                    tracing::debug!(request_id, error = %err, "request stream reset by peer");
+                    return Ok(());
+                }
+                // A clean FIN of the requester's send half is different: it only
+                // means no more requests are coming on this stream, not that the
+                // request is over. This endpoint FINs its own SUBSCRIBE stream
+                // right after sending, and a conformant peer may too, so parking
+                // keeps the response side alive.
+                Err(err) if err.is_stream_ended() => {
+                    tracing::trace!(request_id, error = %err, "request stream send half finished");
+                    std::future::pending::<()>().await;
+                    return Ok(());
+                }
+                // Draft-18 requires closing the session on an unknown message
+                // type, so an undecodable frame is not something to skip past.
+                Err(err) => return Err(err),
+            };
+
+            let terminal = matches!(
+                msg,
+                Message::PublishDone(_)
+                    | Message::PublishNamespaceDone(_)
+                    | Message::Unsubscribe(_)
+            );
+
+            let dispatched = match TryInto::<message::Publisher>::try_into(msg) {
+                Ok(msg) => subscriber
+                    .as_mut()
+                    .ok_or(SessionError::RoleViolation)
+                    .and_then(|s| s.recv_message(msg)),
+                Err(msg) => match TryInto::<message::Subscriber>::try_into(msg) {
+                    Ok(msg) => publisher
+                        .as_mut()
+                        .ok_or(SessionError::RoleViolation)
+                        .and_then(|p| p.recv_message(msg)),
+                    Err(msg) => {
+                        tracing::warn!(
+                            request_id,
+                            msg_type = msg.name(),
+                            "unexpected follow-up on bidi request stream"
+                        );
+                        Ok(())
+                    }
+                },
+            };
+
+            if let Err(err) = dispatched {
+                // Session::run decides: a protocol violation closes the session,
+                // anything else only ends this request.
+                return Err(err);
+            }
+
+            if terminal {
+                return Ok(());
+            }
+        }
     }
 
     /// Encode a response message to a bidi stream, omitting the Request ID
@@ -989,6 +1218,14 @@ impl Session {
             }
             // id-only messages: payload is empty (id omitted on bidi).
             Message::PublishNamespaceDone(_) | Message::Unsubscribe(_) => {}
+            // NAMESPACE / NAMESPACE_DONE never carried a Request ID, so their
+            // payload is unchanged on a bidi stream.
+            Message::Namespace(m) => {
+                m.track_namespace_suffix.encode(&mut payload)?;
+            }
+            Message::NamespaceDone(m) => {
+                m.track_namespace_suffix.encode(&mut payload)?;
+            }
             Message::PublishOk(m) => {
                 m.params.encode(&mut payload)?;
             }
@@ -1099,6 +1336,20 @@ impl Session {
             wire_id::Unsubscribe => Ok(Message::Unsubscribe(message::Unsubscribe {
                 id: request_id,
             })),
+            // NAMESPACE / NAMESPACE_DONE have no Request ID field, so nothing
+            // is injected — they decode exactly as they do on any other stream.
+            wire_id::Namespace => {
+                let track_namespace_suffix = crate::coding::TrackNamespacePrefix::decode(&mut buf)?;
+                Ok(Message::Namespace(message::Namespace {
+                    track_namespace_suffix,
+                }))
+            }
+            wire_id::NamespaceDone => {
+                let track_namespace_suffix = crate::coding::TrackNamespacePrefix::decode(&mut buf)?;
+                Ok(Message::NamespaceDone(message::NamespaceDone {
+                    track_namespace_suffix,
+                }))
+            }
             wire_id::PublishOk => {
                 let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
                 Ok(Message::PublishOk(message::PublishOk {
@@ -1276,6 +1527,68 @@ impl Session {
     }
 }
 
+/// Shared helpers for session-layer unit tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Establish a real `web_transport::Session` over an in-process QUIC
+    /// loopback so tests can construct a `Publisher`/`Subscriber` and exercise
+    /// the real cleanup paths.
+    ///
+    /// Most tests never send anything over it — they only touch in-memory maps
+    /// and queues — but `Publisher` and `Subscriber` hold a concrete
+    /// `web_transport::Session`, so a live connection is the only honest way to
+    /// build one. The accepted server side is parked for the lifetime of the test
+    /// to keep the client session established.
+    pub(crate) async fn loopback_session() -> web_transport::Session {
+        use web_transport::quinn::{ClientBuilder, ServerBuilder};
+
+        // Under `cargo test --workspace`, feature unification links both the
+        // `ring` and `aws-lc-rs` rustls providers, leaving no unambiguous
+        // process default. Install one explicitly (idempotent across tests).
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed certificate");
+        let cert_der = cert.cert.der().clone();
+        let key = cert
+            .key_pair
+            .serialize_der()
+            .try_into()
+            .expect("serialize private key");
+
+        let mut server = ServerBuilder::new()
+            .with_addr("127.0.0.1:0".parse().expect("server addr"))
+            .with_certificate(vec![cert_der], key)
+            .expect("build loopback server");
+        let addr = server.local_addr().expect("server local addr");
+
+        tokio::spawn(async move {
+            if let Some(request) = server.accept().await {
+                // Hold the accepted server session open for the lifetime of the
+                // test so the client side stays established; the spawned task is
+                // cancelled at runtime shutdown when the test returns.
+                if let Ok(_session) = request.ok().await {
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+
+        let client = ClientBuilder::new()
+            .dangerous()
+            .with_no_certificate_verification()
+            .expect("build loopback client");
+        let url = url::Url::parse(&format!("https://127.0.0.1:{}/", addr.port()))
+            .expect("parse loopback url");
+
+        // Fail fast rather than hang CI if the loopback handshake ever stalls.
+        tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(url))
+            .await
+            .expect("loopback connect timed out")
+            .expect("connect loopback session")
+            .into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1389,6 +1702,29 @@ mod tests {
             !bytes.contains(&99),
             "Request ID must not appear in bidi encoding"
         );
+    }
+
+    /// NAMESPACE and NAMESPACE_DONE carry no Request ID field, so their bidi
+    /// framing must be byte-identical to the ordinary message encoding.
+    #[test]
+    fn encode_bidi_namespace_matches_plain_message_encoding() {
+        for msg in [
+            Message::Namespace(message::Namespace {
+                track_namespace_suffix: crate::coding::TrackNamespacePrefix::from_utf8_path(
+                    "meeting=123",
+                ),
+            }),
+            Message::NamespaceDone(message::NamespaceDone {
+                track_namespace_suffix: crate::coding::TrackNamespacePrefix::from_utf8_path(
+                    "meeting=123",
+                ),
+            }),
+        ] {
+            let mut plain = bytes::BytesMut::new();
+            msg.encode(&mut plain).unwrap();
+
+            assert_eq!(encode_bidi_response_bytes(&msg), plain.to_vec());
+        }
     }
 
     #[test]

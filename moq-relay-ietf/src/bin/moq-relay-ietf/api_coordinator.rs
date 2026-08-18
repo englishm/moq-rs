@@ -21,7 +21,8 @@ use moq_transport::coding::TrackNamespace;
 use url::Url;
 
 use moq_relay_ietf::{
-    Coordinator, CoordinatorError, CoordinatorResult, NamespaceOrigin, NamespaceRegistration,
+    Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, NamespaceOrigin,
+    NamespaceRegistration,
 };
 
 /// Default TTL for namespace registrations (in seconds)
@@ -214,6 +215,7 @@ impl Coordinator for ApiCoordinator {
         &self,
         scope: Option<&str>,
         namespace: &TrackNamespace,
+        _context: &CoordinatorContext,
     ) -> CoordinatorResult<NamespaceRegistration> {
         let namespace_str = Self::registry_key(scope, namespace);
         let origin = Origin {

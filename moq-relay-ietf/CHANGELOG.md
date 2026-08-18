@@ -6,6 +6,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.25](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.24...moq-relay-ietf-v0.7.25) - 2026-07-31
+
+### Added
+
+- add metrics for lock poisoning and broadcast lag
+
+### Fixed
+
+- decide upstream wait outcome by branch, not error variant
+- label cancelled subscribes distinctly from upstream failures
+- wait for upstream subscription before sending SUBSCRIBE_OK
+- release upstream subscriptions for idle cached tracks
+- send log output to stderr instead of stdout
+
+### Other
+
+- stream namespace paths into the formatter
+
+## [0.7.24](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.23...moq-relay-ietf-v0.7.24) - 2026-07-20
+
+### Added
+
+- forward local accept IP to the connection tagger
+
+## [0.7.23](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.22...moq-relay-ietf-v0.7.23) - 2026-07-19
+
+### Added
+
+- *(moq-relay-ietf)* coalesce upstream subscribe-namespace prefixes
+- *(moq-relay-ietf)* track local and remote namespace sources
+- *(moq-relay-ietf)* pull upstream namespaces for subscribe_namespace
+- *(moq-relay-ietf)* return no upstream relays for internal subscribe_namespace
+- *(moq-relay-ietf)* return upstream relays from coordinator subscribe_namespace
+- *(moq-relay-ietf)* fan out publish namespaces to subscribers
+- *(moq-relay-ietf)* make relay-to-relay sessions full bidirectional peers
+- *(moq-relay-ietf)* pass connection interface and peer source to coordinator
+- *(moq-relay-ietf)* classify inbound connections as public or internal
+
+### Fixed
+
+- *(moq-relay-ietf)* isolate best-effort namespace fan-out failures
+- *(moq-relay-ietf)* share reserved reader for concurrent pull-through requests
+
+### Other
+
+- *(moq-relay-ietf)* align subscribe-namespace connection bindings
+- *(moq-relay-ietf)* build resync_publish_tracks set in one pass
+- *(moq-relay-ietf)* read-mostly RwLock for track and namespace registries
+- *(moq-relay-ietf)* name namespace/track broadcast channel capacities
+- *(moq-relay-ietf)* prune and match tracks in a single locked pass
+- *(moq-relay-ietf)* serve subscribe-namespace from local state only
+- *(moq-relay-ietf)* cover cross-relay subscribe-namespace choreography
+- honor subscribe namespace prefixes
+- register namespace subscription interest
+- persist file coordinator namespace interest
+- return file coordinator namespace matches
+- filter namespace fanout to published tracks
+- fan out publish tracks for namespace subscriptions
+- serve namespace subscriptions
+- track namespace changes in locals
+
+## [0.7.22](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.21...moq-relay-ietf-v0.7.22) - 2026-07-09
+
+### Fixed
+
+- *(moq-transport)* send publish done after serve completion
+
+### Other
+
+- address PUBLISH review feedback
+- track pending request responses
+- route PUBLISH tracks by full track name
+
+## [0.7.21](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.20...moq-relay-ietf-v0.7.21) - 2026-07-08
+
+### Added
+
+- *(moq-relay-ietf)* expose relay session config
+
+### Other
+
+- *(moq-relay-ietf)* remove redundant session config binding
+- *(moq-relay-ietf)* remove manual changelog entry
+
+## [0.7.20](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.19...moq-relay-ietf-v0.7.20) - 2026-07-08
+
+### Added
+
+- route track-level PUBLISH registrations so relays can serve exact pushed tracks before falling back to namespace routing
+
+### Other
+
+- Merge pull request #170 from itzmanish/draft-16-rewrite
+- Update relay dependencies for the draft-16 transport/native stack.
+
+## [0.7.19](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.18...moq-relay-ietf-v0.7.19) - 2026-06-10
+
+### Other
+
+- updated the following local packages: moq-native-ietf
+
 ## [0.7.18](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.17...moq-relay-ietf-v0.7.18) - 2026-05-20
 
 ### Fixed

@@ -138,6 +138,32 @@ impl SessionError {
     }
 
     /// Returns true when only one WebTransport stream was closed or reset.
+    /// True when this error means the peer's send half ended, cleanly or
+    /// otherwise, rather than that a message was malformed.
+    ///
+    /// Callers reading an open-ended stream use this to tell "nothing more is
+    /// coming" from "that frame was bad but the stream is still in sync".
+    pub(crate) fn is_stream_ended(&self) -> bool {
+        self.is_stream_error() || matches!(self, Self::Decode(crate::coding::DecodeError::More(_)))
+    }
+
+    /// Whether this error requires tearing down the whole session, rather than
+    /// only ending one stream or failing the one request it arose from.
+    ///
+    /// Draft-18 makes session closure mandatory for protocol violations:
+    /// duplicate track aliases, invalid request IDs, malformed messages. Two
+    /// classes must *not* take the connection down with them, because both are
+    /// ordinary events on a healthy session: a peer ending or resetting a single
+    /// request stream, and a request that legitimately fails (an unknown track,
+    /// say). Collapsing those into "close the session" would let any subscriber
+    /// kill the connection by asking for something that does not exist.
+    pub(crate) fn is_session_fatal(&self) -> bool {
+        if self.is_stream_ended() {
+            return false;
+        }
+        !matches!(self, Self::Serve(_))
+    }
+
     pub(crate) fn is_stream_error(&self) -> bool {
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         {
@@ -244,5 +270,37 @@ mod tests {
         assert!(reset.is_stream_error());
         assert!(stopped.is_stream_error());
         assert!(!SessionError::Internal.is_stream_error());
+    }
+
+    #[test]
+    fn protocol_violations_are_session_fatal() {
+        for err in [
+            SessionError::Duplicate,
+            SessionError::InvalidRequestId,
+            SessionError::ProtocolViolation("bad".into()),
+            SessionError::RoleViolation,
+            SessionError::WrongSize,
+        ] {
+            assert!(err.is_session_fatal(), "{err} should close the session");
+        }
+    }
+
+    #[test]
+    fn one_stream_ending_does_not_close_the_session() {
+        let reset = SessionError::WebTransport(web_transport::Error::Read(
+            web_transport::quinn::ReadError::Reset(42),
+        ));
+        let ended = SessionError::Decode(crate::coding::DecodeError::More(1));
+
+        assert!(!reset.is_session_fatal());
+        assert!(!ended.is_session_fatal());
+    }
+
+    #[test]
+    fn a_failed_request_does_not_close_the_session() {
+        // Otherwise any subscriber could drop the connection for everyone by
+        // asking for a track that does not exist.
+        let not_found = SessionError::Serve(serve::ServeError::NotFound);
+        assert!(!not_found.is_session_fatal());
     }
 }
