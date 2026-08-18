@@ -283,6 +283,42 @@ impl Deref for TracksReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::TrackReaderMode;
+    use bytes::Bytes;
+
+    /// Helper: deterministic payload for (group_id, object_id).
+    fn payload(group_id: u64, object_id: u64) -> Bytes {
+        Bytes::from(format!("g{}-o{}", group_id, object_id))
+    }
+
+    /// Helper: drain all objects from a TrackReader in Subgroups mode.
+    async fn drain_subgroups(track_reader: TrackReader) -> Vec<(u64, u64, Bytes)> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            let mode = track_reader
+                .mode()
+                .await
+                .expect("track_reader.mode() should succeed");
+            let mut received: Vec<(u64, u64, Bytes)> = Vec::new();
+            if let TrackReaderMode::Subgroups(mut subgroups) = mode {
+                while let Ok(Some(mut subgroup)) = subgroups.next().await {
+                    let gid = subgroup.group_id;
+                    while let Ok(Some(mut obj)) = subgroup.next().await {
+                        let oid = obj.object_id;
+                        let data: Bytes = obj
+                            .read_all()
+                            .await
+                            .expect("obj.read_all() should succeed");
+                        received.push((gid, oid, data));
+                    }
+                }
+            } else {
+                panic!("expected Subgroups mode");
+            }
+            received
+        })
+        .await
+        .expect("drain_subgroups timed out after 5 seconds")
+    }
 
     /// Regression test for the stale track caching bug.
     ///
@@ -407,6 +443,194 @@ mod tests {
         // Both readers should refer to the same track
         assert_eq!(track_reader_1.name, track_reader_2.name);
         assert_eq!(track_reader_1.namespace, track_reader_2.namespace);
+    }
+
+    // ---------------------------------------------------------------
+    // I1: Write-read round-trip through Track
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn track_round_trip() {
+        let namespace = TrackNamespace::from_utf8_path("test/ns");
+        let (track_writer, track_reader) =
+            Track::new(namespace, "data-track".to_string()).produce();
+
+        let num_objects = 10u64;
+
+        // Writer: create subgroups, write 1 group x 10 objects
+        let write_handle = tokio::spawn(async move {
+            let mut subgroups = track_writer.subgroups().unwrap();
+            let mut sg = subgroups.append(0).unwrap();
+            for oid in 0..num_objects {
+                sg.write(payload(0, oid)).unwrap();
+            }
+            drop(sg);
+            subgroups.close(ServeError::Done).ok();
+        });
+
+        // Reader: drain all data
+        let received = drain_subgroups(track_reader).await;
+        write_handle.await.unwrap();
+
+        assert_eq!(received.len(), num_objects as usize);
+        for (gid, oid, data) in &received {
+            assert_eq!(*gid, 0);
+            assert_eq!(data, &payload(0, *oid));
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // I2: Tracks subscribe round-trip
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn tracks_subscribe_round_trip() {
+        let namespace = TrackNamespace::from_utf8_path("test/ns");
+        let track_name = "data-track";
+        let num_objects = 5u64;
+
+        let (writer, mut request, mut reader) = Tracks::new(namespace.clone()).produce();
+
+        // Subscriber side: request the track
+        let track_reader = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("subscribe should succeed");
+
+        // Publisher side: receive request, write data
+        let pub_handle = tokio::spawn(async move {
+            let track_writer = request.next().await.expect("should receive track request");
+
+            assert_eq!(track_writer.name, track_name);
+
+            let mut subgroups = track_writer.subgroups().unwrap();
+            let mut sg = subgroups.append(0).unwrap();
+            for oid in 0..num_objects {
+                sg.write(payload(0, oid)).unwrap();
+            }
+            drop(sg);
+            subgroups.close(ServeError::Done).ok();
+
+            // Keep writer alive until data is consumed
+            drop(writer);
+        });
+
+        // Subscriber side: read data
+        let received = drain_subgroups(track_reader).await;
+        pub_handle.await.unwrap();
+
+        assert_eq!(received.len(), num_objects as usize);
+        for (gid, oid, data) in &received {
+            assert_eq!(*gid, 0);
+            assert_eq!(data, &payload(0, *oid));
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // I3: Multiple tracks independence
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn multiple_tracks_independence() {
+        let namespace = TrackNamespace::from_utf8_path("test/ns");
+
+        // Create two independent tracks directly (no Tracks layer needed).
+        let (track_a_writer, track_a_reader) =
+            Track::new(namespace.clone(), "track-a".to_string()).produce();
+        let (track_b_writer, track_b_reader) =
+            Track::new(namespace.clone(), "track-b".to_string()).produce();
+
+        // Write different data to each
+        let handle_a = tokio::spawn(async move {
+            let mut subgroups = track_a_writer.subgroups().unwrap();
+            let mut sg = subgroups.append(0).unwrap();
+            sg.write(Bytes::from_static(b"alpha-0")).unwrap();
+            sg.write(Bytes::from_static(b"alpha-1")).unwrap();
+            drop(sg);
+            subgroups.close(ServeError::Done).ok();
+        });
+
+        let handle_b = tokio::spawn(async move {
+            let mut subgroups = track_b_writer.subgroups().unwrap();
+            let mut sg = subgroups.append(0).unwrap();
+            sg.write(Bytes::from_static(b"beta-0")).unwrap();
+            sg.write(Bytes::from_static(b"beta-1")).unwrap();
+            sg.write(Bytes::from_static(b"beta-2")).unwrap();
+            drop(sg);
+            subgroups.close(ServeError::Done).ok();
+        });
+
+        let data_a = drain_subgroups(track_a_reader).await;
+        let data_b = drain_subgroups(track_b_reader).await;
+
+        handle_a.await.unwrap();
+        handle_b.await.unwrap();
+
+        // Verify no cross-contamination
+        assert_eq!(data_a.len(), 2);
+        assert_eq!(data_a[0].2, Bytes::from_static(b"alpha-0"));
+        assert_eq!(data_a[1].2, Bytes::from_static(b"alpha-1"));
+
+        assert_eq!(data_b.len(), 3);
+        assert_eq!(data_b[0].2, Bytes::from_static(b"beta-0"));
+        assert_eq!(data_b[1].2, Bytes::from_static(b"beta-1"));
+        assert_eq!(data_b[2].2, Bytes::from_static(b"beta-2"));
+    }
+
+    // ---------------------------------------------------------------
+    // I4: Stale track re-subscribe with data integrity
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn stale_resubscribe_data_integrity() {
+        let namespace = TrackNamespace::from_utf8_path("test/ns");
+        let track_name = "data-track";
+
+        let (_writer, mut request, mut reader) = Tracks::new(namespace.clone()).produce();
+
+        // First subscription
+        let track_reader_1 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("first subscribe");
+
+        // Publisher receives and closes (simulates failure)
+        let track_writer_1 = request.next().await.expect("first request");
+        track_writer_1.close(ServeError::Cancel).unwrap();
+
+        // Wait for close to propagate using closed() with timeout
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            track_reader_1.closed(),
+        )
+        .await;
+
+        // Second subscription (stale eviction should happen)
+        let track_reader_2 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("second subscribe");
+
+        // Publisher receives the new request and writes real data
+        let track_writer_2 =
+            tokio::time::timeout(std::time::Duration::from_millis(100), request.next())
+                .await
+                .expect("should receive second request")
+                .expect("second request should be Some");
+
+        let write_handle = tokio::spawn(async move {
+            let mut subgroups = track_writer_2.subgroups().unwrap();
+            let mut sg = subgroups.append(0).unwrap();
+            for oid in 0..3u64 {
+                sg.write(payload(0, oid)).unwrap();
+            }
+            drop(sg);
+            subgroups.close(ServeError::Done).ok();
+        });
+
+        // Read data from the second subscription
+        let received = drain_subgroups(track_reader_2).await;
+        write_handle.await.unwrap();
+
+        // All 3 objects from the second subscription must be intact
+        assert_eq!(received.len(), 3);
+        for (gid, oid, data) in &received {
+            assert_eq!(*gid, 0);
+            assert_eq!(data, &payload(0, *oid));
+        }
     }
 
     /// Test that a track is NOT considered stale after the writer transitions to
