@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashSet,
-    fmt,
+    fmt::{self, Write as _},
     fs::File,
     io::BufWriter,
     net::{self, IpAddr},
@@ -111,14 +111,33 @@ fn bind_smart(addr: net::SocketAddr) -> anyhow::Result<(net::UdpSocket, bool)> {
     Ok((socket.into(), is_dual_stack))
 }
 
-/// Build a TransportConfig with our standard settings
+/// HTTP/3 `H3_NO_ERROR` ([RFC 9114] §8.1): the H3 layer completed normally, the
+/// request was simply refused.
 ///
-/// This is used both for the base endpoint config and when creating
-/// per-connection configs with qlog enabled.
+/// Wire hygiene rather than a behaviour fix — §8 already requires an unknown
+/// code to be read as H3_NO_ERROR, so a conformant peer read the previous 0
+/// the same way. `H3_REQUEST_REJECTED` would be wrong here: §4.1.1 reserves it
+/// for requests the server did not process, and this one was answered with 406.
+///
+/// [RFC 9114]: https://www.rfc-editor.org/rfc/rfc9114.html#section-8.1
+const H3_NO_ERROR: u32 = 0x100;
+
 /// How long a rejected WebTransport CONNECT is given to reach the peer before
 /// the connection is closed underneath it.
 const REJECT_FLUSH_TIMEOUT: time::Duration = time::Duration::from_millis(250);
 
+/// Caps the offered protocol identifiers logged when a CONNECT is rejected.
+///
+/// The list is peer-controlled on a pre-authentication path. H3 bounds the
+/// whole header block to 64 KiB, but that is still ~104 KiB of decoded text in
+/// one entry, so both the entry count and each entry's length are capped.
+const MAX_LOGGED_PROTOCOLS: usize = 16;
+const MAX_LOGGED_PROTOCOL_LEN: usize = 64;
+
+/// Build a TransportConfig with our standard settings
+///
+/// This is used both for the base endpoint config and when creating
+/// per-connection configs with qlog enabled.
 fn build_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(time::Duration::from_secs(10).try_into().unwrap()));
@@ -543,9 +562,26 @@ impl Server {
             let selected = match moq_transport::setup::negotiate_version(&request.protocols) {
                 Some(selected) => selected,
                 None => {
-                    // `reject` consumes the request, so keep the offer for the log
-                    // and the error.
-                    let offered = request.protocols.clone();
+                    // `reject` consumes the request, so render the offer now,
+                    // bounded in both directions: the peer chooses how many
+                    // entries it sends and how long each one is.
+                    let offered = {
+                        let total = request.protocols.len();
+                        let shown: Vec<String> = request
+                            .protocols
+                            .iter()
+                            .take(MAX_LOGGED_PROTOCOLS)
+                            .map(|p| match p.char_indices().nth(MAX_LOGGED_PROTOCOL_LEN) {
+                                Some((cut, _)) => format!("{}…", &p[..cut]),
+                                None => p.clone(),
+                            })
+                            .collect();
+                        let mut rendered = format!("{shown:?}");
+                        if total > MAX_LOGGED_PROTOCOLS {
+                            let _ = write!(rendered, " (+{} more)", total - MAX_LOGGED_PROTOCOLS);
+                        }
+                        rendered
+                    };
 
                     // Answer the CONNECT instead of dropping the connection, so the
                     // peer learns why, and record what it offered: without this the
@@ -553,7 +589,7 @@ impl Server {
                     tracing::warn!(
                         cid = %connection_id_hex,
                         ip = %remote_address,
-                        offered = ?offered,
+                        offered = %offered,
                         supported = ?moq_transport::setup::SUPPORTED_ALPNS,
                         "rejecting WebTransport CONNECT: no mutually supported MoQT version in WT-Available-Protocols"
                     );
@@ -575,14 +611,16 @@ impl Server {
                         .await
                         .is_err()
                     {
+                        // H3_NO_ERROR: the H3 layer did its job and answered the
+                        // CONNECT; 0 is not a defined HTTP/3 error code.
                         conn_for_reject.close(
-                            VarInt::from_u32(0),
+                            VarInt::from_u32(H3_NO_ERROR),
                             b"no mutually supported MoQT version in WT-Available-Protocols",
                         );
                     }
 
                     anyhow::bail!(
-                        "no mutually supported MoQT version in WT-Available-Protocols (offered: {:?}, supported: {:?})",
+                        "no mutually supported MoQT version in WT-Available-Protocols (offered: {}, supported: {:?})",
                         offered,
                         moq_transport::setup::SUPPORTED_ALPNS,
                     );
