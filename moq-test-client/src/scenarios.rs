@@ -16,7 +16,8 @@ use tokio::time::{timeout, Duration};
 use moq_native_ietf::quic;
 use moq_transport::{
     coding::{KeyValuePairs, TrackNamespace},
-    serve::{Track, TrackReaderMode, TrackWriter, Tracks},
+    message::PublishDoneCode,
+    serve::{ServeError, Track, TrackReaderMode, TrackWriter, Tracks},
     session::Session,
 };
 
@@ -36,6 +37,9 @@ const PUBLISH_NAMESPACE: &str = "moq-test/publish";
 
 /// Track name used for direct PUBLISH test operations
 const PUBLISH_TRACK: &str = "published-track";
+
+/// Payload carried by the single Object the direct PUBLISH tests send
+const PUBLISH_PAYLOAD: &[u8] = b"publish-track-subscribe";
 
 /// Helper to connect to a relay and establish a session
 /// Returns (session, connection_id, transport) so we can report CIDs for mlog correlation
@@ -71,9 +75,25 @@ fn write_test_subgroup(track: TrackWriter, payload: &'static [u8]) -> Result<()>
     subgroup
         .write(Bytes::from_static(payload))
         .context("failed to write subgroup object")?;
+    // Dropping both writers ends the track, which is what a publisher with
+    // nothing more to send does.
     drop(subgroup);
     drop(subgroups);
     Ok(())
+}
+
+/// Whether a subscription ending with this error is a normal end of track.
+///
+/// A publisher that has sent everything ends the subscription with
+/// PUBLISH_DONE / TRACK_ENDED (draft-18 §10.11), which surfaces here as
+/// `Closed(0x2)`. Treating that as a failure would fail every test that
+/// subscribes to a finite track.
+fn is_normal_subscription_end(err: &ServeError) -> bool {
+    match err {
+        ServeError::Done | ServeError::Cancel => true,
+        ServeError::Closed(code) => *code == PublishDoneCode::TrackEnded as u64,
+        _ => false,
+    }
 }
 
 /// T0.1: Setup Only
@@ -326,6 +346,13 @@ pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionId
 ///
 /// Publisher sends direct PUBLISH for one track, receives PUBLISH_OK, serves one
 /// object, and completes with PUBLISH_DONE.
+///
+/// With no peer subscribed there is nothing to read the Object back from, so
+/// this asserts the publisher's side of delivery only: that the Object was
+/// accepted by the transport and that serving it reported no error. Note that
+/// `serve()` only became a meaningful assertion once per-subgroup send failures
+/// stopped being swallowed; before that it returned `Ok` even when nothing was
+/// transmitted. End-to-end receipt is asserted by `publish-track-subscribe`.
 pub async fn test_publish_track_only(args: &Args) -> Result<TestConnectionIds> {
     timeout(TEST_TIMEOUT, async {
         let (session, cid, transport) = connect(args)
@@ -356,8 +383,12 @@ pub async fn test_publish_track_only(args: &Args) -> Result<TestConnectionIds> {
                 published.ok().await.context("PUBLISH was rejected")?;
                 tracing::info!(namespace = %namespace, track = PUBLISH_TRACK, "PUBLISH accepted");
 
-                write_test_subgroup(track_writer, b"publish-track-only")?;
-                published.serve().await.context("failed serving PUBLISH track")?;
+                write_test_subgroup(track_writer, b"publish-track-only")
+                    .context("publisher failed to write the Object")?;
+                published
+                    .serve()
+                    .await
+                    .context("failed serving PUBLISH track")?;
                 tracing::info!(namespace = %namespace, track = PUBLISH_TRACK, "PUBLISH completed");
                 Ok(())
             } => res,
@@ -426,10 +457,13 @@ pub async fn test_publish_track_subscribe(args: &Args) -> Result<TestConnectionI
                 tracing::info!(namespace = %namespace, track = PUBLISH_TRACK, "PUBLISH accepted; starting subscriber");
 
                 let subscribe = async {
-                    subscriber
-                        .subscribe(sub_track)
-                        .await
-                        .context("subscriber failed to receive direct PUBLISH track")
+                    match subscriber.subscribe(sub_track).await {
+                        Ok(()) => Ok(()),
+                        // The publisher ending a finite track is the expected
+                        // outcome, not a failure.
+                        Err(err) if is_normal_subscription_end(&err) => Ok(()),
+                        Err(err) => Err(err).context("subscriber failed to receive direct PUBLISH track"),
+                    }
                 };
 
                 let receive = async {
@@ -441,16 +475,32 @@ pub async fn test_publish_track_subscribe(args: &Args) -> Result<TestConnectionI
                         .ok_or_else(|| anyhow::anyhow!("subscriber did not receive a subgroup"))?;
                     let payload = subgroup.read_next().await.context("subscriber object failed")?
                         .ok_or_else(|| anyhow::anyhow!("subscriber did not receive an object"))?;
-                    if payload.as_ref() != b"publish-track-subscribe" {
-                        anyhow::bail!("subscriber received unexpected payload");
+                    if payload.as_ref() != PUBLISH_PAYLOAD {
+                        anyhow::bail!(
+                            "subscriber received unexpected payload: {:?}",
+                            String::from_utf8_lossy(payload.as_ref())
+                        );
                     }
                     Ok(())
                 };
 
                 let publish = async {
+                    // Let the subscriber attach first, so the Object is relayed
+                    // to a live subscription rather than served from whatever the
+                    // relay happened to buffer before the SUBSCRIBE arrived.
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    write_test_subgroup(track_writer, b"publish-track-subscribe")?;
-                    published.serve().await.context("failed serving PUBLISH track")
+
+                    // Write one Object and end the track immediately. Ending it
+                    // straight away is the point of this test: PUBLISH_DONE then
+                    // races the Object, and §10.11's Stream Count is what keeps
+                    // the subscription alive long enough to deliver it. Holding
+                    // the track open would sidestep the very condition under test.
+                    write_test_subgroup(track_writer, PUBLISH_PAYLOAD)?;
+                    published
+                        .serve()
+                        .await
+                        .context("failed serving PUBLISH track")?;
+                    Ok(())
                 };
 
                 tokio::try_join!(subscribe, receive, publish)?;
