@@ -18,6 +18,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use url::Url;
 
 use moq_transport::session::Transport;
+use quinn::VarInt;
 
 use crate::tls;
 
@@ -114,6 +115,10 @@ fn bind_smart(addr: net::SocketAddr) -> anyhow::Result<(net::UdpSocket, bool)> {
 ///
 /// This is used both for the base endpoint config and when creating
 /// per-connection configs with qlog enabled.
+/// How long a rejected WebTransport CONNECT is given to reach the peer before
+/// the connection is closed underneath it.
+const REJECT_FLUSH_TIMEOUT: time::Duration = time::Duration::from_millis(250);
+
 fn build_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(time::Duration::from_secs(10).try_into().unwrap()));
@@ -518,6 +523,11 @@ impl Server {
 
         let alpn_bytes = alpn.as_bytes();
         let (session, transport) = if alpn_bytes == web_transport_quinn::ALPN.as_bytes() {
+            // `Request::accept` takes the connection, so keep a handle for the
+            // rejection path: closing with a reason tells the peer why, which a
+            // bare drop does not.
+            let conn_for_reject = conn.clone();
+
             // Wait for the WebTransport CONNECT request (includes H3 SETTINGS exchange).
             let request = web_transport_quinn::Request::accept(conn)
                 .await
@@ -526,8 +536,58 @@ impl Server {
             // Negotiate the MoQT version from the client's offered protocols. Rejecting here
             // rather than accepting without a protocol keeps a non-MoQT WebTransport client
             // from getting a successful CONNECT only to fail later at MoQT SETUP.
-            let selected = moq_transport::setup::negotiate_version(&request.protocols)
-                .context("no mutually supported MoQT version in WT-Available-Protocols")?;
+            //
+            // draft-18 §3.1.3 has the client put its MoQT protocol identifiers in
+            // WT-Available-Protocols; draft-ietf-webtrans-http3 §3.3 lets the server
+            // "reject the request if the client did not include a suitable protocol".
+            let selected = match moq_transport::setup::negotiate_version(&request.protocols) {
+                Some(selected) => selected,
+                None => {
+                    // `reject` consumes the request, so keep the offer for the log
+                    // and the error.
+                    let offered = request.protocols.clone();
+
+                    // Answer the CONNECT instead of dropping the connection, so the
+                    // peer learns why, and record what it offered: without this the
+                    // peer sees an abrupt close and the log names no cause.
+                    tracing::warn!(
+                        cid = %connection_id_hex,
+                        ip = %remote_address,
+                        offered = ?offered,
+                        supported = ?moq_transport::setup::SUPPORTED_ALPNS,
+                        "rejecting WebTransport CONNECT: no mutually supported MoQT version in WT-Available-Protocols"
+                    );
+
+                    // 406: the client's offer could not be satisfied.
+                    if let Err(err) = request
+                        .reject(web_transport_quinn::http::StatusCode::NOT_ACCEPTABLE)
+                        .await
+                    {
+                        tracing::debug!(cid = %connection_id_hex, error = %err, "failed to reject WebTransport CONNECT");
+                    }
+
+                    // `reject` only queues the response, and both `close` and
+                    // dropping the connection stop sending immediately, which
+                    // would truncate it. Give the peer a bounded moment to read
+                    // the 406 and close, then close with a reason so its logs
+                    // name the cause rather than a truncated H3 exchange.
+                    if tokio::time::timeout(REJECT_FLUSH_TIMEOUT, conn_for_reject.closed())
+                        .await
+                        .is_err()
+                    {
+                        conn_for_reject.close(
+                            VarInt::from_u32(0),
+                            b"no mutually supported MoQT version in WT-Available-Protocols",
+                        );
+                    }
+
+                    anyhow::bail!(
+                        "no mutually supported MoQT version in WT-Available-Protocols (offered: {:?}, supported: {:?})",
+                        offered,
+                        moq_transport::setup::SUPPORTED_ALPNS,
+                    );
+                }
+            };
             let response =
                 web_transport_quinn::proto::ConnectResponse::OK.with_protocol(selected.to_string());
 
@@ -550,7 +610,12 @@ impl Server {
             );
             (session, Transport::RawQuic)
         } else {
-            anyhow::bail!("unsupported ALPN: {}", alpn)
+            anyhow::bail!(
+                "unsupported ALPN: {} (supported: {:?} or {})",
+                alpn,
+                moq_transport::setup::SUPPORTED_ALPNS,
+                web_transport_quinn::ALPN,
+            )
         };
 
         let info = ConnInfo {
