@@ -22,9 +22,9 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    DoneOutcome, PublishReceived, PublishReceivedRecv, PublishedNamespace, PublishedNamespaceRecv,
-    Reader, RequestId, Session, SessionError, Subscribe, SubscribeNamespace,
-    SubscribeNamespaceInfo, SubscribeRecv, Writer,
+    DoneOutcome, NameRegistry, PublishReceived, PublishReceivedRecv, PublishedNamespace,
+    PublishedNamespaceRecv, Reader, RequestId, Session, SessionError, Subscribe,
+    SubscribeNamespace, SubscribeNamespaceInfo, SubscribeRecv, Writer,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -145,36 +145,6 @@ impl TrackAliasRegistry {
     }
 }
 
-/// Tracks that this endpoint already subscribes to, whether via an outbound
-/// SUBSCRIBE or an inbound PUBLISH. Draft-16 §5.1 allows only one
-/// subscriber-role subscription per track.
-#[derive(Default)]
-struct SubscriberNameRegistry {
-    by_name: HashMap<FullTrackName, u64>,
-    by_request_id: HashMap<u64, FullTrackName>,
-}
-
-impl SubscriberNameRegistry {
-    fn contains_name(&self, name: &FullTrackName) -> bool {
-        self.by_name.contains_key(name)
-    }
-
-    fn insert(&mut self, name: FullTrackName, request_id: u64) {
-        if let Some(old_name) = self.by_request_id.insert(request_id, name.clone()) {
-            self.by_name.remove(&old_name);
-        }
-        if let Some(old_id) = self.by_name.insert(name, request_id) {
-            self.by_request_id.remove(&old_id);
-        }
-    }
-
-    fn remove_by_request_id(&mut self, request_id: u64) -> Option<FullTrackName> {
-        let name = self.by_request_id.remove(&request_id)?;
-        self.by_name.remove(&name);
-        Some(name)
-    }
-}
-
 // TODO remove Clone.
 #[derive(Clone)]
 pub struct Subscriber {
@@ -200,7 +170,7 @@ pub struct Subscriber {
     track_alias_notify: Arc<Notify>,
 
     /// Tracks this endpoint subscribes to, for the §5.1 duplicate check.
-    subscriber_names: Arc<Mutex<SubscriberNameRegistry>>,
+    subscriber_names: Arc<Mutex<NameRegistry>>,
 
     /// Transport-side state for inbound PUBLISH requests, keyed by request id.
     publishes_received: Arc<Mutex<HashMap<u64, PublishReceivedRecv>>>,
@@ -263,7 +233,7 @@ impl Subscriber {
         transport: super::Transport,
     ) -> Result<(Session, Self), SessionError> {
         let (session, _, subscriber) = Session::accept(session, None, transport).await?;
-        Ok((session, subscriber.unwrap()))
+        Ok((session, subscriber.ok_or(SessionError::Internal)?))
     }
 
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for control messages.
@@ -694,45 +664,51 @@ impl Subscriber {
         Some(subscribe)
     }
 
-    /// Fail an outbound SUBSCRIBE whose request stream ended before the publisher
-    /// answered. Without this an application awaiting `Subscribe::ok()` waits for
-    /// the life of the session on a request that can never be answered. A no-op
-    /// once the subscription has been established and removed by other means.
+    /// Handle an outbound SUBSCRIBE whose request stream ended.
+    ///
+    /// If nothing has been delivered yet this fails the request, so an
+    /// application awaiting `Subscribe::ok()` does not wait for the life of the
+    /// session on a request that can never be answered. If data is still
+    /// arriving the subscription is drained instead, so in-flight Objects are
+    /// not discarded. A no-op once the subscription has been removed by other
+    /// means.
     pub(super) fn abort_subscribe(&mut self, id: u64) {
         // PUBLISH_DONE is terminal on the request stream, so this also runs
-        // after a normal end of subscription. Data streams are separate, so a
-        // subscription still draining its announced Stream Count must be left
-        // for the drain (or its timeout) to finish.
-        let subscribe = match self.subscribes.lock() {
-            Ok(mut subscribes) => {
-                if subscribes.get(&id).is_some_and(|recv| recv.is_draining()) {
-                    tracing::debug!(
-                        request_id = id,
-                        "SUBSCRIBE request stream closed while draining; keeping state for in-flight streams"
-                    );
-                    return;
-                }
-                subscribes.remove(&id)
-            }
+        // after a normal end of subscription. Data streams are independent of
+        // it, so a subscription still draining — against an announced Stream
+        // Count or against a stream it is mid-way through reading — is left for
+        // the drain (or its timeout) to finish, or its in-flight Objects are
+        // discarded.
+        let outcome = match self.subscribes.lock() {
+            Ok(mut subscribes) => match subscribes.get_mut(&id) {
+                Some(recv) => recv.abort(ServeError::Cancel),
+                None => return,
+            },
             Err(_) => {
                 tracing::error!(request_id = id, "subscribes lock poisoned");
                 return;
             }
         };
 
-        let Some(subscribe) = subscribe else {
-            return;
-        };
-        if let Err(err) = self.clear_subscription_reservations(id) {
-            tracing::error!(request_id = id, error = %err, "failed to release subscribe reservations");
-        }
-
-        tracing::debug!(
-            request_id = id,
-            "SUBSCRIBE request stream closed before the publisher responded"
-        );
-        if let Err(err) = subscribe.error(ServeError::Cancel) {
-            tracing::debug!(request_id = id, error = %err, "failed to fail aborted SUBSCRIBE");
+        match outcome {
+            DoneOutcome::AlreadyDraining => {
+                tracing::debug!(
+                    request_id = id,
+                    "SUBSCRIBE request stream closed while draining; keeping state for in-flight streams"
+                );
+            }
+            DoneOutcome::DrainArmed => self.begin_drain(
+                id,
+                Subscriber::expire_subscribe_drain,
+                "SUBSCRIBE request stream closed with a stream still being read",
+            ),
+            DoneOutcome::Finished => {
+                tracing::debug!(
+                    request_id = id,
+                    "SUBSCRIBE request stream closed before the publisher responded"
+                );
+                self.remove_subscribe(id);
+            }
         }
     }
 
@@ -774,23 +750,11 @@ impl Subscriber {
                     request_id = msg.id,
                     "duplicate PUBLISH_DONE while draining — ignoring"
                 ),
-                DoneOutcome::DrainArmed => {
-                    if self.draining_count() > MAX_CONCURRENT_DRAINS {
-                        tracing::warn!(
-                            request_id = msg.id,
-                            "too many draining subscriptions; ending this one immediately"
-                        );
-                        self.expire_subscribe_drain(msg.id);
-                        return Ok(());
-                    }
-                    tracing::debug!(
-                        target: "moq_transport::control",
-                        request_id = msg.id,
-                        stream_count = msg.stream_count,
-                        "PUBLISH_DONE received with streams outstanding; draining"
-                    );
-                    self.arm_drain(msg.id, Subscriber::expire_subscribe_drain);
-                }
+                DoneOutcome::DrainArmed => self.begin_drain(
+                    msg.id,
+                    Subscriber::expire_subscribe_drain,
+                    "PUBLISH_DONE received with streams outstanding",
+                ),
             }
             return Ok(());
         }
@@ -825,23 +789,11 @@ impl Subscriber {
                 request_id = msg.id,
                 "duplicate PUBLISH_DONE while draining — ignoring"
             ),
-            DoneOutcome::DrainArmed => {
-                if self.draining_count() > MAX_CONCURRENT_DRAINS {
-                    tracing::warn!(
-                        request_id = msg.id,
-                        "too many draining subscriptions; ending this one immediately"
-                    );
-                    self.expire_publish_done_drain(msg.id);
-                    return Ok(());
-                }
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    stream_count = msg.stream_count,
-                    "PUBLISH_DONE received with streams outstanding; draining"
-                );
-                self.arm_drain(msg.id, Subscriber::expire_publish_done_drain);
-            }
+            DoneOutcome::DrainArmed => self.begin_drain(
+                msg.id,
+                Subscriber::expire_publish_done_drain,
+                "PUBLISH_DONE received with streams outstanding",
+            ),
         }
 
         Ok(())
@@ -938,6 +890,33 @@ impl Subscriber {
     /// Request IDs are never reused within a session (see
     /// `RequestId::validate_incoming`), so this timer cannot end a later
     /// subscription that happens to share the ID.
+    /// Start draining a subscription, or end it now if too many are already
+    /// draining.
+    ///
+    /// Every path that defers teardown goes through here: a draining
+    /// subscription outlives its request stream by design, so the cap is the
+    /// only thing bounding how much state a peer can hold open by never sending
+    /// the streams it announced — or by never sending PUBLISH_DONE at all.
+    fn begin_drain(&self, request_id: u64, expire: fn(&Subscriber, u64), reason: &str) {
+        if self.draining_count() > MAX_CONCURRENT_DRAINS {
+            tracing::warn!(
+                request_id,
+                reason,
+                "too many draining subscriptions; ending this one immediately"
+            );
+            expire(self, request_id);
+            return;
+        }
+
+        tracing::debug!(
+            target: "moq_transport::control",
+            request_id,
+            reason,
+            "draining subscription"
+        );
+        self.arm_drain(request_id, expire);
+    }
+
     fn arm_drain(&self, request_id: u64, expire: fn(&Subscriber, u64)) {
         let session = self.clone();
         let drain = async move {
@@ -1224,40 +1203,41 @@ impl Subscriber {
     pub(super) fn abort_publish_received(&self, request_id: u64) {
         // PUBLISH_DONE is terminal on the request stream, so this runs
         // immediately after a normal end-of-subscription too. Data streams are
-        // separate from the request stream, so a subscription still draining
-        // its announced Stream Count must be left alone: the drain (or its
-        // timeout) owns teardown and preserves the publisher's status code.
-        let recv = match self.publishes_received.lock() {
-            Ok(mut map) => {
-                if map.get(&request_id).is_some_and(|recv| recv.is_draining()) {
-                    tracing::debug!(
-                        request_id,
-                        "PUBLISH request stream closed while draining; keeping state for in-flight streams"
-                    );
-                    return;
-                }
-                map.remove(&request_id)
-            }
+        // independent of the request stream, so a subscription that is still
+        // draining — against an announced Stream Count or against a stream it
+        // is mid-way through reading — is left for the drain (or its timeout)
+        // to finish. Tearing down here would discard Objects already in flight
+        // and lose the publisher's status code.
+        let outcome = match self.publishes_received.lock() {
+            Ok(mut map) => match map.get_mut(&request_id) {
+                Some(recv) => recv.abort(message::PublishDoneCode::InternalError as u64),
+                None => return,
+            },
             Err(_) => {
                 tracing::error!(request_id, "publishes_received lock poisoned");
                 return;
             }
         };
 
-        let Some(mut recv) = recv else {
-            return;
-        };
-
-        // Nothing more can arrive on a dead request stream that never sent
-        // PUBLISH_DONE, so tear down immediately.
-        if recv.force_finish(message::PublishDoneCode::InternalError as u64) {
-            tracing::debug!(
+        match outcome {
+            DoneOutcome::AlreadyDraining => tracing::debug!(
                 request_id,
-                "PUBLISH request stream closed without PUBLISH_DONE"
-            );
-        }
-        if let Err(err) = self.clear_subscription_reservations(request_id) {
-            tracing::error!(request_id, error = %err, "failed to release inbound PUBLISH reservations");
+                "PUBLISH request stream closed while draining; keeping state for in-flight streams"
+            ),
+            DoneOutcome::DrainArmed => self.begin_drain(
+                request_id,
+                Subscriber::expire_publish_done_drain,
+                "PUBLISH request stream closed with a stream still being read",
+            ),
+            DoneOutcome::Finished => {
+                tracing::debug!(
+                    request_id,
+                    "PUBLISH request stream closed without PUBLISH_DONE"
+                );
+                if let Err(err) = self.remove_publish_received_state(request_id) {
+                    tracing::error!(request_id, error = %err, "failed to release inbound PUBLISH reservations");
+                }
+            }
         }
     }
 
@@ -1446,7 +1426,13 @@ impl Subscriber {
             }
         }
 
-        let track_alias = stream_header.subgroup_header.as_ref().unwrap().track_alias;
+        // Peer-parsed: `is_subgroup()` gates this today, but never panic on
+        // decoded input (RFC-022).
+        let track_alias = stream_header
+            .subgroup_header
+            .as_ref()
+            .ok_or(SessionError::Internal)?
+            .track_alias;
         tracing::trace!(
             "[SUBSCRIBER] recv_stream: stream for subscription track_alias={}",
             track_alias
@@ -1481,7 +1467,13 @@ impl Subscriber {
         stream_header: data::StreamHeader,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
-        let track_alias = stream_header.subgroup_header.as_ref().unwrap().track_alias;
+        // Peer-parsed: `is_subgroup()` gates this today, but never panic on
+        // decoded input (RFC-022).
+        let track_alias = stream_header
+            .subgroup_header
+            .as_ref()
+            .ok_or(SessionError::Internal)?
+            .track_alias;
         tracing::trace!(
             "[SUBSCRIBER] recv_stream_inner: processing stream for track_alias={}",
             track_alias
@@ -2179,12 +2171,15 @@ mod tests {
         assert!(subscriber.track_alias_map.lock().unwrap().is_empty());
     }
 
+    /// §5.1 allows only one subscriber-role subscription per track, so the
+    /// track name is derived from the request ID: a test that registers several
+    /// inbound PUBLISHes at once would otherwise be rejected as a duplicate.
     fn inbound_publish(subscriber: &mut Subscriber, id: u64, track_alias: u64) {
         subscriber
             .recv_publish(&message::Publish {
                 id,
                 track_namespace: TrackNamespace::from_utf8_path("test/ns"),
-                track_name: "video".into(),
+                track_name: format!("video-{id}").into(),
                 track_alias,
                 params: Default::default(),
                 track_extensions: Default::default(),
@@ -2261,12 +2256,7 @@ mod tests {
             "the Track Alias must be released"
         );
         assert!(
-            subscriber
-                .subscriber_names
-                .lock()
-                .unwrap()
-                .by_request_id
-                .is_empty(),
+            subscriber.subscriber_names.lock().unwrap().is_empty(),
             "the track name reservation must be released so it can be republished"
         );
     }
@@ -2303,9 +2293,37 @@ mod tests {
     async fn draining_subscriptions_are_capped() {
         let (mut subscriber, _tasks) = test_subscriber_with_tasks(loopback_session().await);
 
-        for id in 0..(MAX_CONCURRENT_DRAINS as u64 + 20) {
+        // Peer-initiated request IDs are odd for a client session (§10.1).
+        for n in 0..(MAX_CONCURRENT_DRAINS as u64 + 20) {
+            let id = n * 2 + 1;
             inbound_publish(&mut subscriber, id, id + 1000);
+            assert!(
+                !subscriber.publishes_received.lock().unwrap().is_empty(),
+                "the inbound PUBLISH must be registered for the cap to mean anything"
+            );
             publish_done(&mut subscriber, id, 1);
+        }
+
+        assert!(
+            subscriber.draining_count() <= MAX_CONCURRENT_DRAINS + 1,
+            "draining subscriptions must stay bounded, got {}",
+            subscriber.draining_count()
+        );
+    }
+
+    /// A peer that never sends PUBLISH_DONE must not escape the drain cap by
+    /// resetting the request stream instead — that path also defers teardown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_subscriptions_are_capped_too() {
+        let (mut subscriber, _tasks) = test_subscriber_with_tasks(loopback_session().await);
+
+        // Peer-initiated request IDs are odd for a client session (§10.1).
+        for n in 0..(MAX_CONCURRENT_DRAINS as u64 + 20) {
+            let id = n * 2 + 1;
+            inbound_publish(&mut subscriber, id, id + 1000);
+            // A data stream is mid-transfer, then the request stream dies.
+            assert!(subscriber.note_publish_stream_received(id), "id={id}");
+            subscriber.abort_publish_received(id);
         }
 
         assert!(
@@ -2327,11 +2345,6 @@ mod tests {
 
         assert!(subscriber.publishes_received.lock().unwrap().is_empty());
         assert!(subscriber.track_alias_map.lock().unwrap().is_empty());
-        assert!(subscriber
-            .subscriber_names
-            .lock()
-            .unwrap()
-            .by_request_id
-            .is_empty());
+        assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
     }
 }

@@ -183,9 +183,10 @@ impl Producer {
             // drops, its upstream subscription becomes eligible for release.
             let _interest_guard = local.interest;
 
-            // Draft-16 §8.4: a relay MUST have an Established upstream
-            // subscription before it sends SUBSCRIBE_OK. A pull-through cache
-            // entry exists before its upstream subscription does, so wait for it.
+            // Draft-18 §9.4: "The relay MUST have an Established upstream
+            // subscription before sending SUBSCRIBE_OK in response to a
+            // downstream SUBSCRIBE." A pull-through cache entry exists before
+            // its upstream subscription does, so wait for it.
             if let Some(upstream) = local.upstream {
                 if let Err(outcome) = Self::await_upstream(&subscribed, &upstream).await {
                     // Which side ended the wait is decided by the branch that

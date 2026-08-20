@@ -22,7 +22,11 @@
 //! (`PublishReceivedRecv`) and SUBSCRIBE-created ones (`SubscribeRecv`). `T` is
 //! the terminal value each one applies when the drain completes.
 
-/// What [`StreamDrain::arm`] did with a PUBLISH_DONE.
+/// What [`StreamDrain::arm`] did with a terminal condition.
+///
+/// Ignoring this leaks the subscription: a deferred teardown that nobody arms a
+/// timer for keeps its state until the session ends.
+#[must_use]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DoneOutcome {
     /// The subscription ended; the caller releases its session-level state.
@@ -80,8 +84,12 @@ impl<T> StreamDrain<T> {
         self.take_if_drained()
     }
 
-    /// Record PUBLISH_DONE. Returns what the caller must do next, and the
-    /// terminal value when the subscription can end immediately.
+    /// Record a terminal condition: PUBLISH_DONE, or a request stream that
+    /// died (pass `stream_count` 0 — nothing further can be announced, but a
+    /// stream already being read still has to finish).
+    ///
+    /// Returns what the caller must do next, and the terminal value when the
+    /// subscription can end immediately.
     pub fn arm(&mut self, terminal: T, stream_count: u64) -> (DoneOutcome, Option<T>) {
         if self.finished {
             return (DoneOutcome::Finished, None);

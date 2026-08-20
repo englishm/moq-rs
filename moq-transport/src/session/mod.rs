@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod error;
+mod name_registry;
 mod publish_namespace;
 mod publish_received;
 mod published;
@@ -20,6 +21,7 @@ mod track_status_requested;
 mod writer;
 
 pub use error::*;
+pub(crate) use name_registry::NameRegistry;
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
 pub(crate) use publish_received::PublishReceivedRecv;
@@ -604,13 +606,18 @@ impl Session {
 
         // Client sends even IDs (0); peer server sends odd IDs (1).
         let request_id = RequestId::new(0, 1);
-        let session = Session::new(session, sender, recver, mlog, transport, path, request_id);
-        Ok((session.0, session.1.unwrap(), session.2.unwrap()))
+        let (session, publisher, subscriber) =
+            Session::new(session, sender, recver, mlog, transport, path, request_id);
+        // Both roles are always constructed for a client session; propagate
+        // rather than panic if that ever stops holding (RFC-022).
+        let publisher = publisher.ok_or(SessionError::Internal)?;
+        let subscriber = subscriber.ok_or(SessionError::Internal)?;
+        Ok((session, publisher, subscriber))
     }
 
     /// Accept an inbound server connection.
     ///
-    /// Opens a unidirectional control stream and accepts the peer.s, decodes SETUP,
+    /// Opens a unidirectional control stream and accepts the peer's, decodes SETUP,
     /// sends SETUP with parameters only.  Version is already agreed
     /// via ALPN before this is called.
     pub async fn accept(
@@ -832,6 +839,14 @@ impl Session {
     /// by responses/follow-ups on the same stream.
     /// Maximum number of bidi request handler tasks running concurrently.
     /// Provides back-pressure when a peer opens many streams at once.
+    ///
+    /// Note this bounds *live requests*, not just request setup: draft-18 keeps
+    /// SUBSCRIBE, PUBLISH, PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE and FETCH on
+    /// their own bidi stream for the whole life of the request, so a slot is
+    /// held until the subscription ends rather than until it is acknowledged.
+    /// A peer with more than this many concurrent subscriptions on one session
+    /// stalls rather than erroring, so raise it (or make it configurable)
+    /// before fanning out large numbers of tracks over a single session.
     const MAX_CONCURRENT_BIDI_STREAMS: usize = 128;
 
     /// Upper bound on how long a bidi request handler waits, applied to two
@@ -1201,7 +1216,7 @@ impl Session {
         let mut payload = bytes::BytesMut::new();
         match msg {
             Message::RequestOk(m) => {
-                m.params.encode(&mut payload)?;
+                m.params.encode_message_params(&mut payload)?;
             }
             Message::RequestError(m) => {
                 m.error_code.encode(&mut payload)?;
@@ -1210,7 +1225,7 @@ impl Session {
             }
             Message::SubscribeOk(m) => {
                 m.track_alias.encode(&mut payload)?;
-                m.params.encode(&mut payload)?;
+                m.params.encode_message_params(&mut payload)?;
                 m.track_extensions.encode(&mut payload)?;
             }
             Message::PublishDone(m) => {
@@ -1229,12 +1244,12 @@ impl Session {
                 m.track_namespace_suffix.encode(&mut payload)?;
             }
             Message::PublishOk(m) => {
-                m.params.encode(&mut payload)?;
+                m.params.encode_message_params(&mut payload)?;
             }
             Message::FetchOk(m) => {
                 m.end_of_track.encode(&mut payload)?;
                 m.end_location.encode(&mut payload)?;
-                m.params.encode(&mut payload)?;
+                m.params.encode_message_params(&mut payload)?;
                 m.track_extensions.encode(&mut payload)?;
             }
             other => {
@@ -1304,7 +1319,7 @@ impl Session {
                 }))
             }
             wire_id::RequestOk => {
-                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                let params = crate::coding::KeyValuePairs::decode_message_params(&mut buf)?;
                 Ok(Message::RequestOk(message::RequestOk {
                     id: request_id,
                     params,
@@ -1312,7 +1327,7 @@ impl Session {
             }
             wire_id::SubscribeOk => {
                 let track_alias = u64::decode(&mut buf)?;
-                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                let params = crate::coding::KeyValuePairs::decode_message_params(&mut buf)?;
                 let track_extensions = message::TrackExtensions::decode(&mut buf)?;
                 Ok(Message::SubscribeOk(message::SubscribeOk {
                     id: request_id,
@@ -1353,7 +1368,7 @@ impl Session {
                 }))
             }
             wire_id::PublishOk => {
-                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                let params = crate::coding::KeyValuePairs::decode_message_params(&mut buf)?;
                 Ok(Message::PublishOk(message::PublishOk {
                     id: request_id,
                     params,
@@ -1362,7 +1377,7 @@ impl Session {
             wire_id::FetchOk => {
                 let end_of_track = bool::decode(&mut buf)?;
                 let end_location = crate::coding::Location::decode(&mut buf)?;
-                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                let params = crate::coding::KeyValuePairs::decode_message_params(&mut buf)?;
                 let track_extensions = message::TrackExtensions::decode(&mut buf)?;
                 Ok(Message::FetchOk(message::FetchOk {
                     id: request_id,

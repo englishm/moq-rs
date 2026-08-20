@@ -338,7 +338,6 @@ impl SubscribeRecv {
     /// The subscription is kept alive until the announced Stream Count has been
     /// received and every stream has closed, so Objects the publisher already
     /// sent are still delivered. See [`DoneOutcome`].
-    #[must_use]
     pub fn recv_done(&mut self, err: ServeError, stream_count: u64) -> DoneOutcome {
         let (outcome, terminal) = self.drain.arm(err, stream_count);
         if let Some(err) = terminal {
@@ -350,6 +349,26 @@ impl SubscribeRecv {
     /// True while waiting for streams announced by PUBLISH_DONE.
     pub fn is_draining(&self) -> bool {
         self.drain.is_draining()
+    }
+
+    /// End the subscription because its request stream died.
+    ///
+    /// No further Stream Count can be announced, but a data stream already
+    /// being read still has to finish, so this can defer exactly like
+    /// PUBLISH_DONE does.
+    pub fn abort(&mut self, err: ServeError) -> DoneOutcome {
+        if self.drain.is_finished() {
+            return DoneOutcome::Finished;
+        }
+        if self.drain.is_draining() {
+            return DoneOutcome::AlreadyDraining;
+        }
+
+        let (outcome, terminal) = self.drain.arm(err, 0);
+        if let Some(err) = terminal {
+            self.finish(err);
+        }
+        outcome
     }
 
     /// Give up waiting for announced streams (§10.11 requires this backstop).
@@ -484,6 +503,70 @@ mod tests {
             params,
         })
         .unwrap()
+    }
+
+    async fn test_recv() -> (Subscribe, SubscribeRecv) {
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = crate::session::Subscriber::new(
+            crate::watch::Queue::default(),
+            crate::session::test_support::loopback_session().await,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (writer, _reader) =
+            crate::serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let (send, recv, _msg) = Subscribe::new(subscriber, 0, writer);
+        (send, recv)
+    }
+
+    /// §10.11: the request stream can die while a data stream is still being
+    /// read. Tearing down here discards Objects already in flight — the same
+    /// loss the drain exists to prevent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_waits_for_a_stream_still_being_read() {
+        let (_send, mut recv) = test_recv().await;
+
+        recv.note_stream_received();
+        assert_eq!(
+            recv.abort(ServeError::Cancel),
+            DoneOutcome::DrainArmed,
+            "teardown defers while a stream is mid-transfer"
+        );
+        assert!(
+            recv.writer.is_some(),
+            "the writer must survive so the in-flight Object can be written"
+        );
+
+        assert!(recv.note_stream_finished(), "closing the stream ends it");
+        assert!(recv.writer.is_none());
+    }
+
+    /// With nothing in flight the subscription must fail immediately, so an
+    /// application awaiting `Subscribe::ok()` is not left waiting for the life
+    /// of the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_fails_an_idle_subscription_immediately() {
+        let (send, mut recv) = test_recv().await;
+
+        assert_eq!(recv.abort(ServeError::Cancel), DoneOutcome::Finished);
+        assert_eq!(send.ok().await, Err(ServeError::Cancel));
+    }
+
+    /// A drain already carries the publisher's own status code, so an abort
+    /// must not replace it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_leaves_an_armed_drain_alone() {
+        let (send, mut recv) = test_recv().await;
+
+        assert_eq!(
+            recv.recv_done(ServeError::Closed(0x6), 4),
+            DoneOutcome::DrainArmed
+        );
+        assert_eq!(recv.abort(ServeError::Cancel), DoneOutcome::AlreadyDraining);
+
+        assert!(recv.drain_timeout());
+        assert_eq!(send.closed().await, Err(ServeError::Closed(0x6)));
     }
 
     #[test]

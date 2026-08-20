@@ -587,11 +587,14 @@ impl ObjectForwarder {
                 data::DatagramType::ObjectIdPayload
             };
 
+            // Bound locally so the logging and largest-location updates below
+            // read it directly instead of unwrapping the Option again.
+            let object_id = datagram.object_id;
             let encoded_datagram = data::Datagram {
                 datagram_type,
                 track_alias: self.track_alias,
                 group_id: datagram.group_id,
-                object_id: Some(datagram.object_id),
+                object_id: Some(object_id),
                 publisher_priority: datagram.priority,
                 extension_headers: if has_extension_headers {
                     Some(datagram.extension_headers.clone())
@@ -615,7 +618,7 @@ impl ObjectForwarder {
                 datagram_count + 1,
                 encoded_datagram.track_alias,
                 encoded_datagram.group_id,
-                encoded_datagram.object_id.unwrap(),
+                object_id,
                 encoded_datagram.publisher_priority,
                 payload_len,
                 encoded_datagram.extension_headers,
@@ -640,10 +643,7 @@ impl ObjectForwarder {
             self.state
                 .lock_mut()
                 .ok_or(ServeError::Done)?
-                .update_largest_location(
-                    encoded_datagram.group_id,
-                    encoded_datagram.object_id.unwrap(),
-                )?;
+                .update_largest_location(encoded_datagram.group_id, object_id)?;
 
             datagram_count += 1;
         }

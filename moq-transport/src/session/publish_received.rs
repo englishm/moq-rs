@@ -415,7 +415,6 @@ impl PublishReceivedRecv {
     /// lost.
     ///
     /// See [`DoneOutcome`] for what the caller must do with each result.
-    #[must_use]
     pub fn recv_done(&mut self, status_code: u64, stream_count: u64) -> DoneOutcome {
         // A repeat PUBLISH_DONE must not re-arm a subscription that already
         // finished, nor replace the count an earlier one is draining against.
@@ -431,23 +430,28 @@ impl PublishReceivedRecv {
         self.drain.is_draining()
     }
 
-    /// Tear the subscription down now, whatever it is waiting for.
+    /// End the subscription because its request stream died.
     ///
-    /// Used when nothing further can arrive, e.g. the request stream died
-    /// without PUBLISH_DONE.
-    ///
-    /// Callers are expected to skip draining subscriptions (the drain owns
-    /// their teardown), but if one is forced anyway the publisher's own status
-    /// code is preserved in preference to `status_code`.
-    ///
-    /// Returns `true` if this call ended the subscription.
-    pub fn force_finish(&mut self, status_code: u64) -> bool {
+    /// No further Stream Count can be announced, but a data stream already
+    /// being read still has to finish, so this can defer exactly like
+    /// PUBLISH_DONE does. See [`DoneOutcome`] for what the caller must do.
+    pub fn abort(&mut self, status_code: u64) -> DoneOutcome {
         if self.drain.is_finished() {
-            return false;
+            return DoneOutcome::Finished;
         }
-        let status_code = self.drain.timeout().unwrap_or(status_code);
-        self.finish(status_code);
-        true
+        if self.drain.is_draining() {
+            // A drain already owns teardown and carries the publisher's own
+            // status code, which is better than this placeholder.
+            return DoneOutcome::AlreadyDraining;
+        }
+
+        // Stream Count 0: nothing further can be announced on a dead request
+        // stream, but streams already being read must still finish.
+        let (outcome, terminal) = self.drain.arm(status_code, 0);
+        if let Some(status_code) = terminal {
+            self.finish(status_code);
+        }
+        outcome
     }
 
     /// Force teardown of a subscription still waiting for announced streams.
@@ -720,35 +724,74 @@ mod tests {
         assert!(!recv.drain_timeout(), "no drain is pending once finished");
     }
 
-    /// The request stream dying mid-drain must not lose the status code the
-    /// publisher already sent in PUBLISH_DONE.
+    /// The request stream dying mid-drain must not cancel the drain, nor lose
+    /// the status code the publisher already sent in PUBLISH_DONE.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn force_finish_keeps_the_publishers_status_code() {
+    async fn abort_leaves_an_armed_drain_alone() {
         let (pr, mut recv, _sub) = make_pair(13).await;
 
         assert_eq!(
             recv.recv_done(message::PublishDoneCode::Expired as u64, 4),
             DoneOutcome::DrainArmed
         );
-        assert!(recv.force_finish(message::PublishDoneCode::InternalError as u64));
+        assert_eq!(
+            recv.abort(message::PublishDoneCode::InternalError as u64),
+            DoneOutcome::AlreadyDraining
+        );
 
+        // The drain still owns teardown, and still carries the publisher's code.
+        assert!(recv.drain_timeout());
         assert!(
             matches!(pr.closed().await, Err(ServeError::Closed(code)) if code == message::PublishDoneCode::Expired as u64),
-            "the drain's status code wins over the abort's placeholder"
+            "the publisher's status code survives the abort"
         );
     }
 
-    /// With no drain pending, `force_finish` applies the caller's code.
+    /// With nothing in flight, a dead request stream ends the subscription
+    /// immediately and applies the caller's code.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn force_finish_uses_its_own_code_when_no_drain_is_pending() {
+    async fn abort_ends_an_idle_subscription_immediately() {
         let (pr, mut recv, _sub) = make_pair(14).await;
 
-        assert!(recv.force_finish(message::PublishDoneCode::InternalError as u64));
-        assert!(
-            !recv.force_finish(message::PublishDoneCode::InternalError as u64),
+        assert_eq!(
+            recv.abort(message::PublishDoneCode::InternalError as u64),
+            DoneOutcome::Finished
+        );
+        assert_eq!(
+            recv.abort(message::PublishDoneCode::InternalError as u64),
+            DoneOutcome::Finished,
             "a finished subscription is not finished twice"
         );
 
+        assert!(matches!(
+            pr.closed().await,
+            Err(ServeError::Closed(code)) if code == message::PublishDoneCode::InternalError as u64
+        ));
+    }
+
+    /// §10.11: the request stream can die before PUBLISH_DONE ever arrives. A
+    /// data stream already being read must still be delivered — dropping the
+    /// writer here loses Objects the publisher legitimately sent, which is the
+    /// same failure this module exists to prevent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_waits_for_a_stream_still_being_read() {
+        let (pr, mut recv, _sub) = make_pair(15).await;
+
+        recv.note_stream_received();
+        assert_eq!(
+            recv.abort(message::PublishDoneCode::InternalError as u64),
+            DoneOutcome::DrainArmed,
+            "teardown defers while a stream is mid-transfer"
+        );
+        assert!(
+            recv.writer.is_some(),
+            "the writer must survive so the in-flight Object can be written"
+        );
+        recv.subgroup(subgroup_header(0))
+            .expect("the in-flight stream can still be written");
+
+        assert!(recv.note_stream_finished(), "closing the stream ends it");
+        assert!(recv.writer.is_none());
         assert!(matches!(
             pr.closed().await,
             Err(ServeError::Closed(code)) if code == message::PublishDoneCode::InternalError as u64
