@@ -43,9 +43,17 @@ pub enum ServeError {
 }
 
 impl ServeError {
-    /// Returns error codes for per-request/per-track errors.
-    /// These codes are used in SUBSCRIBE_ERROR, PUBLISH_DONE, FETCH_ERROR, etc.
-    /// Error codes are based on draft-ietf-moq-transport-14 Section 13.1.x
+    /// Legacy per-request/per-track error codes.
+    ///
+    /// These predate draft-18 and do **not** match its registries: `NotFound`
+    /// answers 0x4 where §15.10.2 assigns DOES_NOT_EXIST 0x10, and `Done`
+    /// answers 0x0 where the PUBLISH_DONE path in `session::subscribed` uses
+    /// TRACK_ENDED 0x2. The only wire user left is PUBLISH_NAMESPACE_CANCEL.
+    ///
+    /// New code should map to [`RequestErrorCode`](crate::message::RequestErrorCode)
+    /// or [`PublishDoneCode`](crate::message::PublishDoneCode) directly.
+    ///
+    /// TODO: retire this in favour of the registry enums.
     pub fn code(&self) -> u64 {
         match self {
             // Special case: 0 typically means successful completion or internal error depending on context

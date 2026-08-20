@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! REQUEST_ERROR message (draft-ietf-moq-transport-16 §9.8).
+//! REQUEST_ERROR message (draft-ietf-moq-transport-18 §10.6).
 //!
 //! Sent in response to any request (SUBSCRIBE, FETCH, PUBLISH,
 //! SUBSCRIBE_NAMESPACE, PUBLISH_NAMESPACE, TRACK_STATUS, REQUEST_UPDATE).
@@ -9,7 +9,7 @@
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, ReasonPhrase};
 
-/// Draft-16 §13.4.2 REQUEST_ERROR codes.
+/// REQUEST_ERROR codes from the draft-18 §15.10.2 IANA registry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
 pub enum RequestErrorCode {
@@ -19,13 +19,24 @@ pub enum RequestErrorCode {
     NotSupported = 0x3,
     MalformedAuthToken = 0x4,
     ExpiredAuthToken = 0x5,
+    GoingAway = 0x6,
+    ExcessiveLoad = 0x9,
     DoesNotExist = 0x10,
     InvalidRange = 0x11,
     MalformedTrack = 0x12,
     DuplicateSubscription = 0x19,
     Uninterested = 0x20,
     PrefixOverlap = 0x30,
+    NamespaceTooLarge = 0x31,
     InvalidJoiningRequestId = 0x32,
+    /// Required by §2.5.1 when a peer does not understand a Mandatory Track
+    /// Property (types 0x4000-0x7FFF) carried by PUBLISH, SUBSCRIBE_OK or
+    /// FETCH_OK.
+    UnsupportedExtension = 0x33,
+    /// §10.6.2 requires a trailing Redirect structure whenever this code is
+    /// used, which [`RequestError`] cannot encode yet. Recognise it on receive;
+    /// do not send it until the structure is implemented.
+    Redirect = 0x34,
 }
 
 impl From<RequestErrorCode> for u64 {
@@ -113,6 +124,29 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = RequestError::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    /// The wire values come from the draft-18 §15.10.2 registry (Table 18).
+    #[test]
+    fn codes_match_the_iana_registry() {
+        assert_eq!(RequestErrorCode::InternalError as u64, 0x0);
+        assert_eq!(RequestErrorCode::Unauthorized as u64, 0x1);
+        assert_eq!(RequestErrorCode::Timeout as u64, 0x2);
+        assert_eq!(RequestErrorCode::NotSupported as u64, 0x3);
+        assert_eq!(RequestErrorCode::MalformedAuthToken as u64, 0x4);
+        assert_eq!(RequestErrorCode::ExpiredAuthToken as u64, 0x5);
+        assert_eq!(RequestErrorCode::GoingAway as u64, 0x6);
+        assert_eq!(RequestErrorCode::ExcessiveLoad as u64, 0x9);
+        assert_eq!(RequestErrorCode::DoesNotExist as u64, 0x10);
+        assert_eq!(RequestErrorCode::InvalidRange as u64, 0x11);
+        assert_eq!(RequestErrorCode::MalformedTrack as u64, 0x12);
+        assert_eq!(RequestErrorCode::DuplicateSubscription as u64, 0x19);
+        assert_eq!(RequestErrorCode::Uninterested as u64, 0x20);
+        assert_eq!(RequestErrorCode::PrefixOverlap as u64, 0x30);
+        assert_eq!(RequestErrorCode::NamespaceTooLarge as u64, 0x31);
+        assert_eq!(RequestErrorCode::InvalidJoiningRequestId as u64, 0x32);
+        assert_eq!(RequestErrorCode::UnsupportedExtension as u64, 0x33);
+        assert_eq!(RequestErrorCode::Redirect as u64, 0x34);
     }
 
     #[test]

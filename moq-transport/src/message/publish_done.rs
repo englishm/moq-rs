@@ -3,7 +3,7 @@
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, ReasonPhrase};
 
-/// Draft-16 §13.4.3 PUBLISH_DONE codes.
+/// PUBLISH_DONE codes from the draft-18 §15.10.3 IANA registry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
 pub enum PublishDoneCode {
@@ -12,9 +12,10 @@ pub enum PublishDoneCode {
     TrackEnded = 0x2,
     SubscriptionEnded = 0x3,
     GoingAway = 0x4,
-    Expired = 0x5,
-    TooFarBehind = 0x6,
+    TooFarBehind = 0x5,
+    Expired = 0x6,
     UpdateFailed = 0x8,
+    ExcessiveLoad = 0x9,
     MalformedTrack = 0x12,
 }
 
@@ -85,5 +86,22 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = PublishDone::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    /// The wire values come from the draft-18 §15.10.3 registry (Table 19).
+    /// TOO_FAR_BEHIND and EXPIRED are adjacent and were previously swapped, so
+    /// pin every code rather than only the pair that was wrong.
+    #[test]
+    fn codes_match_the_iana_registry() {
+        assert_eq!(PublishDoneCode::InternalError as u64, 0x0);
+        assert_eq!(PublishDoneCode::Unauthorized as u64, 0x1);
+        assert_eq!(PublishDoneCode::TrackEnded as u64, 0x2);
+        assert_eq!(PublishDoneCode::SubscriptionEnded as u64, 0x3);
+        assert_eq!(PublishDoneCode::GoingAway as u64, 0x4);
+        assert_eq!(PublishDoneCode::TooFarBehind as u64, 0x5);
+        assert_eq!(PublishDoneCode::Expired as u64, 0x6);
+        assert_eq!(PublishDoneCode::UpdateFailed as u64, 0x8);
+        assert_eq!(PublishDoneCode::ExcessiveLoad as u64, 0x9);
+        assert_eq!(PublishDoneCode::MalformedTrack as u64, 0x12);
     }
 }
