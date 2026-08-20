@@ -33,9 +33,10 @@ pub enum RequestErrorCode {
     /// Property (types 0x4000-0x7FFF) carried by PUBLISH, SUBSCRIBE_OK or
     /// FETCH_OK.
     UnsupportedExtension = 0x33,
-    /// §10.6.2 requires a trailing Redirect structure whenever this code is
-    /// used, which [`RequestError`] cannot encode yet. Recognise it on receive;
-    /// do not send it until the structure is implemented.
+    /// §10.6.2 requires a trailing Redirect structure (defined in §10.6.1)
+    /// whenever this code is used, which [`RequestError`] cannot encode yet.
+    /// Recognise it on receive; do not send it until the structure is
+    /// implemented.
     Redirect = 0x34,
 }
 
