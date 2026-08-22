@@ -158,13 +158,84 @@ pub struct UpstreamReadyTx {
 impl UpstreamReadyTx {
     /// Report that the upstream publisher acknowledged the SUBSCRIBE.
     pub fn established(&self) {
-        // Fails only when every downstream subscriber has already gone away.
-        let _ = self.state.send(UpstreamState::Established);
+        self.resolve(UpstreamState::Established);
     }
 
     /// Report that the upstream subscription could not be established.
     pub fn failed(&self, err: ServeError) {
-        let _ = self.state.send(UpstreamState::Failed(err));
+        self.resolve(UpstreamState::Failed(err));
+    }
+
+    /// Record the outcome, whether or not anyone is currently waiting.
+    ///
+    /// `watch::Sender::send` refuses to update once the last receiver is gone,
+    /// which would leave the state on `Pending` forever and make a resolved
+    /// subscription indistinguishable from an abandoned one. The outcome is
+    /// what [`Drop`] keys off, so it has to be recorded unconditionally.
+    fn resolve(&self, outcome: UpstreamState) {
+        self.state.send_replace(outcome);
+    }
+}
+
+/// Resolve the gate on drop so abandonment is never silent.
+///
+/// Most ways this sender dies are not calls to [`UpstreamReadyTx::established`]
+/// or [`UpstreamReadyTx::failed`]: the owning session can return early, be torn
+/// down mid-handshake, or have its task dropped while parked on the upstream
+/// SUBSCRIBE. In every one of those cases the publisher really is gone, so
+/// failing the gate is the correct outcome and not merely a better log line —
+/// waiting subscribers must be released rather than left until the response
+/// timeout.
+///
+/// Without this, the sender's disappearance was only observable as a closed
+/// channel, which surfaced downstream as an unattributable internal error with
+/// no indication of which session gave up or why.
+impl Drop for UpstreamReadyTx {
+    fn drop(&mut self) {
+        // Fast path: already resolved. Checked before building the error so a
+        // successful subscription's teardown neither allocates nor takes the
+        // write lock.
+        //
+        // This must stay an `if` around `matches!`. The condition of an `if` is
+        // a temporary scope, so the read guard is released before the body
+        // runs; `if let` is not, and would hold it across the write lock below
+        // and self-deadlock every abandoned request.
+        if !matches!(&*self.state.borrow(), UpstreamState::Pending) {
+            return;
+        }
+
+        // Deliberately not `ServeError::internal_ctx`: that mints a UUID, and
+        // `Uuid::new_v4` panics rather than degrading when the OS entropy
+        // source is unavailable (seccomp-blocked `getrandom`, an exhausted fd
+        // table with no `/dev/urandom`). A `Drop` must not make a fallible
+        // syscall — and this one especially must not, because it runs *during*
+        // unwinding: a panic here while another panic is in flight aborts the
+        // process, turning one failed task into a dead relay.
+        //
+        // Nothing is logged here either. The waiting subscriber already reports
+        // this at its own site, with the namespace and track attached, so the
+        // reason only has to be carried in the error itself. Spelling it out
+        // rather than hiding it behind a correlation id makes that report
+        // self-explanatory and gives the downstream REQUEST_ERROR an honest
+        // reason phrase; there is nothing sensitive in "the publisher left".
+        //
+        // Built out here rather than in the closure so the allocation stays off
+        // the write lock, and so the closure cannot do anything but match and
+        // move — `send_if_modified` re-raises a panicking closure.
+        let err = ServeError::Internal(
+            "upstream publisher went away before the subscription was established".to_string(),
+        );
+
+        // Re-check under the lock so a concurrently recorded outcome always
+        // wins over this fallback; the sender is never cloned, so this is
+        // belt-and-braces rather than a live race.
+        self.state.send_if_modified(|state| match state {
+            UpstreamState::Pending => {
+                *state = UpstreamState::Failed(err);
+                true
+            }
+            _ => false,
+        });
     }
 }
 
@@ -1961,9 +2032,177 @@ mod tests {
             .established()
             .await
             .expect_err("an abandoned request must not leave subscribers waiting forever");
+        // The reason is spelled out rather than reported as an opaque internal
+        // error: abandonment used to be indistinguishable from any other
+        // internal fault once it reached the subscriber.
         assert!(
-            matches!(err, ServeError::InternalWithId(_, _)),
+            matches!(&err, ServeError::Internal(reason) if reason.contains("upstream publisher went away")),
             "unexpected error: {err}"
+        );
+    }
+
+    /// The production strand: the owning session gives up *before* it ever
+    /// drains its request queue, so the request is destroyed while still
+    /// buffered in the channel rather than after being received.
+    ///
+    /// This is `Consumer::serve` returning early — a failed coordinator
+    /// registration, or the session being torn down — after
+    /// `register_namespace` has already published the route source. Distinct
+    /// from `abandoned_request_releases_waiting_subscribers`, which drops a
+    /// request that was successfully received.
+    #[tokio::test]
+    async fn requests_stranded_in_the_queue_release_waiting_subscribers() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        // A downstream SUBSCRIBE lands in the window between the route source
+        // being published and the owning session reaching its drain loop.
+        let upstream = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("missing track should be requested")
+            .upstream
+            .expect("cached track should hand back a gate");
+
+        // The session aborts without ever calling `requests.recv()`.
+        drop(requests);
+
+        let err = tokio::time::timeout(Duration::from_secs(5), upstream.established())
+            .await
+            .expect("a stranded request must not leave subscribers waiting")
+            .expect_err("a stranded request is not an established subscription");
+        assert!(
+            matches!(&err, ServeError::Internal(reason) if reason.contains("upstream publisher went away")),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A resolved gate must survive the sender's drop.
+    ///
+    /// The sender outlives `established()` by the whole lifetime of the
+    /// upstream subscription, so if its `Drop` overwrote the outcome, every
+    /// subscriber arriving after a track stopped would be told the upstream
+    /// failed when it had in fact succeeded.
+    #[tokio::test]
+    async fn dropping_a_resolved_sender_does_not_overwrite_the_outcome() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let upstream = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("missing track should be requested")
+            .upstream
+            .expect("cached track should hand back a gate");
+
+        let request = requests.recv().await.expect("source should get a request");
+        request.upstream.established();
+        drop(request);
+
+        tokio::time::timeout(Duration::from_secs(5), upstream.established())
+            .await
+            .expect("a resolved gate must not block")
+            .expect("dropping the sender must not turn success into failure");
+    }
+
+    /// The same guarantee for an explicit failure: the reported reason must not
+    /// be replaced by the generic drop fallback.
+    #[tokio::test]
+    async fn dropping_a_failed_sender_preserves_the_reported_reason() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let upstream = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("missing track should be requested")
+            .upstream
+            .expect("cached track should hand back a gate");
+
+        let request = requests.recv().await.expect("source should get a request");
+        request.upstream.failed(ServeError::NotFound);
+        drop(request);
+
+        let err = tokio::time::timeout(Duration::from_secs(5), upstream.established())
+            .await
+            .expect("a resolved gate must not block")
+            .expect_err("the upstream failure should surface");
+        assert!(
+            matches!(err, ServeError::NotFound),
+            "drop fallback overwrote the real reason: {err}"
+        );
+    }
+
+    /// Resolving with every receiver already gone must still be recorded.
+    ///
+    /// `watch::Sender::send` refuses to update once the last receiver drops,
+    /// which would leave a successfully established subscription sitting on
+    /// `Pending` — indistinguishable from abandonment, and so reported as a
+    /// spurious failure by the `Drop` fallback.
+    ///
+    /// Driven against the sender directly: in the registry the cache entry
+    /// holds its own receiver, so the last-receiver case cannot be staged
+    /// through `get_or_request_track`.
+    #[test]
+    fn outcome_is_recorded_after_the_last_receiver_is_gone() {
+        let (state_tx, state_rx) = watch::channel(UpstreamState::Pending);
+        let tx = UpstreamReadyTx { state: state_tx };
+
+        drop(state_rx);
+        tx.established();
+
+        assert!(
+            matches!(&*tx.state.borrow(), UpstreamState::Established),
+            "the outcome must be recorded even with no receivers left"
+        );
+    }
+
+    /// With the outcome recorded, `Drop` must leave it alone — otherwise the
+    /// fallback would rewrite a success into a failure.
+    #[test]
+    fn drop_does_not_rewrite_an_outcome_recorded_without_receivers() {
+        let (state_tx, state_rx) = watch::channel(UpstreamState::Pending);
+        let tx = UpstreamReadyTx { state: state_tx };
+
+        // Genuinely zero receivers at the moment the outcome is reported; the
+        // observer re-attaches only afterwards, standing in for a subscriber
+        // that arrives while the track is still cached.
+        drop(state_rx);
+        tx.established();
+        let observer = tx.state.subscribe();
+        drop(tx);
+
+        assert!(
+            matches!(&*observer.borrow(), UpstreamState::Established),
+            "drop must not overwrite a recorded success"
+        );
+    }
+
+    /// An unresolved sender must fail the gate on drop rather than leaving it
+    /// pending: that is what releases subscribers when a session is torn down
+    /// while parked on the upstream SUBSCRIBE.
+    #[test]
+    fn drop_resolves_an_unreported_outcome_as_failed() {
+        let (state_tx, state_rx) = watch::channel(UpstreamState::Pending);
+        let tx = UpstreamReadyTx { state: state_tx };
+
+        drop(tx);
+
+        assert!(
+            matches!(&*state_rx.borrow(), UpstreamState::Failed(_)),
+            "an unresolved sender must fail the gate on drop"
         );
     }
 
