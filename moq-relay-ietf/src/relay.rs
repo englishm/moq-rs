@@ -215,9 +215,10 @@ impl Relay {
                     .context("failed to establish forward connection")?;
 
                 // Create the MoQ session over the connection
+                let forward_session_id = moq_transport::session::SessionId::new(forward_cid);
                 let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config(
                     session,
-                    moq_transport::session::SessionId::new(forward_cid),
+                    forward_session_id.clone(),
                     None,
                     transport,
                     session_config,
@@ -240,6 +241,7 @@ impl Relay {
                 // upstream paths) would require per-scope forward connections.
                 let forward_scope = session.connection_path().map(|s| s.to_string());
                 let forward_context = SessionContext::internal(
+                    forward_session_id,
                     forward_scope,
                     Some(RelayInfo::new(url.clone())),
                 );
@@ -260,12 +262,13 @@ impl Relay {
                         forward_coordinator,
                         remote_manager.clone(),
                         None,
-                        forward_context,
+                        forward_context.clone(),
                     )),
                     // Forward connections are always full read-write relay peers,
                     // so no reject loops needed.
                     reject_publishes: None,
                     reject_subscribes: None,
+                    context: forward_context,
                 };
 
                 let forward_producer = session.producer.clone();
@@ -346,16 +349,17 @@ impl Relay {
                             let raw_conn = conn.clone();
 
                             // Create the MoQ session over the connection (setup handshake etc)
+                            let session_id = moq_transport::session::SessionId::new(connection_id.clone());
                             let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config(
                                 conn,
-                                moq_transport::session::SessionId::new(connection_id.clone()),
+                                session_id.clone(),
                                 mlog_path,
                                 transport,
                                 session_config,
                             ).await {
                                 Ok(session) => session,
                                 Err(err) => {
-                                    tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
+                                    tracing::warn!(session_id = %session_id, error = %err, "failed to accept MoQ session: {}", err);
                                     metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
                                     // Maintain invariant: connections_total - connections_closed_total == active_connections
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
@@ -372,7 +376,11 @@ impl Relay {
                             let scope_info = match coordinator.resolve_scope(moq_session.connection_path()).await {
                                 Ok(info) => info,
                                 Err(err) => {
+                                    // FIXME(security): connection_path is the
+                                    // credential-bearing path. Redact with the
+                                    // other URL log sites; tracked separately.
                                     tracing::warn!(
+                                        session_id = %session_id,
                                         connection_path = moq_session.connection_path(),
                                         error = %err,
                                         "scope resolution failed, rejecting session"
@@ -413,9 +421,14 @@ impl Relay {
                                     )
                                     .with_local_ip(local_ip);
                                     let tags = tagger.tag(&meta);
-                                    SessionContext::from_tags(scope, &tags, Some(remote_addr))
+                                    SessionContext::from_tags(
+                                        session_id.clone(),
+                                        scope,
+                                        &tags,
+                                        Some(remote_addr),
+                                    )
                                 }
-                                None => SessionContext::public(scope),
+                                None => SessionContext::public(session_id.clone(), scope),
                             };
 
                             // The resolved interface decides whether a
@@ -456,7 +469,11 @@ impl Relay {
                             }
 
                             if let Some(ref info) = scope_info {
+                                // FIXME(security): connection_path is the
+                                // credential-bearing path. Redact with the other
+                                // URL log sites; tracked separately.
                                 tracing::debug!(
+                                    session_id = %session_id,
                                     connection_path = moq_session.connection_path(),
                                     scope_id = %info.scope_id,
                                     permissions = ?info.permissions,
@@ -479,7 +496,7 @@ impl Relay {
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context)), None)
+                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context.clone())), None)
                             } else {
                                 (None, subscriber)
                             };
@@ -490,6 +507,7 @@ impl Relay {
                                 consumer,
                                 reject_publishes,
                                 reject_subscribes,
+                                context,
                             };
 
                             match session.run().await {
@@ -499,12 +517,12 @@ impl Relay {
                                 }
                                 Err(err) if err.is_graceful_close() => {
                                     // Graceful close - peer sent APPLICATION_CLOSE with code 0
-                                    tracing::debug!("MoQ session closed gracefully");
+                                    tracing::debug!(session_id = %session_id, "MoQ session closed gracefully");
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 }
                                 Err(err) => {
                                     // Actual error - protocol violation, timeout, etc.
-                                    tracing::warn!(error = %err, "MoQ session error: {}", err);
+                                    tracing::warn!(session_id = %session_id, error = %err, "MoQ session error: {}", err);
                                     metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_run").increment(1);
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 }

@@ -941,7 +941,7 @@ mod tests {
     fn duplicate_leases_share_automatic_ownership() {
         let (commands, mut receiver) = mpsc::unbounded_channel();
         let manager = UpstreamNamespaces::from_sender(commands);
-        let context = SessionContext::public(None);
+        let context = SessionContext::public(moq_transport::session::SessionId::generate(), None);
         let prefix = TrackNamespacePrefix::from_utf8_path("foo/bar");
 
         let first = manager
@@ -987,7 +987,7 @@ mod tests {
     fn recreated_interest_uses_a_new_generation() {
         let (commands, mut receiver) = mpsc::unbounded_channel();
         let manager = UpstreamNamespaces::from_sender(commands);
-        let context = SessionContext::public(None);
+        let context = SessionContext::public(moq_transport::session::SessionId::generate(), None);
         let prefix = TrackNamespacePrefix::from_utf8_path("foo");
 
         let first = manager

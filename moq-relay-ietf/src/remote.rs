@@ -14,6 +14,7 @@ use moq_transport::serve::{Track, TrackReader, TracksReader};
 use moq_transport::session::{Publisher, SessionConfig, SubscribeNamespace};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use url::Url;
 
 use crate::interest::{TrackInterest, TrackInterestGuard};
@@ -111,7 +112,11 @@ mod tests {
         let url = Url::parse("https://relay.example.com/live").unwrap();
         let addr = "127.0.0.1:4433".parse().unwrap();
 
-        let context = Remote::context_for_endpoint(url.clone(), Some(addr));
+        let context = Remote::context_for_endpoint(
+            moq_transport::session::SessionId::generate(),
+            url.clone(),
+            Some(addr),
+        );
 
         assert_eq!(context.interface, crate::SessionInterface::Internal);
         assert!(context.scope().is_none());
@@ -650,10 +655,11 @@ impl Remote {
         // SUBSCRIBE_NAMESPACE discovery) and Publisher (outbound
         // PUBLISH_NAMESPACE). This mirrors the `--announce` forward path in
         // relay.rs rather than the subscriber-only upstream pull it replaces.
+        let upstream_session_id = moq_transport::session::SessionId::new(upstream_cid);
         let (session, publisher, subscriber) =
             match moq_transport::session::Session::connect_with_config(
                 session,
-                moq_transport::session::SessionId::new(upstream_cid),
+                upstream_session_id.clone(),
                 None,
                 transport,
                 session_config,
@@ -671,14 +677,16 @@ impl Remote {
         let connected = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();
         let upstream_guard = GaugeGuard::new("moq_relay_upstream_connections");
-        let context = Self::context_for_endpoint(url.clone(), addr);
+        let context = Self::context_for_endpoint(upstream_session_id, url.clone(), addr);
 
         let session_url = url.clone();
         let session_connected = connected.clone();
         let session_cancel = cancel.clone();
 
+        let session_span = context.span();
         tokio::spawn(async move {
             let _upstream_guard = upstream_guard;
+            tracing::info!("session established");
             tokio::select! {
                 result = session.run() => {
                     if let Err(err) = result {
@@ -711,7 +719,8 @@ impl Remote {
                     }
                 }
             }
-        });
+        }
+        .instrument(session_span));
 
         Ok(Self {
             url,
@@ -749,13 +758,17 @@ impl Remote {
     /// recognizes.
     ///
     /// [`ConnectionTagger`]: crate::ConnectionTagger
-    fn context_for_endpoint(url: Url, addr: Option<SocketAddr>) -> SessionContext {
+    fn context_for_endpoint(
+        session_id: moq_transport::session::SessionId,
+        url: Url,
+        addr: Option<SocketAddr>,
+    ) -> SessionContext {
         let endpoint = match addr {
             Some(addr) => RelayInfo::with_addr(url, addr),
             None => RelayInfo::new(url),
         };
 
-        SessionContext::internal(None, Some(endpoint))
+        SessionContext::internal(session_id, None, Some(endpoint))
     }
 
     /// Shutdown the remote connection.
