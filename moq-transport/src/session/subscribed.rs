@@ -322,6 +322,15 @@ impl Subscribed {
             SessionError::Serve(ServeError::Cancel | ServeError::Done)
         )
     }
+
+    /// Whether a failed subgroup indicates a fault on this side rather than
+    /// the peer or the network ending one data stream.
+    ///
+    /// A peer may cancel an individual stream (§11.4.1) and the connection may
+    /// fail underneath us; neither means this subscription malfunctioned.
+    fn is_local_serve_failure(err: &SessionError) -> bool {
+        !Self::is_expected_serve_shutdown(err) && !matches!(err, SessionError::WebTransport(_))
+    }
 }
 
 impl ObjectForwarder {
@@ -332,6 +341,15 @@ impl ObjectForwarder {
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
         let mut done: Option<Result<(), ServeError>> = None;
+        // A subgroup that could not be sent means the peer did not receive
+        // Objects this subscription promised. Reporting `Ok` there would let
+        // callers treat a silent delivery failure as a successful transfer.
+        //
+        // Only local faults count. A peer is entitled to cancel an individual
+        // data stream (§11.4.1), and the resulting transport error must not
+        // turn an otherwise healthy subscription's PUBLISH_DONE into
+        // INTERNAL_ERROR.
+        let mut first_failure: Option<SessionError> = None;
 
         loop {
             tokio::select! {
@@ -351,23 +369,43 @@ impl ObjectForwarder {
                         let mlog = self.mlog.clone();
 
                         tasks.push(async move {
-                            if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await {
-                                if Subscribed::is_expected_serve_shutdown(&err) {
+                            let res = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await;
+                            if let Err(err) = &res {
+                                if Subscribed::is_expected_serve_shutdown(err) {
                                     tracing::debug!(subgroup_info = ?info, error = %err, "stopped serving subgroup");
                                 } else {
                                     tracing::warn!(subgroup_info = ?info, error = %err, "failed to serve subgroup");
                                 }
                             }
+                            res
                         });
                     },
                     Ok(None) => done = Some(Ok(())),
                     Err(err) => done = Some(Err(err)),
                 },
                 res = self.closed(), if done.is_none() => done = Some(res),
-                _ = tasks.next(), if !tasks.is_empty() => {},
+                res = tasks.next(), if !tasks.is_empty() => {
+                    // Remaining subgroups still get their chance to send; the
+                    // first local failure is reported once they settle.
+                    if let Some(Err(err)) = res {
+                        if Subscribed::is_local_serve_failure(&err) && first_failure.is_none() {
+                            first_failure = Some(err);
+                        }
+                    }
+                },
                 // Reached only once both the subgroup source and `closed()` are
                 // disabled, which requires `done` to be set.
-                else => return Ok(done.ok_or(SessionError::Internal)??),
+                else => {
+                    // The track's own outcome is the authoritative one; a
+                    // per-subgroup fault is only reported when the track itself
+                    // ended cleanly, so a specific upstream code is never
+                    // replaced by a generic one.
+                    done.ok_or(SessionError::Internal)??;
+                    return match first_failure {
+                        Some(err) => Err(err),
+                        None => Ok(()),
+                    };
+                }
             }
         }
     }
@@ -549,11 +587,14 @@ impl ObjectForwarder {
                 data::DatagramType::ObjectIdPayload
             };
 
+            // Bound locally so the logging and largest-location updates below
+            // read it directly instead of unwrapping the Option again.
+            let object_id = datagram.object_id;
             let encoded_datagram = data::Datagram {
                 datagram_type,
                 track_alias: self.track_alias,
                 group_id: datagram.group_id,
-                object_id: Some(datagram.object_id),
+                object_id: Some(object_id),
                 publisher_priority: datagram.priority,
                 extension_headers: if has_extension_headers {
                     Some(datagram.extension_headers.clone())
@@ -577,7 +618,7 @@ impl ObjectForwarder {
                 datagram_count + 1,
                 encoded_datagram.track_alias,
                 encoded_datagram.group_id,
-                encoded_datagram.object_id.unwrap(),
+                object_id,
                 encoded_datagram.publisher_priority,
                 payload_len,
                 encoded_datagram.extension_headers,
@@ -602,10 +643,7 @@ impl ObjectForwarder {
             self.state
                 .lock_mut()
                 .ok_or(ServeError::Done)?
-                .update_largest_location(
-                    encoded_datagram.group_id,
-                    encoded_datagram.object_id.unwrap(),
-                )?;
+                .update_largest_location(encoded_datagram.group_id, object_id)?;
 
             datagram_count += 1;
         }

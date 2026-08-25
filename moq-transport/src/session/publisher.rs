@@ -19,9 +19,10 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    split_published_state, ObjectForwarderRecv, PublishNamespace, PublishNamespaceRecv, Published,
-    PublishedInfo, PublishedRecv, RequestId, Session, SessionError, Subscribed,
-    SubscribedNamespace, SubscribedNamespaceInfo, SubscribedNamespaceRecv, TrackStatusRequested,
+    split_published_state, NameRegistry, ObjectForwarderRecv, PublishNamespace,
+    PublishNamespaceRecv, Published, PublishedInfo, PublishedRecv, RequestId, Session,
+    SessionError, Subscribed, SubscribedNamespace, SubscribedNamespaceInfo,
+    SubscribedNamespaceRecv, TrackStatusRequested,
 };
 use crate::message::RequestErrorCode;
 
@@ -64,14 +65,14 @@ pub struct Publisher {
 
     /// Active outbound PUBLISHes keyed by Full Track Name, for the §5.1
     /// same-role duplicate-subscription check.
-    published_names: Arc<Mutex<HashMap<FullTrackName, u64>>>,
+    published_names: Arc<Mutex<NameRegistry>>,
 
     /// When a Subscribe is received and we have a matching publish_namespace entry, the
     /// subscription is routed to that PublishNamespaceRecv.  Otherwise it goes here.
     subscribeds: Arc<Mutex<HashMap<u64, ObjectForwarderRecv>>>,
 
     /// Active inbound SUBSCRIBEs keyed by Full Track Name.
-    subscribed_names: Arc<Mutex<HashMap<FullTrackName, u64>>>,
+    subscribed_names: Arc<Mutex<NameRegistry>>,
 
     /// Subscriptions for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_subscribed: Queue<Subscribed>,
@@ -135,7 +136,7 @@ impl Publisher {
         transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
         let (session, publisher, _) = Session::accept(session, None, transport).await?;
-        Ok((session, publisher.unwrap()))
+        Ok((session, publisher.ok_or(SessionError::Internal)?))
     }
 
     pub async fn connect(
@@ -311,7 +312,8 @@ impl Publisher {
                 .published_names
                 .lock()
                 .map_err(|_| SessionError::Internal)?;
-            if subscribed_names.contains_key(&full_name) || published_names.contains_key(&full_name)
+            if subscribed_names.contains_name(&full_name)
+                || published_names.contains_name(&full_name)
             {
                 return Err(SessionError::Serve(ServeError::Duplicate));
             }
@@ -504,7 +506,7 @@ impl Publisher {
 
     fn drop_published_name(&self, id: u64) {
         if let Ok(mut names) = self.published_names.lock() {
-            names.retain(|_, request_id| *request_id != id);
+            names.remove_by_request_id(id);
         }
     }
 
@@ -866,7 +868,7 @@ impl Publisher {
                 .subscribed_names
                 .lock()
                 .map_err(|_| SessionError::Internal)?;
-            if subscribed_names.contains_key(&full_name) {
+            if subscribed_names.contains_name(&full_name) {
                 let id = msg.id;
                 drop(subscribed_names);
                 drop(subscribeds);
@@ -964,10 +966,16 @@ impl Publisher {
             return Ok(());
         }
 
-        Err(SessionError::ProtocolViolation(format!(
-            "UNSUBSCRIBE for unknown subscribe ID {}",
-            msg.id
-        )))
+        // An UNSUBSCRIBE for an ID we no longer hold is an ordinary race: the
+        // peer's UNSUBSCRIBE can cross with our own PUBLISH_DONE for the same
+        // subscription. Closing the session over it would turn a benign
+        // interleaving into a connection failure.
+        tracing::debug!(
+            target: "moq_transport::control",
+            request_id = msg.id,
+            "UNSUBSCRIBE for unknown subscription — ignoring"
+        );
+        Ok(())
     }
 
     /// Pre-send hook: clean up internal state when terminal publisher messages are enqueued.
@@ -1019,13 +1027,13 @@ impl Publisher {
     }
 
     fn drop_subscribed_name(
-        subscribed_names: &Arc<Mutex<HashMap<FullTrackName, u64>>>,
+        subscribed_names: &Arc<Mutex<NameRegistry>>,
         id: u64,
     ) -> Result<(), SessionError> {
         subscribed_names
             .lock()
             .map_err(|_| SessionError::Internal)?
-            .retain(|_, request_id| *request_id != id);
+            .remove_by_request_id(id);
 
         Ok(())
     }
@@ -1054,17 +1062,14 @@ impl Publisher {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, Mutex},
-    };
+    use std::sync::{Arc, Mutex};
 
     use crate::{
         coding::{TrackName, TrackNamespace},
         serve::FullTrackName,
     };
 
-    use super::Publisher;
+    use super::{NameRegistry, Publisher};
 
     fn full_track_name(namespace: &str, name: &str) -> FullTrackName {
         FullTrackName {
@@ -1075,7 +1080,7 @@ mod tests {
 
     #[test]
     fn drop_subscribed_name_removes_only_matching_request_id() {
-        let subscribed_names = Arc::new(Mutex::new(HashMap::new()));
+        let subscribed_names = Arc::new(Mutex::new(NameRegistry::default()));
         let unsubscribed_track = full_track_name("bb1", "video.m4s");
         let active_track = full_track_name("bb1", "audio.m4s");
 
@@ -1088,7 +1093,7 @@ mod tests {
         Publisher::drop_subscribed_name(&subscribed_names, 6).unwrap();
 
         let names = subscribed_names.lock().unwrap();
-        assert!(!names.contains_key(&unsubscribed_track));
-        assert_eq!(names.get(&active_track), Some(&8));
+        assert!(!names.contains_name(&unsubscribed_track));
+        assert_eq!(names.get_by_name(&active_track), Some(8));
     }
 }

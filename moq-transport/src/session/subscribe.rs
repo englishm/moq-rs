@@ -15,6 +15,7 @@ use crate::watch::State;
 
 use super::SessionError;
 use super::Subscriber;
+use super::{DoneOutcome, StreamDrain};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryFilter {
@@ -231,6 +232,7 @@ impl Subscribe {
         let recv = SubscribeRecv {
             state: recv,
             writer: Some(track.into()),
+            drain: StreamDrain::default(),
         };
 
         (send, recv)
@@ -290,6 +292,8 @@ impl ops::Deref for Subscribe {
 pub(super) struct SubscribeRecv {
     state: State<SubscribeState>,
     writer: Option<TrackWriterMode>,
+    /// PUBLISH_DONE Stream Count accounting (draft-18 §10.11).
+    drain: StreamDrain<ServeError>,
 }
 
 impl SubscribeRecv {
@@ -305,6 +309,98 @@ impl SubscribeRecv {
         }
 
         Ok(())
+    }
+
+    /// Record a data stream arriving for this subscription (§10.11 Stream
+    /// Count). Must be paired with
+    /// [`note_stream_finished`](Self::note_stream_finished).
+    pub fn note_stream_received(&mut self) {
+        self.drain.note_stream_received();
+    }
+
+    /// Record a data stream finishing.
+    ///
+    /// Returns `true` if this completed a deferred teardown, in which case the
+    /// caller must release the subscription's session-level state.
+    #[must_use]
+    pub fn note_stream_finished(&mut self) -> bool {
+        match self.drain.note_stream_finished() {
+            Some(err) => {
+                self.finish(err);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record PUBLISH_DONE (§10.11).
+    ///
+    /// The subscription is kept alive until the announced Stream Count has been
+    /// received and every stream has closed, so Objects the publisher already
+    /// sent are still delivered. See [`DoneOutcome`].
+    pub fn recv_done(&mut self, err: ServeError, stream_count: u64) -> DoneOutcome {
+        let (outcome, terminal) = self.drain.arm(err, stream_count);
+        if let Some(err) = terminal {
+            self.finish(err);
+        }
+        outcome
+    }
+
+    /// True while waiting for streams announced by PUBLISH_DONE.
+    pub fn is_draining(&self) -> bool {
+        self.drain.is_draining()
+    }
+
+    /// End the subscription because its request stream died.
+    ///
+    /// No further Stream Count can be announced, but a data stream already
+    /// being read still has to finish, so this can defer exactly like
+    /// PUBLISH_DONE does.
+    pub fn abort(&mut self, err: ServeError) -> DoneOutcome {
+        if self.drain.is_finished() {
+            return DoneOutcome::Finished;
+        }
+        if self.drain.is_draining() {
+            return DoneOutcome::AlreadyDraining;
+        }
+
+        let (outcome, terminal) = self.drain.arm(err, 0);
+        if let Some(err) = terminal {
+            self.finish(err);
+        }
+        outcome
+    }
+
+    /// Give up waiting for announced streams (§10.11 requires this backstop).
+    ///
+    /// Returns `true` if this call ended the subscription.
+    pub fn drain_timeout(&mut self) -> bool {
+        match self.drain.timeout() {
+            Some(err) => {
+                self.finish(err);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Apply the terminal state, closing the writer so the reader sees the end
+    /// of the track.
+    fn finish(&mut self, err: ServeError) {
+        self.drain.mark_finished();
+        if let Some(writer) = self.writer.take() {
+            if let Err(err) = writer.close(err.clone()) {
+                tracing::debug!(error = %err, "failed to close subscribe writer");
+            }
+        }
+
+        let state = self.state.lock();
+        if state.closed.is_err() {
+            return;
+        }
+        if let Some(mut state) = state.into_mut() {
+            state.closed = Err(err);
+        }
     }
 
     pub fn error(mut self, err: ServeError) -> Result<(), ServeError> {
@@ -327,19 +423,31 @@ impl SubscribeRecv {
     ) -> Result<serve::SubgroupWriter, ServeError> {
         let writer = self.writer.take().ok_or(ServeError::Done)?;
 
+        // Every failure below restores the writer: one rejected subgroup must
+        // not strand the track in a state where nothing can be written, which
+        // would also lose the PUBLISH_DONE status code later.
         let mut subgroups = match writer {
             // TODO SLG - understand why both of these are needed, clock demo won't run if I comment out TrackWriteMode::Track
             TrackWriterMode::Track(track) => track.subgroups()?,
             TrackWriterMode::Subgroups(subgroups) => subgroups,
-            _ => return Err(ServeError::Mode),
+            other => {
+                self.writer = Some(other);
+                return Err(ServeError::Mode);
+            }
         };
 
-        let writer = subgroups.create(serve::Subgroup {
+        let writer = match subgroups.create(serve::Subgroup {
             group_id: header.group_id,
             // When subgroup_id is not present in the header type, it implicitly means subgroup 0
             subgroup_id: header.subgroup_id.unwrap_or(0),
             priority: header.publisher_priority,
-        })?;
+        }) {
+            Ok(writer) => writer,
+            Err(err) => {
+                self.writer = Some(subgroups.into());
+                return Err(err);
+            }
+        };
 
         self.writer = Some(subgroups.into());
 
@@ -395,6 +503,70 @@ mod tests {
             params,
         })
         .unwrap()
+    }
+
+    async fn test_recv() -> (Subscribe, SubscribeRecv) {
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = crate::session::Subscriber::new(
+            crate::watch::Queue::default(),
+            crate::session::test_support::loopback_session().await,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (writer, _reader) =
+            crate::serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let (send, recv, _msg) = Subscribe::new(subscriber, 0, writer);
+        (send, recv)
+    }
+
+    /// §10.11: the request stream can die while a data stream is still being
+    /// read. Tearing down here discards Objects already in flight — the same
+    /// loss the drain exists to prevent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_waits_for_a_stream_still_being_read() {
+        let (_send, mut recv) = test_recv().await;
+
+        recv.note_stream_received();
+        assert_eq!(
+            recv.abort(ServeError::Cancel),
+            DoneOutcome::DrainArmed,
+            "teardown defers while a stream is mid-transfer"
+        );
+        assert!(
+            recv.writer.is_some(),
+            "the writer must survive so the in-flight Object can be written"
+        );
+
+        assert!(recv.note_stream_finished(), "closing the stream ends it");
+        assert!(recv.writer.is_none());
+    }
+
+    /// With nothing in flight the subscription must fail immediately, so an
+    /// application awaiting `Subscribe::ok()` is not left waiting for the life
+    /// of the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_fails_an_idle_subscription_immediately() {
+        let (send, mut recv) = test_recv().await;
+
+        assert_eq!(recv.abort(ServeError::Cancel), DoneOutcome::Finished);
+        assert_eq!(send.ok().await, Err(ServeError::Cancel));
+    }
+
+    /// A drain already carries the publisher's own status code, so an abort
+    /// must not replace it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_leaves_an_armed_drain_alone() {
+        let (send, mut recv) = test_recv().await;
+
+        assert_eq!(
+            recv.recv_done(ServeError::Closed(0x6), 4),
+            DoneOutcome::DrainArmed
+        );
+        assert_eq!(recv.abort(ServeError::Cancel), DoneOutcome::AlreadyDraining);
+
+        assert!(recv.drain_timeout());
+        assert_eq!(send.closed().await, Err(ServeError::Closed(0x6)));
     }
 
     #[test]

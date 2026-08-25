@@ -18,14 +18,15 @@ This repository provides:
 ### Protocol Feature Support
 
 **Supported:**
-- CLIENT_SETUP / SERVER_SETUP
+- SETUP
 - PUBLISH_NAMESPACE
 - SUBSCRIBE
+- SUBSCRIBE_NAMESPACE
+- PUBLISH / REQUEST_OK / PUBLISH_DONE (publisher-initiated tracks)
 - WebTransport and raw QUIC transport layers
 - Both stream ("subgroup") and datagram delivery modes
 
 **Not Supported:**
-- SUBSCRIBE_NAMESPACE (Soon)
 - FETCH (Not Soon)
 
 ## Interoperability
