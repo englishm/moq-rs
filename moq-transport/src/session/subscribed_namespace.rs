@@ -290,6 +290,21 @@ impl SubscribedNamespaceRecv {
         msg: Message,
     ) -> Result<bool, SessionError> {
         self.emit_mlog(mlog, &msg);
+        // This stream bypasses Session::log_control_message, so without this
+        // a REQUEST_ERROR sent here would reach the peer with no log record at
+        // all — nothing to correlate against the id the client is quoting.
+        if let Message::RequestError(ref m) = msg {
+            tracing::debug!(
+                target: "moq_transport::control",
+                session_id = %writer.session_id(),
+                direction = "sent",
+                msg_type = "REQUEST_ERROR",
+                request_id = m.id,
+                error_code = m.error_code,
+                reason = %m.reason.0,
+                "MoQT control message"
+            );
+        }
         match writer.encode(&msg).await {
             Ok(()) => Ok(true),
             Err(err) if err.is_stream_error() => Ok(false),

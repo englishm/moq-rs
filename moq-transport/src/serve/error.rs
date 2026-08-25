@@ -75,7 +75,7 @@ impl ServeError {
     pub fn not_found_id() -> Self {
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
-        tracing::warn!("[{}] Not found at {}:{}", id, loc.file(), loc.line());
+        tracing::warn!(error_id = %id, "Not found at {}:{}", loc.file(), loc.line());
         Self::NotFoundWithId("Track not found".to_string(), id)
     }
 
@@ -89,8 +89,8 @@ impl ServeError {
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
         tracing::warn!(
-            "[{}] Not found: {} at {}:{}",
-            id,
+            error_id = %id,
+            "Not found: {} at {}:{}",
             context,
             loc.file(),
             loc.line()
@@ -112,8 +112,8 @@ impl ServeError {
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
         tracing::warn!(
-            "[{}] Not found: {} at {}:{}",
-            id,
+            error_id = %id,
+            "Not found: {} at {}:{}",
             context,
             loc.file(),
             loc.line()
@@ -131,8 +131,8 @@ impl ServeError {
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
         tracing::error!(
-            "[{}] Internal error: {} at {}:{}",
-            id,
+            error_id = %id,
+            "Internal error: {} at {}:{}",
             context,
             loc.file(),
             loc.line()
@@ -150,12 +150,56 @@ impl ServeError {
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
         tracing::warn!(
-            "[{}] Not implemented: {} at {}:{}",
-            id,
+            error_id = %id,
+            "Not implemented: {} at {}:{}",
             feature,
             loc.file(),
             loc.line()
         );
         Self::NotImplementedWithId("Feature not implemented".to_string(), id)
+    }
+
+    /// The correlation id for this error, if it carries one.
+    ///
+    /// The same id is embedded in [`Display`](std::fmt::Display), which is what
+    /// goes on the wire as the reason phrase, so a client can quote it back and
+    /// an operator can find the session that produced it.
+    pub fn error_id(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::NotFoundWithId(_, id)
+            | Self::InternalWithId(_, id)
+            | Self::NotImplementedWithId(_, id) => Some(*id),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire reason phrase is built from `Display`. If the id ever stops
+    /// being embedded there, a client can still see an error but nobody can
+    /// trace it back to a session, so pin the two together.
+    #[test]
+    fn the_error_id_reaches_the_wire_reason_phrase() {
+        for err in [
+            ServeError::not_found_ctx("ctx"),
+            ServeError::internal_ctx("ctx"),
+            ServeError::not_implemented_ctx("feature"),
+        ] {
+            let id = err.error_id().expect("constructor should mint an id");
+            assert!(
+                err.to_string().contains(&id.to_string()),
+                "id {id} missing from wire reason {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn errors_without_an_id_report_none() {
+        assert_eq!(ServeError::NotFound.error_id(), None);
+        assert_eq!(ServeError::Done.error_id(), None);
+        assert_eq!(ServeError::Closed(7).error_id(), None);
     }
 }

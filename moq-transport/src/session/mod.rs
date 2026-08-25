@@ -449,6 +449,8 @@ impl Session {
                     request_id = m.id,
                     status_code = m.status_code,
                     stream_count = m.stream_count,
+                    // The reason carries the error id a client can quote back.
+                    reason = %m.reason.0,
                     "MoQT control message"
                 );
             }
@@ -501,6 +503,9 @@ impl Session {
                     request_id = m.id,
                     error_code = m.error_code,
                     retry_interval = m.retry_interval,
+                    // The reason carries the error id a client can quote back.
+                    // Logging it here is what ties that id to this session.
+                    reason = %m.reason.0,
                     "MoQT control message"
                 );
             }
