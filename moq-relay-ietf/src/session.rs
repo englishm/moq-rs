@@ -269,9 +269,6 @@ pub trait ConnectionTagger: Send + Sync {
 /// Context carried by relay-side producer and consumer tasks for one MoQT session.
 #[derive(Debug, Clone)]
 pub struct SessionContext {
-    /// Correlation id for the MoQT session this context belongs to.
-    pub session_id: SessionId,
-
     /// Scope used for routing and coordinator calls, if any.
     ///
     /// This value may contain credentials and must not be emitted in telemetry.
@@ -290,10 +287,9 @@ pub struct SessionContext {
 }
 
 impl SessionContext {
-    /// Build a public, client-facing context.
-    pub fn public(session_id: SessionId, scope: Option<String>) -> Self {
+    /// Build a public, client-facing context for the given scope.
+    pub fn public(scope: Option<String>) -> Self {
         Self {
-            session_id,
             scope,
             interface: SessionInterface::Public,
             peer: None,
@@ -303,9 +299,8 @@ impl SessionContext {
     /// Build an internal, relay-to-relay context for the given scope and peer.
     ///
     /// The peer is forwarded as the [`CoordinatorContext::source`].
-    pub fn internal(session_id: SessionId, scope: Option<String>, peer: Option<RelayInfo>) -> Self {
+    pub fn internal(scope: Option<String>, peer: Option<RelayInfo>) -> Self {
         Self {
-            session_id,
             scope,
             interface: SessionInterface::Internal,
             peer,
@@ -322,7 +317,6 @@ impl SessionContext {
     /// [`RelayInfo::from_socket_addr`]). Public connections, and internal
     /// connections with no known address, leave `peer` as `None`.
     pub fn from_tags(
-        session_id: SessionId,
         scope: Option<String>,
         tags: &ConnectionTags,
         remote_addr: Option<SocketAddr>,
@@ -333,16 +327,10 @@ impl SessionContext {
             SessionInterface::Public => None,
         };
         Self {
-            session_id,
             scope,
             interface,
             peer,
         }
-    }
-
-    /// The correlation id of the session this context belongs to.
-    pub fn session_id(&self) -> &SessionId {
-        &self.session_id
     }
 
     /// Build the tracing span that every log record for this session inherits.
@@ -351,22 +339,44 @@ impl SessionContext {
     /// each call site: the fields are recorded once per session instead of being
     /// re-formatted per record, and log lines added later inherit them for free.
     ///
-    /// The span is an explicit root so an upstream session created while serving
-    /// another session does not inherit the requesting session's identity.
-    /// Neither the scope nor relay identity is recorded because either may
-    /// contain credentials.
-    /// Its metadata uses the most verbose level currently enabled for this
-    /// module, preserving correlation under restrictive filters without marking
-    /// ordinary sessions as errors. If no level is enabled, this returns a
-    /// disabled span.
-    pub fn span(&self) -> tracing::Span {
+    /// The span is an explicit root (`parent: None`) so an upstream session
+    /// created while serving another session does not inherit the requesting
+    /// session's identity. The full scope value is never recorded because it
+    /// may contain credentials. `relay_uid` holds only the first path segment
+    /// of a path-format scope URL (e.g. `/relay_uid/jwt-token`), which is the
+    /// internal customer/relay account identifier and carries no credential
+    /// material. `scope_present` is a boolean flag for the case where
+    /// `relay_uid` falls back to `"-"` (non-path scope).
+    /// Target-specific filters that enable other relay modules must also enable
+    /// `moq_relay_ietf::session`, because a disabled span cannot carry context.
+    pub fn span(&self, session_id: &SessionId) -> tracing::Span {
         crate::enabled_root_span!(
             target: module_path!(),
             "moq_session",
-            session_id = %self.session_id,
+            session_id = %session_id,
             interface = %self.interface,
+            // relay_uid: first path segment of the scope URL — the internal
+            // customer/relay account identifier. Non-path scopes → "-".
+            relay_uid = self.relay_uid(),
+            // scope_present: signals a scope exists even when relay_uid is "-".
             scope_present = self.scope.is_some(),
         )
+    }
+
+    /// The `relay_uid` extracted from a path-format scope, safe to log.
+    ///
+    /// The `relay_uid` is the internal customer/relay account identifier that
+    /// lives as the first path segment of the scope URL when the scope is
+    /// path-formatted (e.g. `/relay_uid/jwt-token` → `"relay_uid"`).
+    ///
+    /// Non-path scopes (no leading `/`) are treated as potentially containing
+    /// raw credentials and are returned as `"-"` rather than logged verbatim.
+    fn relay_uid(&self) -> &str {
+        self.scope
+            .as_deref()
+            .filter(|s| s.starts_with('/'))
+            .and_then(|s| s.split('/').find(|seg| !seg.is_empty()))
+            .unwrap_or("-")
     }
 
     /// The scope used for routing and coordinator calls, if any.
@@ -406,29 +416,33 @@ pub struct Session {
     /// from the peer. We hold it here so we can actively drain and reject
     /// those messages instead of silently ignoring them.
     pub reject_subscribes: Option<Publisher>,
-
-    /// Relay-level context for this session, used to build the correlation span.
-    pub context: SessionContext,
 }
 
 impl Session {
     /// Run the session, producer, and consumer as necessary.
-    ///
-    /// The whole session runs inside [`SessionContext::span`], so every record
-    /// emitted by the transport, producer and consumer tasks carries the
-    /// session id without each call site naming it.
     pub async fn run(self) -> Result<(), SessionError> {
-        let span = self.context.span();
-        self.run_inner().instrument(span).await
+        self.run_inner().await
+    }
+
+    /// Run the session inside a root span carrying its relay context.
+    ///
+    /// Every record emitted by the transport, producer and consumer tasks
+    /// inherits the session id without each call site naming it.
+    pub async fn run_with_context(self, context: &SessionContext) -> Result<(), SessionError> {
+        let span = context.span(self.session.session_id());
+        async move {
+            tracing::info!(
+                publish_permitted = self.consumer.is_some(),
+                subscribe_permitted = self.producer.is_some(),
+                "session established"
+            );
+            self.run_inner().await
+        }
+        .instrument(span)
+        .await
     }
 
     async fn run_inner(self) -> Result<(), SessionError> {
-        tracing::info!(
-            publish_permitted = self.consumer.is_some(),
-            subscribe_permitted = self.producer.is_some(),
-            "session established"
-        );
-
         let mut tasks = FuturesUnordered::new();
         tasks.push(self.session.run().boxed());
 
@@ -595,9 +609,47 @@ mod tests {
         assert_eq!(tags.get("missing"), None);
     }
 
+    // ========================================================================
+    // relay_uid()
+    // ========================================================================
+
+    #[test]
+    fn relay_uid_extracts_first_path_segment() {
+        let make = |scope: Option<&str>| SessionContext::public(scope.map(str::to_string));
+
+        // Normal case: /relay_uid/jwt-token → relay_uid
+        assert_eq!(
+            make(Some("/relay-uid/eyJhbGciOiJIUzI1NiJ9.secret")).relay_uid(),
+            "relay-uid"
+        );
+        // Non-path scope (no leading slash): treated as potentially sensitive, returns "-".
+        assert_eq!(make(Some("just-an-id")).relay_uid(), "-");
+        // None → fallback sentinel
+        assert_eq!(make(None).relay_uid(), "-");
+        // Empty string → fallback sentinel
+        assert_eq!(make(Some("")).relay_uid(), "-");
+        // Root slash only → fallback sentinel
+        assert_eq!(make(Some("/")).relay_uid(), "-");
+        // Multiple leading slashes
+        assert_eq!(make(Some("//foo")).relay_uid(), "foo");
+    }
+
+    #[test]
+    fn relay_uid_hides_non_path_scopes() {
+        // A non-path scope (no leading '/') cannot be safely decomposed into
+        // uid vs. credential segments, so relay_uid() returns "-" rather than
+        // risking leaking the full value into logs.
+        let ctx = SessionContext::public(Some("eyJhbGciOiJIUzI1NiJ9.payload.sig".to_string()));
+        assert_eq!(
+            ctx.relay_uid(),
+            "-",
+            "non-path scope must not be logged verbatim"
+        );
+    }
+
     #[test]
     fn session_context_public_has_no_peer_or_coordinator_source() {
-        let context = SessionContext::public(SessionId::generate(), Some("scope-a".to_string()));
+        let context = SessionContext::public(Some("scope-a".to_string()));
         assert_eq!(context.scope(), Some("scope-a"));
         assert_eq!(context.interface, SessionInterface::Public);
         assert!(context.peer.is_none());
@@ -612,7 +664,6 @@ mod tests {
         let url = Url::parse("https://relay.example.com/live").unwrap();
         let addr: SocketAddr = "10.0.0.8:4443".parse().unwrap();
         let context = SessionContext::internal(
-            SessionId::generate(),
             Some("scope-b".to_string()),
             Some(RelayInfo::with_addr(url.clone(), addr)),
         );
@@ -627,7 +678,6 @@ mod tests {
 
         // Internal + known address → peer derived from the socket address.
         let internal = SessionContext::from_tags(
-            SessionId::generate(),
             Some("scope-c".to_string()),
             &ConnectionTags::new().with_interface(SessionInterface::Internal),
             Some(addr),
@@ -640,7 +690,6 @@ mod tests {
 
         // Internal but no known address → no peer.
         let internal_no_addr = SessionContext::from_tags(
-            SessionId::generate(),
             None,
             &ConnectionTags::new().with_interface(SessionInterface::Internal),
             None,
@@ -649,12 +698,7 @@ mod tests {
         assert!(internal_no_addr.peer.is_none());
 
         // A public transport address never becomes a relay identity.
-        let public = SessionContext::from_tags(
-            SessionId::generate(),
-            None,
-            &ConnectionTags::new(),
-            Some(addr),
-        );
+        let public = SessionContext::from_tags(None, &ConnectionTags::new(), Some(addr));
         assert_eq!(public.interface, SessionInterface::Public);
         assert!(public.scope().is_none());
         assert!(public.peer.is_none());
@@ -665,7 +709,6 @@ mod tests {
     fn coordinator_context_forwards_interface_and_peer() {
         let addr: SocketAddr = "10.0.0.7:4443".parse().unwrap();
         let internal = SessionContext::from_tags(
-            SessionId::generate(),
             None,
             &ConnectionTags::new().with_interface(SessionInterface::Internal),
             Some(addr),
@@ -674,7 +717,7 @@ mod tests {
         assert_eq!(ctx.interface, SessionInterface::Internal);
         assert_eq!(ctx.source.expect("source should be set").addr, Some(addr));
 
-        let public = SessionContext::public(SessionId::generate(), None);
+        let public = SessionContext::public(None);
         let ctx = public.coordinator_context();
         assert_eq!(ctx.interface, SessionInterface::Public);
         assert!(ctx.source.is_none());
@@ -688,14 +731,14 @@ mod tests {
     fn session_span_fields_reach_a_record_that_names_none_of_them() {
         let addr: SocketAddr = "10.0.0.7:4443".parse().unwrap();
         let context = SessionContext::from_tags(
-            SessionId::new("deadbeefcafe1234"),
             Some("scope-z".to_string()),
             &ConnectionTags::new().with_interface(SessionInterface::Internal),
             Some(addr),
         );
+        let session_id = SessionId::new("deadbeefcafe1234");
 
         let out = capture_output("info", || {
-            let span = context.span();
+            let span = context.span(&session_id);
             // A record naming none of the correlation fields itself.
             futures::executor::block_on(
                 async {
@@ -713,9 +756,17 @@ mod tests {
             out.contains("internal"),
             "interface missing from output: {out}"
         );
+        // scope is Some("scope-z") which has no leading slash, so relay_uid()
+        // returns "-" (non-path scopes are hidden to prevent credential leaks).
+        // The tracing formatter quotes the string value.
+        assert!(
+            out.contains(r#"relay_uid="-""#),
+            "relay_uid missing from output: {out}"
+        );
+        // scope_present is the companion boolean: scope is Some(...) → true.
         assert!(
             out.contains("scope_present=true"),
-            "scope presence missing from output: {out}"
+            "scope_present missing from output: {out}"
         );
         assert!(
             !out.contains("10.0.0.7:4443"),
@@ -730,17 +781,17 @@ mod tests {
 
         let url = Url::parse(&format!("https://relay.example.com/{URL_SECRET}")).unwrap();
         let context = SessionContext::internal(
-            SessionId::new("secret-redaction-session"),
             Some(SCOPE_SECRET.to_string()),
             Some(RelayInfo::with_addr(url, "10.0.0.9:4443".parse().unwrap())),
         );
+        let session_id = SessionId::new("secret-redaction-session");
 
         let out = capture_output("info", || {
             futures::executor::block_on(
                 async {
                     tracing::info!("secret-free session event");
                 }
-                .instrument(context.span()),
+                .instrument(context.span(&session_id)),
             );
         });
 
@@ -760,14 +811,15 @@ mod tests {
 
     #[test]
     fn session_span_fields_survive_warn_and_error_filters() {
-        let context = SessionContext::public(SessionId::new("filtered-session-correlation"), None);
+        let context = SessionContext::public(None);
+        let session_id = SessionId::new("filtered-session-correlation");
 
         let warn_out = capture_output("warn", || {
             futures::executor::block_on(
                 async {
                     tracing::warn!("warning under warn filter");
                 }
-                .instrument(context.span()),
+                .instrument(context.span(&session_id)),
             );
         });
         assert!(
@@ -780,12 +832,38 @@ mod tests {
                 async {
                     tracing::error!("error under error filter");
                 }
-                .instrument(context.span()),
+                .instrument(context.span(&session_id)),
             );
         });
         assert!(
             error_out.contains("filtered-session-correlation"),
             "session id missing under error filter: {error_out}"
+        );
+    }
+
+    #[test]
+    fn session_span_fields_survive_target_specific_filters() {
+        let context = SessionContext::public(None);
+        let session_id = SessionId::new("target-filtered-session-correlation");
+
+        let out = capture_output(
+            "off,moq_relay_ietf::session=warn,moq_relay_ietf::consumer=warn",
+            || {
+                futures::executor::block_on(
+                    async {
+                        tracing::warn!(
+                            target: "moq_relay_ietf::consumer",
+                            "consumer warning under target filter"
+                        );
+                    }
+                    .instrument(context.span(&session_id)),
+                );
+            },
+        );
+
+        assert!(
+            out.contains("target-filtered-session-correlation"),
+            "session id missing under target-specific filter: {out}"
         );
     }
 
@@ -795,8 +873,9 @@ mod tests {
             .finish();
 
         tracing::subscriber::with_default(subscriber, || {
-            let context = SessionContext::public(SessionId::new("metadata-level-session"), None);
-            let span = context.span();
+            let context = SessionContext::public(None);
+            let session_id = SessionId::new("metadata-level-session");
+            let span = context.span(&session_id);
             let metadata = span.metadata().expect("session span should be enabled");
             assert_eq!(*metadata.level(), expected);
         });
@@ -811,17 +890,18 @@ mod tests {
 
     #[test]
     fn session_span_does_not_inherit_the_current_session() {
-        let downstream = SessionContext::public(SessionId::new("outer-downstream-session"), None);
-        let upstream =
-            SessionContext::internal(SessionId::new("nested-upstream-session"), None, None);
+        let downstream = SessionContext::public(None);
+        let upstream = SessionContext::internal(None, None);
+        let downstream_id = SessionId::new("outer-downstream-session");
+        let upstream_id = SessionId::new("nested-upstream-session");
 
         let out = capture_output("warn", || {
-            let downstream_span = downstream.span();
+            let downstream_span = downstream.span(&downstream_id);
             let _downstream_guard = downstream_span.enter();
 
             // Construct and enter the upstream span while the downstream span
             // is current; it must still be an independent root.
-            let upstream_span = upstream.span();
+            let upstream_span = upstream.span(&upstream_id);
             let _upstream_guard = upstream_span.enter();
             tracing::warn!("upstream session event");
         });
@@ -833,6 +913,35 @@ mod tests {
         assert!(
             !out.contains("outer-downstream-session"),
             "upstream span inherited downstream session id: {out}"
+        );
+    }
+
+    /// The relay_uid is the first path segment of the scope URL. The JWT
+    /// credential in later segments must never appear in log output.
+    #[test]
+    fn session_span_relay_uid_strips_jwt_segment() {
+        // Scope with a JWT in the second segment — only the first should appear.
+        let context = SessionContext::public(Some(
+            "/relay-uid-abc/eyJhbGciOiJIUzI1NiJ9.secret".to_string(),
+        ));
+        let session_id = SessionId::generate();
+
+        let out = capture_output("info", || {
+            futures::executor::block_on(
+                async {
+                    tracing::info!("test");
+                }
+                .instrument(context.span(&session_id)),
+            );
+        });
+
+        assert!(
+            out.contains("relay-uid-abc"),
+            "relay_uid missing from output: {out}"
+        );
+        assert!(
+            !out.contains("eyJhbGciOiJIUzI1NiJ9"),
+            "JWT token must not appear in log output: {out}"
         );
     }
 

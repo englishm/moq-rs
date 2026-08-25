@@ -301,7 +301,11 @@ impl SubscribedNamespaceRecv {
                 msg_type = "REQUEST_ERROR",
                 request_id = m.id,
                 error_code = m.error_code,
-                reason = ?m.reason.0,
+                // The reason is peer-supplied (up to 1024 bytes, arbitrary UTF-8).
+                // Log a sanitized form (control chars → '?') and the raw hex so
+                // analysts can reconstruct the exact bytes without log-injection risk.
+                reason_lossy = ?super::SanitizedDisplay(&m.reason.0).to_string(),
+                reason_hex = %super::HexDisplay(&m.reason.0),
                 "MoQT control message"
             );
         }

@@ -19,7 +19,7 @@ use crate::{
     watch::State,
 };
 
-use super::{Reader, SessionError, Subscriber, Writer};
+use super::{Reader, Session, SessionError, Subscriber, Writer};
 
 /// Safety bound on the number of distinct namespaces tracked for a single
 /// SUBSCRIBE_NAMESPACE response stream. A misbehaving upstream could otherwise
@@ -236,6 +236,7 @@ impl SubscribeNamespaceRecv {
             }
 
             let msg = reader.decode::<Message>().await?;
+            Session::log_control_message(reader.session_id(), &msg, "recv");
             self.emit_mlog(mlog, &msg);
             if !self.recv_message(msg)? {
                 return Ok(());

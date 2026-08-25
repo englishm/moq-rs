@@ -25,6 +25,10 @@ impl Reader {
         }
     }
 
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     pub async fn decode<T: Decode>(&mut self) -> Result<T, SessionError> {
         tracing::trace!(
             "[READER] decode: attempting to decode {} (buffer_len={})",

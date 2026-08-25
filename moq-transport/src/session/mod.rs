@@ -64,6 +64,44 @@ where
     }
 }
 
+/// `fmt::Display` adapter that sanitizes peer-supplied strings for logging.
+///
+/// Replaces every Unicode control character (Rust's `char::is_control()`, which
+/// covers U+0000–U+001F, U+007F, and the C1 range U+0080–U+009F) and the Unicode
+/// line/paragraph separators U+2028/U+2029 with `?` to prevent log-injection
+/// attacks (CWE-117). Other codepoints are passed through unchanged. Pair with
+/// [`HexDisplay`] to retain the exact raw bytes.
+struct SanitizedDisplay<'a>(&'a str);
+
+impl std::fmt::Display for SanitizedDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for c in self.0.chars() {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                write!(f, "?")?;
+            } else {
+                write!(f, "{c}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `fmt::Display` adapter that encodes a peer-supplied string as lowercase hex.
+///
+/// Retains every raw byte of the original value so analysts can reconstruct
+/// exactly what the peer sent, even if [`SanitizedDisplay`] replaced some
+/// characters with `?`.
+struct HexDisplay<'a>(&'a str);
+
+impl std::fmt::Display for HexDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in self.0.bytes() {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// The transport protocol negotiated for this MoQT connection.
 ///
 /// MoQT can run over either WebTransport (HTTP/3 + QUIC) or raw QUIC.
@@ -449,8 +487,11 @@ impl Session {
                     request_id = m.id,
                     status_code = m.status_code,
                     stream_count = m.stream_count,
-                    // The reason carries the error id a client can quote back.
-                    reason = ?m.reason.0,
+                    // The reason is peer-supplied (up to 1024 bytes, arbitrary UTF-8).
+                    // Log a sanitized form (control chars → '?') and the raw hex so
+                    // analysts can reconstruct the exact bytes without log-injection risk.
+                    reason_lossy = ?SanitizedDisplay(&m.reason.0).to_string(),
+                    reason_hex = %HexDisplay(&m.reason.0),
                     "MoQT control message"
                 );
             }
@@ -503,9 +544,11 @@ impl Session {
                     request_id = m.id,
                     error_code = m.error_code,
                     retry_interval = m.retry_interval,
-                    // The reason carries the error id a client can quote back.
-                    // Logging it here is what ties that id to this session.
-                    reason = ?m.reason.0,
+                    // The reason is peer-supplied (up to 1024 bytes, arbitrary UTF-8).
+                    // Log a sanitized form (control chars → '?') and the raw hex so
+                    // analysts can reconstruct the exact bytes without log-injection risk.
+                    reason_lossy = ?SanitizedDisplay(&m.reason.0).to_string(),
+                    reason_hex = %HexDisplay(&m.reason.0),
                     "MoQT control message"
                 );
             }
@@ -848,8 +891,6 @@ impl Session {
         let connection_path = wt_path.or(client_setup_path);
 
         if connection_path.is_some() {
-            // FIXME(security): connection_path is the credential-bearing path.
-            // Redact along with the other URL log sites; tracked separately.
             tracing::debug!(
                 session_id = %session_id,
                 connection_path = connection_path.as_deref(),
@@ -1576,13 +1617,45 @@ mod tests {
             !output.contains('\r'),
             "raw carriage return in log: {output}"
         );
+        // Our approach: reason_lossy (control chars → '?') + reason_hex (raw bytes).
+        // The output itself contains '\n' as line terminators — only the peer-supplied
+        // control chars must be absent, which is validated by the '\r' check above and
+        // the reason_lossy assertions below.
+        // '\n' (0x0a) and '\r' (0x0d) become '?' in the lossy display.
         assert!(
-            output.contains(r#"reason="request\nforged\rline""#),
-            "REQUEST_ERROR reason was not escaped: {output}"
+            output.contains(r#"reason_lossy="request?forged?line""#),
+            "REQUEST_ERROR reason_lossy was not sanitized: {output}"
         );
         assert!(
-            output.contains(r#"reason="publish\nforged\rline""#),
-            "PUBLISH_DONE reason was not escaped: {output}"
+            output.contains("reason_hex=726571756573740a666f726765640d6c696e65"),
+            "REQUEST_ERROR reason_hex missing raw bytes: {output}"
+        );
+        assert!(
+            output.contains(r#"reason_lossy="publish?forged?line""#),
+            "PUBLISH_DONE reason_lossy was not sanitized: {output}"
+        );
+        assert!(
+            output.contains("reason_hex=7075626c6973680a666f726765640d6c696e65"),
+            "PUBLISH_DONE reason_hex missing raw bytes: {output}"
+        );
+    }
+
+    #[test]
+    fn control_message_reason_is_quoted_in_text_logs() {
+        let message = Message::RequestError(message::RequestError {
+            id: 7,
+            error_code: 1,
+            retry_interval: 0,
+            reason: crate::coding::ReasonPhrase("ok level=ERROR fake=true".to_string()),
+        });
+
+        let output = capture_logs(|| {
+            Session::log_control_message(&SessionId::generate(), &message, "recv");
+        });
+
+        assert!(
+            output.contains(r#"reason_lossy="ok level=ERROR fake=true""#),
+            "reason field was not quoted: {output}"
         );
     }
 
@@ -1603,5 +1676,65 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    // ========================================================================
+    // SanitizedDisplay and HexDisplay
+    // ========================================================================
+
+    #[test]
+    fn sanitized_display_passes_printable_ascii() {
+        let s = "hello world 123 !@#";
+        assert_eq!(SanitizedDisplay(s).to_string(), s);
+    }
+
+    #[test]
+    fn sanitized_display_replaces_control_chars() {
+        // Controls and Unicode line/paragraph separators must all become '?'.
+        let input = "a\nb\rc\0d\te\x1bf\x7fg\u{0085}h\u{2028}i\u{2029}j";
+        let out = SanitizedDisplay(input).to_string();
+        assert!(!out.contains('\n'), "LF not sanitized: {out:?}");
+        assert!(!out.contains('\r'), "CR not sanitized: {out:?}");
+        assert!(!out.contains('\0'), "NUL not sanitized: {out:?}");
+        assert!(!out.contains('\t'), "TAB not sanitized: {out:?}");
+        assert!(!out.contains('\x1b'), "ESC not sanitized: {out:?}");
+        assert!(!out.contains('\x7f'), "DEL not sanitized: {out:?}");
+        assert!(!out.contains('\u{0085}'), "C1 NEL not sanitized: {out:?}");
+        assert!(
+            !out.contains('\u{2028}'),
+            "line separator not sanitized: {out:?}"
+        );
+        assert!(
+            !out.contains('\u{2029}'),
+            "paragraph separator not sanitized: {out:?}"
+        );
+        // Each control char replaced by exactly one '?'.
+        assert_eq!(out, "a?b?c?d?e?f?g?h?i?j");
+    }
+
+    #[test]
+    fn sanitized_display_preserves_non_ascii_non_control_unicode() {
+        let s = "café résumé 日本語 🎉";
+        assert_eq!(SanitizedDisplay(s).to_string(), s);
+    }
+
+    #[test]
+    fn hex_display_empty_string() {
+        assert_eq!(HexDisplay("").to_string(), "");
+    }
+
+    #[test]
+    fn hex_display_encodes_bytes_as_lowercase_hex() {
+        // "AB" → 0x41 0x42 → "4142"
+        assert_eq!(HexDisplay("AB").to_string(), "4142");
+        // Multi-byte UTF-8: '€' = 0xE2 0x82 0xAC
+        assert_eq!(HexDisplay("€").to_string(), "e282ac");
+    }
+
+    #[test]
+    fn hex_display_round_trips_control_chars() {
+        // Ensure the hex is faithful to the raw bytes even when SanitizedDisplay
+        // would replace them.  '\n' = 0x0A, '\r' = 0x0D.
+        assert_eq!(HexDisplay("\n\r").to_string(), "0a0d");
     }
 }

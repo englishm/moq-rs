@@ -244,11 +244,8 @@ impl Relay {
                 // Multi-scope forwarding (routing different incoming scopes to different
                 // upstream paths) would require per-scope forward connections.
                 let forward_scope = session.connection_path().map(|s| s.to_string());
-                let forward_context = SessionContext::internal(
-                    forward_session_id,
-                    forward_scope,
-                    Some(RelayInfo::new(url.clone())),
-                );
+                let forward_context =
+                    SessionContext::internal(forward_scope, Some(RelayInfo::new(url.clone())));
 
                 let forward_coordinator = coordinator.clone();
                 let session = Session {
@@ -272,12 +269,19 @@ impl Relay {
                     // so no reject loops needed.
                     reject_publishes: None,
                     reject_subscribes: None,
-                    context: forward_context,
                 };
 
                 let forward_producer = session.producer.clone();
 
-                tasks.push(async move { session.run().await.context("forwarding failed") }.boxed());
+                tasks.push(
+                    async move {
+                        session
+                            .run_with_context(&forward_context)
+                            .await
+                            .context("forwarding failed")
+                    }
+                    .boxed(),
+                );
 
                 forward_producer
             } else {
@@ -383,9 +387,6 @@ impl Relay {
                             let scope_info = match coordinator.resolve_scope(moq_session.connection_path()).await {
                                 Ok(info) => info,
                                 Err(err) => {
-                                    // FIXME(security): connection_path is the
-                                    // credential-bearing path. Redact with the
-                                    // other URL log sites; tracked separately.
                                     tracing::warn!(
                                         session_id = %session_id,
                                         connection_path = moq_session.connection_path(),
@@ -429,13 +430,12 @@ impl Relay {
                                     .with_local_ip(local_ip);
                                     let tags = tagger.tag(&meta);
                                     SessionContext::from_tags(
-                                        session_id.clone(),
                                         scope,
                                         &tags,
                                         Some(remote_addr),
                                     )
                                 }
-                                None => SessionContext::public(session_id.clone(), scope),
+                                None => SessionContext::public(scope),
                             };
 
                             // The resolved interface decides whether a
@@ -460,6 +460,7 @@ impl Relay {
                             // misclassification is what is being investigated.
                             match context.interface {
                                 SessionInterface::Internal => tracing::info!(
+                                    session_id = %session_id,
                                     interface = ?context.interface,
                                     local_ip = ?local_ip,
                                     remote_addr = %remote_addr,
@@ -467,6 +468,7 @@ impl Relay {
                                     "session accepted"
                                 ),
                                 SessionInterface::Public => tracing::debug!(
+                                    session_id = %session_id,
                                     interface = ?context.interface,
                                     local_ip = ?local_ip,
                                     remote_addr = %remote_addr,
@@ -476,9 +478,6 @@ impl Relay {
                             }
 
                             if let Some(ref info) = scope_info {
-                                // FIXME(security): connection_path is the
-                                // credential-bearing path. Redact with the other
-                                // URL log sites; tracked separately.
                                 tracing::debug!(
                                     session_id = %session_id,
                                     connection_path = moq_session.connection_path(),
@@ -514,10 +513,9 @@ impl Relay {
                                 consumer,
                                 reject_publishes,
                                 reject_subscribes,
-                                context,
                             };
 
-                            match session.run().await {
+                            match session.run_with_context(&context).await {
                                 Ok(()) => {
                                     // Session ended cleanly (uncommon - usually ends via close)
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);

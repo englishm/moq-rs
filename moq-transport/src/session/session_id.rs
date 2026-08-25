@@ -38,9 +38,9 @@ impl SessionId {
 
     /// Mint a local id, for sessions built without a transport-supplied connection ID.
     ///
-    /// Renders as 32 lowercase hex characters — the same shape as a 16-byte connection ID, and
-    /// deliberately indistinguishable from one. A generated id correlates a session's own events,
-    /// but is not guaranteed to match that session's qlog or mlog filename.
+    /// Renders as 32 lowercase hex characters, the same textual shape as a 16-byte connection ID.
+    /// A generated id correlates a session's own events, but is not guaranteed to match that
+    /// session's qlog or mlog filename.
     pub fn generate() -> Self {
         let mut buf = [0u8; uuid::fmt::Simple::LENGTH];
         let hex = uuid::Uuid::new_v4().simple().encode_lower(&mut buf);

@@ -121,11 +121,7 @@ mod tests {
         let url = Url::parse("https://relay.example.com/live").unwrap();
         let addr = "127.0.0.1:4433".parse().unwrap();
 
-        let context = Remote::context_for_endpoint(
-            moq_transport::session::SessionId::generate(),
-            url.clone(),
-            Some(addr),
-        );
+        let context = Remote::context_for_endpoint(url.clone(), Some(addr));
 
         assert_eq!(context.interface, crate::SessionInterface::Internal);
         assert!(context.scope().is_none());
@@ -693,8 +689,8 @@ impl Remote {
         // PUBLISH_NAMESPACE). This mirrors the `--announce` forward path in
         // relay.rs rather than the subscriber-only upstream pull it replaces.
         let upstream_session_id = moq_transport::session::SessionId::new(upstream_cid);
-        let context = Self::context_for_endpoint(upstream_session_id.clone(), url.clone(), addr);
-        let span = context.span();
+        let context = Self::context_for_endpoint(url.clone(), addr);
+        let span = context.span(&upstream_session_id);
         // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
         // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
         let (session, publisher, subscriber) =
@@ -800,17 +796,13 @@ impl Remote {
     /// recognizes.
     ///
     /// [`ConnectionTagger`]: crate::ConnectionTagger
-    fn context_for_endpoint(
-        session_id: moq_transport::session::SessionId,
-        url: Url,
-        addr: Option<SocketAddr>,
-    ) -> SessionContext {
+    fn context_for_endpoint(url: Url, addr: Option<SocketAddr>) -> SessionContext {
         let endpoint = match addr {
             Some(addr) => RelayInfo::with_addr(url, addr),
             None => RelayInfo::new(url),
         };
 
-        SessionContext::internal(session_id, None, Some(endpoint))
+        SessionContext::internal(None, Some(endpoint))
     }
 
     /// Shutdown the remote connection.
