@@ -40,9 +40,13 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    let (session, subscriber) = moq_transport::session::Subscriber::connect(session, transport)
-        .await
-        .context("failed to create MoQ Transport session")?;
+    let (session, subscriber) = moq_transport::session::Subscriber::connect(
+        session,
+        moq_transport::session::SessionId::new(connection_id.clone()),
+        transport,
+    )
+    .await
+    .context("failed to create MoQ Transport session")?;
 
     // Associate empty set of Tracks with provided namespace
     let tracks = Tracks::new(TrackNamespace::from_utf8_path(&config.name));

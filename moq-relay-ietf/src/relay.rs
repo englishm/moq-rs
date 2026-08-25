@@ -208,7 +208,7 @@ impl Relay {
                 tracing::info!("forwarding PUBLISH_NAMESPACE messages to {}", url);
 
                 // Establish a QUIC connection to the forward URL
-                let (session, _quic_client_initial_cid, transport) = quic_endpoints[0]
+                let (session, forward_cid, transport) = quic_endpoints[0]
                     .client
                     .connect(url, None)
                     .await
@@ -217,6 +217,7 @@ impl Relay {
                 // Create the MoQ session over the connection
                 let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config(
                     session,
+                    moq_transport::session::SessionId::new(forward_cid),
                     None,
                     transport,
                     session_config,
@@ -345,7 +346,13 @@ impl Relay {
                             let raw_conn = conn.clone();
 
                             // Create the MoQ session over the connection (setup handshake etc)
-                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config(conn, mlog_path, transport, session_config).await {
+                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config(
+                                conn,
+                                moq_transport::session::SessionId::new(connection_id.clone()),
+                                mlog_path,
+                                transport,
+                                session_config,
+                            ).await {
                                 Ok(session) => session,
                                 Err(err) => {
                                     tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);

@@ -17,7 +17,7 @@ use moq_pub::Media;
 use moq_transport::{
     coding::{KeyValuePairs, TrackName, TrackNamespace},
     serve,
-    session::Publisher,
+    session::{Publisher, SessionId},
 };
 
 #[derive(Parser, Clone)]
@@ -96,9 +96,10 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    let (session, publisher) = Publisher::connect(session, transport)
-        .await
-        .context("failed to create MoQ Transport publisher")?;
+    let (session, publisher) =
+        Publisher::connect(session, SessionId::new(connection_id.clone()), transport)
+            .await
+            .context("failed to create MoQ Transport publisher")?;
 
     let mut namespace_publisher = publisher.clone();
     let publish_publisher = publisher;

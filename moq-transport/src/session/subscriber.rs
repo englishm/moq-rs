@@ -24,7 +24,7 @@ use crate::watch::Queue;
 use super::{
     OpenSubscribeNamespace, PendingRequest, PendingRequests, PublishReceived, PublishReceivedRecv,
     PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session,
-    SessionConfig, SessionError, Subscribe, SubscribeNamespace, SubscribeRecv,
+    SessionConfig, SessionError, SessionId, Subscribe, SubscribeNamespace, SubscribeRecv,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -92,6 +92,9 @@ pub struct Subscriber {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// Correlation id of the owning session, tagged onto this subscriber's log records.
+    session_id: SessionId,
 }
 
 /// RAII guard that rolls back a SUBSCRIBE_NAMESPACE prefix reservation on failure.
@@ -228,6 +231,7 @@ impl Subscriber {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         pending_requests: PendingRequests,
+        session_id: SessionId,
     ) -> Self {
         Self {
             published_namespaces: Default::default(),
@@ -245,24 +249,32 @@ impl Subscriber {
             request_id,
             pending_requests,
             mlog,
+            session_id,
         }
+    }
+
+    /// Correlation id of the session this subscriber belongs to.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
     }
 
     /// Create an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for control messages.
     pub async fn accept(
         session: web_transport::Session,
+        session_id: SessionId,
         transport: super::Transport,
     ) -> Result<(Session, Self), SessionError> {
-        Self::accept_with_config(session, transport, SessionConfig::default()).await
+        Self::accept_with_config(session, session_id, transport, SessionConfig::default()).await
     }
 
     pub async fn accept_with_config(
         session: web_transport::Session,
+        session_id: SessionId,
         transport: super::Transport,
         config: SessionConfig,
     ) -> Result<(Session, Self), SessionError> {
         let (session, _, subscriber) =
-            Session::accept_with_config(session, None, transport, config).await?;
+            Session::accept_with_config(session, session_id, None, transport, config).await?;
         let subscriber = subscriber.ok_or(SessionError::Internal)?;
         Ok((session, subscriber))
     }
@@ -270,18 +282,20 @@ impl Subscriber {
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for control messages.
     pub async fn connect(
         session: web_transport::Session,
+        session_id: SessionId,
         transport: super::Transport,
     ) -> Result<(Session, Self), SessionError> {
-        Self::connect_with_config(session, transport, SessionConfig::default()).await
+        Self::connect_with_config(session, session_id, transport, SessionConfig::default()).await
     }
 
     pub async fn connect_with_config(
         session: web_transport::Session,
+        session_id: SessionId,
         transport: super::Transport,
         config: SessionConfig,
     ) -> Result<(Session, Self), SessionError> {
         let (session, _, subscriber) =
-            Session::connect_with_config(session, None, transport, config).await?;
+            Session::connect_with_config(session, session_id, None, transport, config).await?;
         Ok((session, subscriber))
     }
 
@@ -1459,6 +1473,7 @@ mod tests {
             None,
             request_id,
             PendingRequests::default(),
+            SessionId::generate(),
         )
     }
 

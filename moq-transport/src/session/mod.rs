@@ -147,6 +147,11 @@ pub struct Session {
     /// (takes precedence) or the CLIENT_SETUP PATH parameter (key 0x1).
     /// For outgoing connections: auto-extracted from the session URL in connect().
     connection_path: Option<String>,
+
+    /// Correlation id for this session, tagged onto every session-scoped log record.
+    /// Normally the QUIC connection ID hex, which the peer also observes and which names this
+    /// connection's qlog and mlog files.
+    session_id: SessionId,
 }
 
 impl Session {
@@ -256,6 +261,14 @@ impl Session {
     /// Returns `None` if no path was present or if the path was just "/".
     pub fn connection_path(&self) -> Option<&str> {
         self.connection_path.as_deref()
+    }
+
+    /// This session's correlation id, tagged onto its log records.
+    ///
+    /// Normally the QUIC connection ID hex, so it also names this connection's qlog and mlog
+    /// files and matches what the peer observes.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
     }
 
     /// Log a control message with structured fields for observability.
@@ -482,8 +495,10 @@ impl Session {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         webtransport: web_transport::Session,
+        session_id: SessionId,
         sender: Writer,
         recver: Reader,
         mlog: Option<mlog::MlogWriter>,
@@ -504,6 +519,7 @@ impl Session {
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
+            session_id.clone(),
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
@@ -511,6 +527,7 @@ impl Session {
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
+            session_id.clone(),
         ));
 
         let session = Self {
@@ -526,6 +543,7 @@ impl Session {
             mlog: mlog_shared,
             transport,
             connection_path,
+            session_id,
         };
 
         (session, publisher, subscriber)
@@ -541,15 +559,24 @@ impl Session {
     /// CONNECT URL so PATH is not sent.
     pub async fn connect(
         session: web_transport::Session,
+        session_id: SessionId,
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
-        Self::connect_with_config(session, mlog_path, transport, SessionConfig::default()).await
+        Self::connect_with_config(
+            session,
+            session_id,
+            mlog_path,
+            transport,
+            SessionConfig::default(),
+        )
+        .await
     }
 
     /// Create an outbound/client QUIC connection with explicit session configuration.
     pub async fn connect_with_config(
         session: web_transport::Session,
+        session_id: SessionId,
         mlog_path: Option<PathBuf>,
         transport: Transport,
         config: SessionConfig,
@@ -628,7 +655,9 @@ impl Session {
         Self::log_peer_max_request_id(peer_max);
         // Client sends even IDs (0); peer server sends odd IDs (1).
         let request_id = RequestId::new(0, peer_max, our_max_request_id, 1);
-        let session = Session::new(session, sender, recver, mlog, transport, path, request_id);
+        let session = Session::new(
+            session, session_id, sender, recver, mlog, transport, path, request_id,
+        );
         let publisher = session.1.ok_or(SessionError::Internal)?;
         let subscriber = session.2.ok_or(SessionError::Internal)?;
         Ok((session.0, publisher, subscriber))
@@ -641,15 +670,24 @@ impl Session {
     /// via ALPN before this is called.
     pub async fn accept(
         session: web_transport::Session,
+        session_id: SessionId,
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
-        Self::accept_with_config(session, mlog_path, transport, SessionConfig::default()).await
+        Self::accept_with_config(
+            session,
+            session_id,
+            mlog_path,
+            transport,
+            SessionConfig::default(),
+        )
+        .await
     }
 
     /// Accept an inbound server connection with explicit session configuration.
     pub async fn accept_with_config(
         session: web_transport::Session,
+        session_id: SessionId,
         mlog_path: Option<PathBuf>,
         transport: Transport,
         config: SessionConfig,
@@ -728,6 +766,7 @@ impl Session {
         let request_id = RequestId::new(1, peer_max, our_max_request_id, 0);
         Ok(Session::new(
             session,
+            session_id,
             sender,
             recver,
             mlog,

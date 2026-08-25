@@ -457,6 +457,7 @@ mod tests {
             None,
             rid,
             crate::session::PendingRequests::default(),
+            crate::session::SessionId::generate(),
         );
         let (writer, _reader) =
             serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
@@ -476,6 +477,7 @@ mod tests {
             None,
             rid,
             crate::session::PendingRequests::default(),
+            crate::session::SessionId::generate(),
         );
         let (writer, _reader) =
             serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();

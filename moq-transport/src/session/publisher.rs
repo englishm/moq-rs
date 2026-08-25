@@ -21,8 +21,8 @@ use crate::watch::Queue;
 use super::{
     split_published_state, ObjectForwarderRecv, PendingRequest, PendingRequests, PublishNamespace,
     PublishNamespaceRecv, Published, PublishedInfo, PublishedRecv, RequestId, RequestIdAllocation,
-    Session, SessionConfig, SessionError, Subscribed, SubscribedNamespace, SubscribedNamespaceInfo,
-    SubscribedNamespaceRecv, TrackStatusRequested,
+    Session, SessionConfig, SessionError, SessionId, Subscribed, SubscribedNamespace,
+    SubscribedNamespaceInfo, SubscribedNamespaceRecv, TrackStatusRequested,
 };
 use crate::message::RequestErrorCode;
 
@@ -134,6 +134,9 @@ pub struct Publisher {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// Correlation id of the owning session, tagged onto this publisher's log records.
+    session_id: SessionId,
 }
 
 impl Publisher {
@@ -143,6 +146,7 @@ impl Publisher {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         pending_requests: PendingRequests,
+        session_id: SessionId,
     ) -> Self {
         Self {
             webtransport,
@@ -159,41 +163,51 @@ impl Publisher {
             request_id,
             pending_requests,
             mlog,
+            session_id,
         }
+    }
+
+    /// Correlation id of the session this publisher belongs to.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
     }
 
     pub async fn accept(
         session: web_transport::Session,
+        session_id: SessionId,
         transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        Self::accept_with_config(session, transport, SessionConfig::default()).await
+        Self::accept_with_config(session, session_id, transport, SessionConfig::default()).await
     }
 
     pub async fn accept_with_config(
         session: web_transport::Session,
+        session_id: SessionId,
         transport: super::Transport,
         config: SessionConfig,
     ) -> Result<(Session, Publisher), SessionError> {
         let (session, publisher, _) =
-            Session::accept_with_config(session, None, transport, config).await?;
+            Session::accept_with_config(session, session_id, None, transport, config).await?;
         let publisher = publisher.ok_or(SessionError::Internal)?;
         Ok((session, publisher))
     }
 
     pub async fn connect(
         session: web_transport::Session,
+        session_id: SessionId,
         transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        Self::connect_with_config(session, transport, SessionConfig::default()).await
+        Self::connect_with_config(session, session_id, transport, SessionConfig::default()).await
     }
 
     pub async fn connect_with_config(
         session: web_transport::Session,
+        session_id: SessionId,
         transport: super::Transport,
         config: SessionConfig,
     ) -> Result<(Session, Publisher), SessionError> {
         let (session, publisher, _) =
-            Session::connect_with_config(session, None, transport, config).await?;
+            Session::connect_with_config(session, session_id, None, transport, config).await?;
         Ok((session, publisher))
     }
 

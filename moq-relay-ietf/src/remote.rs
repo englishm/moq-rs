@@ -636,8 +636,7 @@ impl Remote {
             key: cache_key,
             slot: cache_slot,
         } = cache;
-        let (session, _quic_client_initial_cid, transport) = match client.connect(&url, addr).await
-        {
+        let (session, upstream_cid, transport) = match client.connect(&url, addr).await {
             Ok(session) => session,
             Err(err) => {
                 metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
@@ -654,6 +653,7 @@ impl Remote {
         let (session, publisher, subscriber) =
             match moq_transport::session::Session::connect_with_config(
                 session,
+                moq_transport::session::SessionId::new(upstream_cid),
                 None,
                 transport,
                 session_config,

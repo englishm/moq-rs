@@ -422,7 +422,10 @@ impl OpenSubscribeNamespace {
 
 #[cfg(test)]
 mod tests {
-    use crate::{message::RequestOk, session::PendingRequests, session::RequestId, watch::Queue};
+    use crate::{
+        message::RequestOk, session::PendingRequests, session::RequestId, session::SessionId,
+        watch::Queue,
+    };
 
     use super::*;
 
@@ -434,6 +437,7 @@ mod tests {
             None,
             request_id,
             PendingRequests::default(),
+            SessionId::generate(),
         )
     }
 
