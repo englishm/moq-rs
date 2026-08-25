@@ -14,6 +14,7 @@ use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
 use crate::{
     metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
     RelayInfo, RemoteManager, Session, SessionContext, DEFAULT_CACHE_IDLE_TIMEOUT,
+    DEFAULT_MAX_REMOTE_CONNECTIONS,
 };
 
 // A type alias for boxed future
@@ -110,8 +111,22 @@ impl Relay {
     /// subscription outlives the last subscriber and the relay keeps receiving a
     /// track nobody is watching. A zero timeout restores that behaviour.
     pub fn new_with_cache_idle_timeout(
+        config: RelayConfig,
+        cache_idle_timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_cache_limits(config, cache_idle_timeout, DEFAULT_MAX_REMOTE_CONNECTIONS)
+    }
+
+    /// Create a relay with both cache limits set.
+    ///
+    /// `cache_idle_timeout` is described on [`Relay::new_with_cache_idle_timeout`].
+    /// `max_remote_connections` bounds how many peer relay connections are
+    /// pooled: see [`RemoteManager::with_max_connections`], which also documents
+    /// that connections still serving a subscription are never evicted.
+    pub fn new_with_cache_limits(
         mut config: RelayConfig,
         cache_idle_timeout: Duration,
+        max_remote_connections: usize,
     ) -> anyhow::Result<Self> {
         if config.bind.is_some() && !config.endpoints.is_empty() {
             anyhow::bail!("cannot specify both bind and endpoints");
@@ -156,7 +171,8 @@ impl Relay {
             remote_clients,
             config.session,
         )
-        .with_cache_idle_timeout(cache_idle_timeout);
+        .with_cache_idle_timeout(cache_idle_timeout)
+        .with_max_connections(max_remote_connections);
         let (upstream_namespaces, upstream_namespaces_runner) =
             UpstreamNamespaces::new(locals.clone(), remotes.clone(), config.coordinator.clone());
 

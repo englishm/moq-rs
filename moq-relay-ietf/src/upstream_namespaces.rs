@@ -852,7 +852,9 @@ async fn run_pull_inner(
     prefix: TrackNamespacePrefix,
     cancel: &mut oneshot::Receiver<()>,
 ) -> PullOutcome {
-    let handle = tokio::select! {
+    // `_peer_use` keeps the peer connection out of the pool's eviction candidate
+    // set for as long as this pull is running on it.
+    let (handle, _peer_use) = tokio::select! {
         _ = &mut *cancel => return PullOutcome::Intentional { timed_out: false },
         result = remotes.subscribe_namespace(relay, prefix, SubscribeOptions::Namespace) => {
             match result {

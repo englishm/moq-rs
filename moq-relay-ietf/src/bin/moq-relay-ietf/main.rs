@@ -12,7 +12,9 @@ use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
-use moq_relay_ietf::{Coordinator, Relay, RelayConfig, SessionConfig, Web, WebConfig};
+use moq_relay_ietf::{
+    Coordinator, Relay, RelayConfig, SessionConfig, Web, WebConfig, DEFAULT_MAX_REMOTE_CONNECTIONS,
+};
 use std::time::Duration;
 
 #[derive(Parser, Clone)]
@@ -42,6 +44,13 @@ pub struct Cli {
     /// subscriptions for the lifetime of the upstream session.
     #[arg(long, default_value_t = 30)]
     pub cache_idle_timeout: u64,
+
+    /// Maximum number of peer relay connections kept open. Adding one to a full
+    /// pool closes the least recently used connection that nothing is using;
+    /// connections still serving a subscription are never closed. 0 disables the
+    /// bound, keeping a connection per peer for the life of the process.
+    #[arg(long, default_value_t = DEFAULT_MAX_REMOTE_CONNECTIONS)]
+    pub max_remote_connections: usize,
 
     /// Forward all PUBLISH_NAMESPACE messages to the provided server for auth/routing.
     /// If not provided, the relay accepts every unique namespace publish.
@@ -195,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create a QUIC server for media.
-    let relay = Relay::new_with_cache_idle_timeout(
+    let relay = Relay::new_with_cache_limits(
         RelayConfig {
             tls: tls.clone(),
             bind: Some(cli.bind),
@@ -214,6 +223,7 @@ async fn main() -> anyhow::Result<()> {
             connection_tagger: None,
         },
         Duration::from_secs(cli.cache_idle_timeout),
+        cli.max_remote_connections,
     )?;
 
     if cli.dev {
