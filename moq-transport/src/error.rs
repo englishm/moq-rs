@@ -104,6 +104,11 @@ impl MoqError for SubscribeError {
 }
 
 /// An error that causes the subscribe to be terminated.
+///
+/// Unused legacy table. Its values predate draft-18 and disagree with the
+/// §15.10.3 PUBLISH_DONE registry from 0x2 upwards, so converting a wire status
+/// code through it yields the wrong variant. Use
+/// [`PublishDoneCode`](crate::message::PublishDoneCode) instead.
 #[derive(thiserror::Error, Debug)]
 pub enum SubscribeDone {
     // Official error codes
