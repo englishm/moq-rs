@@ -157,10 +157,11 @@ pub struct Session {
 impl Session {
     const MAX_CONNECTION_PATH_LEN: usize = 1024;
 
-    fn log_peer_max_request_id(peer_max: u64) {
+    fn log_peer_max_request_id(session_id: &SessionId, peer_max: u64) {
         if peer_max == 0 {
             tracing::warn!(
                 target: "moq_transport::control",
+                session_id = %session_id,
                 "peer MAX_REQUEST_ID is 0; outbound requests are disabled until MAX_REQUEST_ID increases"
             );
         }
@@ -273,11 +274,12 @@ impl Session {
 
     /// Log a control message with structured fields for observability.
     /// Uses target "moq_transport::control" so it can be filtered independently.
-    fn log_control_message(msg: &Message, direction: &str) {
+    fn log_control_message(session_id: &SessionId, msg: &Message, direction: &str) {
         match msg {
             Message::Subscribe(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "SUBSCRIBE",
                     subscribe_id = m.id,
@@ -289,6 +291,7 @@ impl Session {
             Message::SubscribeOk(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "SUBSCRIBE_OK",
                     subscribe_id = m.id,
@@ -299,6 +302,7 @@ impl Session {
             Message::Unsubscribe(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "UNSUBSCRIBE",
                     subscribe_id = m.id,
@@ -308,6 +312,7 @@ impl Session {
             Message::PublishNamespace(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "PUBLISH_NAMESPACE",
                     request_id = m.id,
@@ -318,6 +323,7 @@ impl Session {
             Message::PublishNamespaceDone(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "PUBLISH_NAMESPACE_DONE",
                     request_id = m.id,
@@ -327,6 +333,7 @@ impl Session {
             Message::Namespace(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "NAMESPACE",
                     namespace_suffix = %m.track_namespace_suffix,
@@ -336,6 +343,7 @@ impl Session {
             Message::NamespaceDone(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "NAMESPACE_DONE",
                     namespace_suffix = %m.track_namespace_suffix,
@@ -345,6 +353,7 @@ impl Session {
             Message::PublishNamespaceCancel(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "PUBLISH_NAMESPACE_CANCEL",
                     request_id = m.id,
@@ -356,6 +365,7 @@ impl Session {
             Message::TrackStatus(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "TRACK_STATUS",
                     request_id = m.id,
@@ -367,6 +377,7 @@ impl Session {
             Message::SubscribeNamespace(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "SUBSCRIBE_NAMESPACE",
                     request_id = m.id,
@@ -377,6 +388,7 @@ impl Session {
             Message::Fetch(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "FETCH",
                     request_id = m.id,
@@ -387,6 +399,7 @@ impl Session {
             Message::FetchOk(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "FETCH_OK",
                     request_id = m.id,
@@ -397,6 +410,7 @@ impl Session {
             Message::FetchCancel(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "FETCH_CANCEL",
                     request_id = m.id,
@@ -406,6 +420,7 @@ impl Session {
             Message::Publish(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "PUBLISH",
                     request_id = m.id,
@@ -418,6 +433,7 @@ impl Session {
             Message::PublishOk(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "PUBLISH_OK",
                     request_id = m.id,
@@ -427,6 +443,7 @@ impl Session {
             Message::PublishDone(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "PUBLISH_DONE",
                     request_id = m.id,
@@ -438,6 +455,7 @@ impl Session {
             Message::GoAway(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "GOAWAY",
                     uri = %m.uri.0,
@@ -447,6 +465,7 @@ impl Session {
             Message::MaxRequestId(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "MAX_REQUEST_ID",
                     request_id = m.request_id,
@@ -456,6 +475,7 @@ impl Session {
             Message::RequestsBlocked(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "REQUESTS_BLOCKED",
                     max_request_id = m.max_request_id,
@@ -465,6 +485,7 @@ impl Session {
             Message::RequestOk(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "REQUEST_OK",
                     request_id = m.id,
@@ -474,6 +495,7 @@ impl Session {
             Message::RequestError(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "REQUEST_ERROR",
                     request_id = m.id,
@@ -485,6 +507,7 @@ impl Session {
             Message::RequestUpdate(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "REQUEST_UPDATE",
                     request_id = m.id,
@@ -635,6 +658,7 @@ impl Session {
 
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %session_id,
             direction = "sent",
             msg_type = "CLIENT_SETUP",
             ?transport,
@@ -646,13 +670,14 @@ impl Session {
         let server: setup::Server = recver.decode().await?;
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %session_id,
             direction = "recv",
             msg_type = "SERVER_SETUP",
             "MoQT control message"
         );
 
         let peer_max = max_request_id_from_params(&server.params);
-        Self::log_peer_max_request_id(peer_max);
+        Self::log_peer_max_request_id(&session_id, peer_max);
         // Client sends even IDs (0); peer server sends odd IDs (1).
         let request_id = RequestId::new(0, peer_max, our_max_request_id, 1);
         let session = Session::new(
@@ -705,6 +730,7 @@ impl Session {
         let client: setup::Client = recver.decode().await?;
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %session_id,
             direction = "recv",
             msg_type = "CLIENT_SETUP",
             "MoQT control message"
@@ -736,7 +762,7 @@ impl Session {
         }
 
         let peer_max = max_request_id_from_params(&client.params);
-        Self::log_peer_max_request_id(peer_max);
+        Self::log_peer_max_request_id(&session_id, peer_max);
 
         // The MAX_REQUEST_ID we advertise to the client.
         let our_max_request_id = config.max_request_id;
@@ -750,6 +776,7 @@ impl Session {
 
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %session_id,
             direction = "sent",
             msg_type = "SERVER_SETUP",
             "MoQT control message"
@@ -781,25 +808,26 @@ impl Session {
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
         tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
-            res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
-            res = Self::run_subscribe_namespace_open(self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
-            res = Self::run_subscribe_namespace_accept(self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => res,
+            res = Self::run_recv(self.session_id.clone(), self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
+            res = Self::run_send(self.session_id.clone(), self.sender, self.outgoing, self.mlog.clone()) => res,
+            res = Self::run_subscribe_namespace_open(self.session_id.clone(), self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
+            res = Self::run_subscribe_namespace_accept(self.session_id.clone(), self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
-            res = Self::run_pending_timeouts(self.publisher, self.subscriber, self.pending_requests) => res,
+            res = Self::run_pending_timeouts(self.session_id, self.publisher, self.subscriber, self.pending_requests) => res,
         }
     }
 
     /// Processes the outgoing control message queue, and sends queued messages on the control stream sender/writer.
     async fn run_send(
+        session_id: SessionId,
         mut sender: Writer,
         mut outgoing: Queue<message::Message>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         while let Some(msg) = outgoing.pop().await {
             // Emit structured tracing log for sent control messages
-            Self::log_control_message(&msg, "sent");
+            Self::log_control_message(&session_id, &msg, "sent");
 
             // Emit mlog event for sent control messages
             if let Some(ref mlog) = mlog {
@@ -840,6 +868,7 @@ impl Session {
     }
 
     async fn run_subscribe_namespace_open(
+        session_id: SessionId,
         webtransport: web_transport::Session,
         mut requests: Queue<OpenSubscribeNamespace>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
@@ -853,7 +882,7 @@ impl Session {
                     match request {
                         Some(request) => {
                             let webtransport = webtransport.clone();
-                            tasks.push(Self::open_subscribe_namespace(webtransport, request, mlog.clone()));
+                            tasks.push(Self::open_subscribe_namespace(session_id.clone(), webtransport, request, mlog.clone()));
                         }
                         None => requests_done = true,
                     }
@@ -865,6 +894,7 @@ impl Session {
     }
 
     async fn open_subscribe_namespace(
+        session_id: SessionId,
         webtransport: web_transport::Session,
         request: OpenSubscribeNamespace,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
@@ -874,7 +904,7 @@ impl Session {
         let reader = Reader::new(recv);
 
         let msg = Message::SubscribeNamespace(request.message.clone());
-        Self::log_control_message(&msg, "sent");
+        Self::log_control_message(&session_id, &msg, "sent");
         add_mlog_event(&mlog, |time| {
             mlog::events::subscribe_namespace_created(time, 0, &request.message)
         });
@@ -889,6 +919,7 @@ impl Session {
     }
 
     async fn run_subscribe_namespace_accept(
+        session_id: SessionId,
         webtransport: web_transport::Session,
         publisher: Option<Publisher>,
         request_id: RequestId,
@@ -904,7 +935,7 @@ impl Session {
                     let (send, recv) = stream?;
                     let publisher = publisher.clone().ok_or(SessionError::RoleViolation)?;
                     let request_id = request_id.clone();
-                    tasks.push(Self::accept_subscribe_namespace_stream(publisher, request_id, send, recv, mlog.clone()));
+                    tasks.push(Self::accept_subscribe_namespace_stream(session_id.clone(), publisher, request_id, send, recv, mlog.clone()));
                 }
                 Some(res) = tasks.next(), if !tasks.is_empty() => res?,
             }
@@ -912,6 +943,7 @@ impl Session {
     }
 
     async fn accept_subscribe_namespace_stream(
+        session_id: SessionId,
         mut publisher: Publisher,
         request_id: RequestId,
         send: web_transport::SendStream,
@@ -944,7 +976,7 @@ impl Session {
             }
         };
         let log_msg = Message::SubscribeNamespace(subscribe_namespace.clone());
-        Self::log_control_message(&log_msg, "recv");
+        Self::log_control_message(&session_id, &log_msg, "recv");
         add_mlog_event(&mlog, |time| {
             mlog::events::subscribe_namespace_parsed(time, 0, &subscribe_namespace)
         });
@@ -961,6 +993,7 @@ impl Session {
     /// Handles session-level messages (GOAWAY, MAX_REQUEST_ID, REQUESTS_BLOCKED)
     /// directly and routes role-specific messages to Publisher or Subscriber.
     async fn run_recv(
+        session_id: SessionId,
         mut recver: Reader,
         mut publisher: Option<Publisher>,
         mut subscriber: Option<Subscriber>,
@@ -974,7 +1007,7 @@ impl Session {
             let msg: message::Message = recver.decode().await?;
 
             // Emit structured tracing log for received control messages
-            Self::log_control_message(&msg, "recv");
+            Self::log_control_message(&session_id, &msg, "recv");
 
             // Emit mlog event for received control messages
             if let Some(ref mlog) = mlog {
@@ -1014,11 +1047,12 @@ impl Session {
 
             let msg = match msg {
                 Message::RequestOk(msg) => {
-                    Self::recv_request_ok(&pending_requests, &mut publisher, msg)?;
+                    Self::recv_request_ok(&session_id, &pending_requests, &mut publisher, msg)?;
                     continue;
                 }
                 Message::RequestError(msg) => {
                     Self::recv_request_error(
+                        &session_id,
                         &pending_requests,
                         &mut publisher,
                         &mut subscriber,
@@ -1027,11 +1061,11 @@ impl Session {
                     continue;
                 }
                 Message::PublishOk(msg) => {
-                    Self::recv_publish_ok(&pending_requests, &mut publisher, msg)?;
+                    Self::recv_publish_ok(&session_id, &pending_requests, &mut publisher, msg)?;
                     continue;
                 }
                 Message::SubscribeOk(msg) => {
-                    Self::recv_subscribe_ok(&pending_requests, &mut subscriber, msg)?;
+                    Self::recv_subscribe_ok(&session_id, &pending_requests, &mut subscriber, msg)?;
                     continue;
                 }
                 msg => msg,
@@ -1071,6 +1105,7 @@ impl Session {
                     goaway_received = true;
                     tracing::info!(
                         target: "moq_transport::control",
+                        session_id = %session_id,
                         new_uri = %m.uri.0,
                         "received GOAWAY"
                     );
@@ -1080,6 +1115,7 @@ impl Session {
                     request_id.apply_max_request_id(m)?;
                     tracing::debug!(
                         target: "moq_transport::control",
+                        session_id = %session_id,
                         max_request_id = m.request_id,
                         "received MAX_REQUEST_ID"
                     );
@@ -1087,6 +1123,7 @@ impl Session {
                 Message::RequestsBlocked(ref m) => {
                     tracing::debug!(
                         target: "moq_transport::control",
+                        session_id = %session_id,
                         max_request_id = m.max_request_id,
                         "received REQUESTS_BLOCKED"
                     );
@@ -1105,6 +1142,7 @@ impl Session {
     }
 
     fn recv_request_ok(
+        session_id: &SessionId,
         pending_requests: &PendingRequests,
         publisher: &mut Option<Publisher>,
         msg: message::RequestOk,
@@ -1121,6 +1159,7 @@ impl Session {
             None => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     request_id = msg.id,
                     "received REQUEST_OK for unknown outbound request — ignoring"
                 );
@@ -1130,6 +1169,7 @@ impl Session {
     }
 
     fn recv_request_error(
+        session_id: &SessionId,
         pending_requests: &PendingRequests,
         publisher: &mut Option<Publisher>,
         subscriber: &mut Option<Subscriber>,
@@ -1147,6 +1187,7 @@ impl Session {
             None => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     request_id = msg.id,
                     error_code = msg.error_code,
                     retry_interval = msg.retry_interval,
@@ -1159,6 +1200,7 @@ impl Session {
     }
 
     fn recv_publish_ok(
+        session_id: &SessionId,
         pending_requests: &PendingRequests,
         publisher: &mut Option<Publisher>,
         msg: message::PublishOk,
@@ -1175,6 +1217,7 @@ impl Session {
             None => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     request_id = msg.id,
                     "received PUBLISH_OK for unknown outbound request — ignoring"
                 );
@@ -1184,6 +1227,7 @@ impl Session {
     }
 
     fn recv_subscribe_ok(
+        session_id: &SessionId,
         pending_requests: &PendingRequests,
         subscriber: &mut Option<Subscriber>,
         msg: message::SubscribeOk,
@@ -1200,6 +1244,7 @@ impl Session {
             None => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     request_id = msg.id,
                     "received SUBSCRIBE_OK for unknown outbound request — ignoring"
                 );
@@ -1209,6 +1254,7 @@ impl Session {
     }
 
     async fn run_pending_timeouts(
+        session_id: SessionId,
         mut publisher: Option<Publisher>,
         mut subscriber: Option<Subscriber>,
         pending_requests: PendingRequests,
@@ -1227,6 +1273,7 @@ impl Session {
             for (id, request) in pending_requests.expire()? {
                 tracing::warn!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     request_id = id,
                     request = ?request,
                     "outbound request timed out waiting for response"
@@ -1367,6 +1414,7 @@ mod tests {
         let mut subscriber = None;
 
         Session::recv_subscribe_ok(
+            &SessionId::generate(),
             &pending_requests,
             &mut subscriber,
             message::SubscribeOk {
