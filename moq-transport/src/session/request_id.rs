@@ -30,6 +30,7 @@ pub struct RequestId {
 
 #[derive(Debug)]
 struct RequestIdInner {
+    session_id: SessionId,
     send: Mutex<SendState>,
     recv: Mutex<RecvState>,
 }
@@ -86,8 +87,31 @@ impl RequestId {
     /// `our_max` is the MAX_REQUEST_ID we advertised in setup.
     /// `peer_first_id` is 0 if the peer is client, 1 if the peer is server.
     pub fn new(local_first_id: u64, peer_max: u64, our_max: u64, peer_first_id: u64) -> Self {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `new` accept it and remove `new_with_session_id`.
+        Self::new_with_session_id(
+            SessionId::generate(),
+            local_first_id,
+            peer_max,
+            our_max,
+            peer_first_id,
+        )
+    }
+
+    /// Create a request-ID manager with an explicit session correlation ID.
+    ///
+    /// `session_id` comes first, followed by the same endpoint ID and limit arguments as
+    /// [`Self::new`]. Transport sessions should pass their peer-observed QUIC connection ID.
+    pub fn new_with_session_id(
+        session_id: SessionId,
+        local_first_id: u64,
+        peer_max: u64,
+        our_max: u64,
+        peer_first_id: u64,
+    ) -> Self {
         Self {
             inner: Arc::new(RequestIdInner {
+                session_id,
                 send: Mutex::new(SendState {
                     next: local_first_id,
                     peer_max,
@@ -182,14 +206,10 @@ impl RequestId {
     /// If the peer has consumed our current advertised maximum and reports that
     /// same maximum as blocked, we currently ignore this. In the future, we may
     /// advertise new incremented MAX_REQUEST_ID.
-    pub fn handle_requests_blocked(
-        &self,
-        session_id: &SessionId,
-        msg: &RequestsBlocked,
-    ) -> Result<(), SessionError> {
+    pub fn handle_requests_blocked(&self, msg: &RequestsBlocked) -> Result<(), SessionError> {
         let recv = self.inner.recv.lock().map_err(|_| SessionError::Internal)?;
         tracing::warn!(
-            session_id = %session_id,
+            session_id = %self.inner.session_id,
             "got requests blocked, peer max: {}, configured limit: {}, limit hit: {}, ignoring it",
             msg.max_request_id,
             recv.our_max,

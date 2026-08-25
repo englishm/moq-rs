@@ -216,7 +216,10 @@ impl Relay {
 
                 // Create the MoQ session over the connection
                 let forward_session_id = moq_transport::session::SessionId::new(forward_cid);
-                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config(
+                // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API,
+                // make `connect_with_config` accept it and remove
+                // `connect_with_config_and_session_id`.
+                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config_and_session_id(
                     session,
                     forward_session_id.clone(),
                     None,
@@ -226,7 +229,8 @@ impl Relay {
                 .await
                 .context("failed to establish forward session")?;
 
-                // Use the connection path already validated and stored by Session::connect().
+                // Use the connection path already validated and stored by
+                // Session::connect_with_config_and_session_id().
                 // The forward session is scoped to whatever path the announce URL specifies.
                 //
                 // Note: the forward connection intentionally does not call
@@ -350,7 +354,10 @@ impl Relay {
 
                             // Create the MoQ session over the connection (setup handshake etc)
                             let session_id = moq_transport::session::SessionId::new(connection_id.clone());
-                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config(
+                            // TODO(itzmanish): When SessionId becomes mandatory in the next
+                            // breaking API, make `accept_with_config` accept it and remove
+                            // `accept_with_config_and_session_id`.
+                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config_and_session_id(
                                 conn,
                                 session_id.clone(),
                                 mlog_path,

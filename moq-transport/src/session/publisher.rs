@@ -172,42 +172,124 @@ impl Publisher {
         &self.session_id
     }
 
+    /// Accept a publisher session using a generated local correlation ID.
+    ///
+    /// Use [`Self::accept_with_session_id`] when a peer-observed QUIC connection ID is available.
     pub async fn accept(
+        session: web_transport::Session,
+        transport: super::Transport,
+    ) -> Result<(Session, Publisher), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept` accept it and remove `accept_with_session_id`.
+        Self::accept_with_session_id(session, SessionId::generate(), transport).await
+    }
+
+    /// Accept a publisher session with explicit configuration and a generated correlation ID.
+    ///
+    /// Use [`Self::accept_with_config_and_session_id`] when a peer-observed QUIC connection ID is
+    /// available.
+    pub async fn accept_with_config(
+        session: web_transport::Session,
+        transport: super::Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Publisher), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        Self::accept_with_config_and_session_id(session, SessionId::generate(), transport, config)
+            .await
+    }
+
+    /// Accept a publisher session using a peer-observed QUIC connection ID.
+    pub async fn accept_with_session_id(
         session: web_transport::Session,
         session_id: SessionId,
         transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        Self::accept_with_config(session, session_id, transport, SessionConfig::default()).await
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        Self::accept_with_config_and_session_id(
+            session,
+            session_id,
+            transport,
+            SessionConfig::default(),
+        )
+        .await
     }
 
-    pub async fn accept_with_config(
+    /// Accept a configured publisher session using a peer-observed QUIC connection ID.
+    pub async fn accept_with_config_and_session_id(
         session: web_transport::Session,
         session_id: SessionId,
         transport: super::Transport,
         config: SessionConfig,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) =
-            Session::accept_with_config(session, session_id, None, transport, config).await?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        let (session, publisher, _) = Session::accept_with_config_and_session_id(
+            session, session_id, None, transport, config,
+        )
+        .await?;
         let publisher = publisher.ok_or(SessionError::Internal)?;
         Ok((session, publisher))
     }
 
+    /// Create a publisher session using a generated local correlation ID.
+    ///
+    /// Use [`Self::connect_with_session_id`] when a peer-observed QUIC connection ID is available.
     pub async fn connect(
+        session: web_transport::Session,
+        transport: super::Transport,
+    ) -> Result<(Session, Publisher), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        Self::connect_with_session_id(session, SessionId::generate(), transport).await
+    }
+
+    /// Create a configured publisher session using a generated local correlation ID.
+    ///
+    /// Use [`Self::connect_with_config_and_session_id`] when a peer-observed QUIC connection ID is
+    /// available.
+    pub async fn connect_with_config(
+        session: web_transport::Session,
+        transport: super::Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Publisher), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        Self::connect_with_config_and_session_id(session, SessionId::generate(), transport, config)
+            .await
+    }
+
+    /// Create a publisher session using a peer-observed QUIC connection ID.
+    pub async fn connect_with_session_id(
         session: web_transport::Session,
         session_id: SessionId,
         transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        Self::connect_with_config(session, session_id, transport, SessionConfig::default()).await
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        Self::connect_with_config_and_session_id(
+            session,
+            session_id,
+            transport,
+            SessionConfig::default(),
+        )
+        .await
     }
 
-    pub async fn connect_with_config(
+    /// Create a configured publisher session using a peer-observed QUIC connection ID.
+    pub async fn connect_with_config_and_session_id(
         session: web_transport::Session,
         session_id: SessionId,
         transport: super::Transport,
         config: SessionConfig,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) =
-            Session::connect_with_config(session, session_id, None, transport, config).await?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        let (session, publisher, _) = Session::connect_with_config_and_session_id(
+            session, session_id, None, transport, config,
+        )
+        .await?;
         Ok((session, publisher))
     }
 

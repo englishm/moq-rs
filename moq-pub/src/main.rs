@@ -96,10 +96,15 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    let (session, publisher) =
-        Publisher::connect(session, SessionId::new(connection_id.clone()), transport)
-            .await
-            .context("failed to create MoQ Transport publisher")?;
+    // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+    // `connect` accept it and remove `connect_with_session_id`.
+    let (session, publisher) = Publisher::connect_with_session_id(
+        session,
+        SessionId::new(connection_id.clone()),
+        transport,
+    )
+    .await
+    .context("failed to create MoQ Transport publisher")?;
 
     let mut namespace_publisher = publisher.clone();
     let publish_publisher = publisher;

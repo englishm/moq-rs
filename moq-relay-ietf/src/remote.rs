@@ -656,8 +656,10 @@ impl Remote {
         // PUBLISH_NAMESPACE). This mirrors the `--announce` forward path in
         // relay.rs rather than the subscriber-only upstream pull it replaces.
         let upstream_session_id = moq_transport::session::SessionId::new(upstream_cid);
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
         let (session, publisher, subscriber) =
-            match moq_transport::session::Session::connect_with_config(
+            match moq_transport::session::Session::connect_with_config_and_session_id(
                 session,
                 upstream_session_id.clone(),
                 None,

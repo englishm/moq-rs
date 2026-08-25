@@ -40,7 +40,9 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    let (session, subscriber) = moq_transport::session::Subscriber::connect(
+    // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+    // `connect` accept it and remove `connect_with_session_id`.
+    let (session, subscriber) = moq_transport::session::Subscriber::connect_with_session_id(
         session,
         moq_transport::session::SessionId::new(connection_id.clone()),
         transport,

@@ -585,13 +585,31 @@ impl Session {
     /// For native `moqt://` connections the PATH and AUTHORITY parameters are
     /// sent automatically.  For WebTransport the path is carried in the HTTP/3
     /// CONNECT URL so PATH is not sent.
+    ///
+    /// Generates a local [`SessionId`] fallback. Use [`Self::connect_with_session_id`]
+    /// when a peer-observed QUIC connection ID is available.
     pub async fn connect(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        Self::connect_with_session_id(session, SessionId::generate(), mlog_path, transport).await
+    }
+
+    /// Create an outbound/client QUIC connection with an explicit correlation ID.
+    ///
+    /// `session_id` should normally be the peer-observed QUIC connection ID.
+    pub async fn connect_with_session_id(
         session: web_transport::Session,
         session_id: SessionId,
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
-        Self::connect_with_config(
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        Self::connect_with_config_and_session_id(
             session,
             session_id,
             mlog_path,
@@ -602,7 +620,32 @@ impl Session {
     }
 
     /// Create an outbound/client QUIC connection with explicit session configuration.
+    ///
+    /// Generates a local [`SessionId`] fallback. Use
+    /// [`Self::connect_with_config_and_session_id`] when a peer-observed QUIC connection ID is
+    /// available.
     pub async fn connect_with_config(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        Self::connect_with_config_and_session_id(
+            session,
+            SessionId::generate(),
+            mlog_path,
+            transport,
+            config,
+        )
+        .await
+    }
+
+    /// Create an outbound/client QUIC connection with explicit configuration and correlation ID.
+    ///
+    /// `session_id` should normally be the peer-observed QUIC connection ID.
+    pub async fn connect_with_config_and_session_id(
         session: web_transport::Session,
         session_id: SessionId,
         mlog_path: Option<PathBuf>,
@@ -686,7 +729,10 @@ impl Session {
         let peer_max = max_request_id_from_params(&server.params);
         Self::log_peer_max_request_id(&session_id, peer_max);
         // Client sends even IDs (0); peer server sends odd IDs (1).
-        let request_id = RequestId::new(0, peer_max, our_max_request_id, 1);
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `RequestId::new` accept it and remove `RequestId::new_with_session_id`.
+        let request_id =
+            RequestId::new_with_session_id(session_id.clone(), 0, peer_max, our_max_request_id, 1);
         let session = Session::new(
             session, session_id, sender, recver, mlog, transport, path, request_id,
         );
@@ -700,13 +746,31 @@ impl Session {
     /// Waits for the bidirectional control stream, decodes CLIENT_SETUP,
     /// sends SERVER_SETUP with parameters only.  Version is already agreed
     /// via ALPN before this is called.
+    ///
+    /// Generates a local [`SessionId`] fallback. Use [`Self::accept_with_session_id`]
+    /// when a peer-observed QUIC connection ID is available.
     pub async fn accept(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+    ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept` accept it and remove `accept_with_session_id`.
+        Self::accept_with_session_id(session, SessionId::generate(), mlog_path, transport).await
+    }
+
+    /// Accept an inbound server connection with an explicit correlation ID.
+    ///
+    /// `session_id` should normally be the peer-observed QUIC connection ID.
+    pub async fn accept_with_session_id(
         session: web_transport::Session,
         session_id: SessionId,
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
-        Self::accept_with_config(
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        Self::accept_with_config_and_session_id(
             session,
             session_id,
             mlog_path,
@@ -717,7 +781,32 @@ impl Session {
     }
 
     /// Accept an inbound server connection with explicit session configuration.
+    ///
+    /// Generates a local [`SessionId`] fallback. Use
+    /// [`Self::accept_with_config_and_session_id`] when a peer-observed QUIC connection ID is
+    /// available.
     pub async fn accept_with_config(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        Self::accept_with_config_and_session_id(
+            session,
+            SessionId::generate(),
+            mlog_path,
+            transport,
+            config,
+        )
+        .await
+    }
+
+    /// Accept an inbound server connection with explicit configuration and correlation ID.
+    ///
+    /// `session_id` should normally be the peer-observed QUIC connection ID.
+    pub async fn accept_with_config_and_session_id(
         session: web_transport::Session,
         session_id: SessionId,
         mlog_path: Option<PathBuf>,
@@ -802,7 +891,10 @@ impl Session {
         sender.encode(&server).await?;
 
         // Server sends odd IDs (1); peer client sends even IDs (0).
-        let request_id = RequestId::new(1, peer_max, our_max_request_id, 0);
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `RequestId::new` accept it and remove `RequestId::new_with_session_id`.
+        let request_id =
+            RequestId::new_with_session_id(session_id.clone(), 1, peer_max, our_max_request_id, 0);
         Ok(Session::new(
             session,
             session_id,
@@ -1140,7 +1232,7 @@ impl Session {
                         "received REQUESTS_BLOCKED"
                     );
                     // REQUESTS_BLOCKED tells us the peer's send budget is exhausted.
-                    request_id.handle_requests_blocked(&session_id, m)?;
+                    request_id.handle_requests_blocked(m)?;
                 }
                 other => {
                     tracing::warn!(session_id = %session_id, msg_type = other.name(), "received unhandled message type");

@@ -259,43 +259,125 @@ impl Subscriber {
     }
 
     /// Create an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for control messages.
+    ///
+    /// Generates a local correlation ID. Use [`Self::accept_with_session_id`] when a peer-observed
+    /// QUIC connection ID is available.
     pub async fn accept(
+        session: web_transport::Session,
+        transport: super::Transport,
+    ) -> Result<(Session, Self), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept` accept it and remove `accept_with_session_id`.
+        Self::accept_with_session_id(session, SessionId::generate(), transport).await
+    }
+
+    /// Accept a configured subscriber session using a generated local correlation ID.
+    ///
+    /// Use [`Self::accept_with_config_and_session_id`] when a peer-observed QUIC connection ID is
+    /// available.
+    pub async fn accept_with_config(
+        session: web_transport::Session,
+        transport: super::Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Self), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        Self::accept_with_config_and_session_id(session, SessionId::generate(), transport, config)
+            .await
+    }
+
+    /// Accept a subscriber session using a peer-observed QUIC connection ID.
+    pub async fn accept_with_session_id(
         session: web_transport::Session,
         session_id: SessionId,
         transport: super::Transport,
     ) -> Result<(Session, Self), SessionError> {
-        Self::accept_with_config(session, session_id, transport, SessionConfig::default()).await
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        Self::accept_with_config_and_session_id(
+            session,
+            session_id,
+            transport,
+            SessionConfig::default(),
+        )
+        .await
     }
 
-    pub async fn accept_with_config(
+    /// Accept a configured subscriber session using a peer-observed QUIC connection ID.
+    pub async fn accept_with_config_and_session_id(
         session: web_transport::Session,
         session_id: SessionId,
         transport: super::Transport,
         config: SessionConfig,
     ) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) =
-            Session::accept_with_config(session, session_id, None, transport, config).await?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        let (session, _, subscriber) = Session::accept_with_config_and_session_id(
+            session, session_id, None, transport, config,
+        )
+        .await?;
         let subscriber = subscriber.ok_or(SessionError::Internal)?;
         Ok((session, subscriber))
     }
 
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for control messages.
+    ///
+    /// Generates a local correlation ID. Use [`Self::connect_with_session_id`] when a peer-observed
+    /// QUIC connection ID is available.
     pub async fn connect(
+        session: web_transport::Session,
+        transport: super::Transport,
+    ) -> Result<(Session, Self), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        Self::connect_with_session_id(session, SessionId::generate(), transport).await
+    }
+
+    /// Create a configured subscriber session using a generated local correlation ID.
+    ///
+    /// Use [`Self::connect_with_config_and_session_id`] when a peer-observed QUIC connection ID is
+    /// available.
+    pub async fn connect_with_config(
+        session: web_transport::Session,
+        transport: super::Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Self), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        Self::connect_with_config_and_session_id(session, SessionId::generate(), transport, config)
+            .await
+    }
+
+    /// Create a subscriber session using a peer-observed QUIC connection ID.
+    pub async fn connect_with_session_id(
         session: web_transport::Session,
         session_id: SessionId,
         transport: super::Transport,
     ) -> Result<(Session, Self), SessionError> {
-        Self::connect_with_config(session, session_id, transport, SessionConfig::default()).await
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        Self::connect_with_config_and_session_id(
+            session,
+            session_id,
+            transport,
+            SessionConfig::default(),
+        )
+        .await
     }
 
-    pub async fn connect_with_config(
+    /// Create a configured subscriber session using a peer-observed QUIC connection ID.
+    pub async fn connect_with_config_and_session_id(
         session: web_transport::Session,
         session_id: SessionId,
         transport: super::Transport,
         config: SessionConfig,
     ) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) =
-            Session::connect_with_config(session, session_id, None, transport, config).await?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        let (session, _, subscriber) = Session::connect_with_config_and_session_id(
+            session, session_id, None, transport, config,
+        )
+        .await?;
         Ok((session, subscriber))
     }
 
