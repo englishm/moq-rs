@@ -191,6 +191,7 @@ impl Drop for Published {
             Ok(state) => state,
             Err(_) => {
                 tracing::error!(
+                    session_id = %self.publisher.session_id(),
                     request_id = self.info.id,
                     "published state lock poisoned while dropping PUBLISH"
                 );
@@ -213,6 +214,7 @@ impl Drop for Published {
             .is_err()
         {
             tracing::error!(
+                session_id = %self.publisher.session_id(),
                 request_id = self.info.id,
                 "failed to enqueue PUBLISH_DONE while dropping PUBLISH"
             );

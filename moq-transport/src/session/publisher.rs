@@ -255,10 +255,12 @@ impl Publisher {
                     match res? {
                         Some(subscribed) => {
                             let tracks = tracks.clone();
+                            let session_id = self.session_id.clone();
                             subscribe_tasks.push(async move {
                                 let info = subscribed.info.clone();
                                 if let Err(err) = Self::serve_subscribe(subscribed, tracks).await {
                                     tracing::warn!(
+                                        session_id = %session_id,
                                         subscribe_info = ?info,
                                         error = %err,
                                         "failed serving subscribe"
@@ -273,10 +275,12 @@ impl Publisher {
                     match res? {
                         Some(status) => {
                             let tracks = tracks.clone();
+                            let session_id = self.session_id.clone();
                             status_tasks.push(async move {
                                 let request_msg = status.request_msg.clone();
                                 if let Err(err) = Self::serve_track_status(status, tracks).await {
                                     tracing::warn!(
+                                        session_id = %session_id,
                                         request = ?request_msg,
                                         error = %err,
                                         "failed serving track status request"
@@ -520,6 +524,7 @@ impl Publisher {
             message::Subscriber::FetchCancel(msg) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %self.session_id,
                     request_id = msg.id,
                     "received FETCH_CANCEL for unsupported FETCH — ignoring"
                 );
@@ -548,6 +553,7 @@ impl Publisher {
     fn send_not_supported(&mut self, request_id: u64, request_kind: &str) {
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %self.session_id,
             request_id,
             "sending REQUEST_ERROR NOT_SUPPORTED for unimplemented request"
         );
@@ -590,6 +596,7 @@ impl Publisher {
         } else {
             tracing::debug!(
                 target: "moq_transport::control",
+                session_id = %self.session_id,
                 request_id = msg.id,
                 "received PUBLISH_OK for unknown PUBLISH — ignoring"
             );
@@ -892,7 +899,7 @@ impl Publisher {
 
     pub(super) fn drop_subscribe(&mut self, id: u64) {
         if let Err(err) = self.remove_subscribe(id) {
-            tracing::error!(request_id = id, error = %err, "failed to drop subscribe state");
+            tracing::error!(session_id = %self.session_id, request_id = id, error = %err, "failed to drop subscribe state");
         }
     }
 
@@ -955,7 +962,7 @@ impl Publisher {
 
     fn drop_published(&mut self, id: u64) {
         if let Err(err) = self.remove_published(id) {
-            tracing::error!(request_id = id, error = %err, "failed to drop published state");
+            tracing::error!(session_id = %self.session_id, request_id = id, error = %err, "failed to drop published state");
         }
     }
 

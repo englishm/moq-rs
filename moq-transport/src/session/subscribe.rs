@@ -186,7 +186,7 @@ impl Subscribe {
             params: KeyValuePairs::default(),
         };
         let info = SubscribeInfo::new_from_subscribe(&subscribe_message).unwrap_or_else(|err| {
-            tracing::warn!(error = %err, "failed to decode outbound subscribe parameters");
+            tracing::warn!(session_id = %subscriber.session_id(), error = %err, "failed to decode outbound subscribe parameters");
             SubscribeInfo {
                 id: request_id,
                 track_namespace: track.namespace.clone(),

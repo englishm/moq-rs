@@ -364,7 +364,7 @@ impl Subscriber {
     /// Called by `PublishReceived::drop` when the app did not call `ok()`.
     pub(super) fn remove_publish_received(&self, request_id: u64) {
         if let Err(err) = self.remove_publish_received_state(request_id) {
-            tracing::error!(request_id, error = %err, "failed to remove inbound PUBLISH state");
+            tracing::error!(session_id = %self.session_id, request_id, error = %err, "failed to remove inbound PUBLISH state");
         }
     }
 
@@ -448,14 +448,14 @@ impl Subscriber {
         let id = match self.get_next_request_id() {
             Ok(id) => id,
             Err(e) => {
-                tracing::warn!(error = %e, "could not send TRACK_STATUS: request ID limit reached");
+                tracing::warn!(session_id = %self.session_id, error = %e, "could not send TRACK_STATUS: request ID limit reached");
                 return;
             }
         };
         if let Ok(mut track_statuses) = self.track_statuses.lock() {
             track_statuses.insert(id);
         } else {
-            tracing::warn!("could not track outbound TRACK_STATUS: lock poisoned");
+            tracing::warn!(session_id = %self.session_id, "could not track outbound TRACK_STATUS: lock poisoned");
             return;
         }
         self.send_message(message::TrackStatus {
@@ -567,6 +567,7 @@ impl Subscriber {
             message::Publisher::FetchOk(msg) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %self.session_id,
                     request_id = msg.id,
                     "received FETCH_OK for unsupported FETCH — ignoring"
                 );
@@ -797,6 +798,7 @@ impl Subscriber {
 
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %self.session_id,
             request_id = msg.id,
             track_alias = msg.track_alias,
             namespace = %msg.track_namespace,
@@ -853,6 +855,7 @@ impl Subscriber {
         } else {
             tracing::debug!(
                 target: "moq_transport::control",
+                session_id = %self.session_id,
                 request_id = msg.id,
                 "received PUBLISH_DONE for unknown subscription — ignoring"
             );
@@ -872,6 +875,7 @@ impl Subscriber {
             self.log_request_ok_parsed(request_kind, msg);
             tracing::debug!(
                 target: "moq_transport::control",
+                session_id = %self.session_id,
                 request_id = msg.id,
                 request_kind,
                 "received REQUEST_OK"
@@ -883,6 +887,7 @@ impl Subscriber {
         self.log_request_ok_parsed(request_kind, msg);
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %self.session_id,
             request_id = msg.id,
             request_kind,
             "received REQUEST_OK"
@@ -903,6 +908,7 @@ impl Subscriber {
             subscribe.error(ServeError::Closed(msg.error_code))?;
             tracing::debug!(
                 target: "moq_transport::control",
+                session_id = %self.session_id,
                 request_id = msg.id,
                 request_kind = "subscribe",
                 error_code = msg.error_code,
@@ -915,6 +921,7 @@ impl Subscriber {
             self.log_request_error_parsed("track_status", msg);
             tracing::debug!(
                 target: "moq_transport::control",
+                session_id = %self.session_id,
                 request_id = msg.id,
                 request_kind = "track_status",
                 error_code = msg.error_code,
@@ -928,6 +935,7 @@ impl Subscriber {
         self.log_request_error_parsed("unknown", msg);
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %self.session_id,
             request_id = msg.id,
             request_kind = "unknown",
             error_code = msg.error_code,
@@ -1077,6 +1085,7 @@ impl Subscriber {
             .await;
         if let Err(SessionError::Serve(err)) = &res {
             tracing::warn!(
+                session_id = %self.session_id,
                 "[SUBSCRIBER] recv_stream: stream processing error for track_alias={}: {:?}",
                 track_alias,
                 err
@@ -1141,6 +1150,7 @@ impl Subscriber {
     /// PUBLISH).  Keeping this as a closure avoids duplicating ~100 lines of
     /// object decoding, ID tracking, validation, logging, and payload reading.
     async fn recv_subgroup_objects(
+        session_id: SessionId,
         stream_header_type: data::StreamHeaderType,
         mut subgroup_header: data::SubgroupHeader,
         mut reader: Reader,
@@ -1284,6 +1294,7 @@ impl Subscriber {
             while remaining_bytes > 0 {
                 let chunk = reader.read_chunk(remaining_bytes).await?.ok_or_else(|| {
                     tracing::error!(
+                        session_id = %session_id,
                         "[SUBSCRIBER] recv_subgroup_objects: stream ended with {} bytes remaining",
                         remaining_bytes
                     );
@@ -1322,6 +1333,7 @@ impl Subscriber {
         let subscribes = self.subscribes.clone();
         let publishes_received = self.publishes_received.clone();
         Self::recv_subgroup_objects(
+            self.session_id.clone(),
             stream_header_type,
             subgroup_header,
             reader,
@@ -1446,6 +1458,7 @@ impl Subscriber {
             }
             None => {
                 tracing::warn!(
+                    session_id = %self.session_id,
                     "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias={}, group_id={}, object_id={}",
                     track_alias,
                     datagram.group_id,

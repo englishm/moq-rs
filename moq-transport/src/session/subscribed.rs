@@ -513,13 +513,14 @@ impl ObjectForwarder {
                         let state = self.state.clone();
                         let info = subgroup.info.clone();
                         let mlog = self.mlog.clone();
+                        let session_id = self.publisher.session_id().clone();
 
                         tasks.push(async move {
                             if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await {
                                 if Subscribed::is_expected_serve_shutdown(&err) {
-                                    tracing::debug!(subgroup_info = ?info, error = %err, "stopped serving subgroup");
+                                    tracing::debug!(session_id = %session_id, subgroup_info = ?info, error = %err, "stopped serving subgroup");
                                 } else {
-                                    tracing::warn!(subgroup_info = ?info, error = %err, "failed to serve subgroup");
+                                    tracing::warn!(session_id = %session_id, subgroup_info = ?info, error = %err, "failed to serve subgroup");
                                 }
                             }
                         });
@@ -845,7 +846,7 @@ impl ObjectForwarder {
         mut datagrams: serve::DatagramsReader,
         delivery_filter: DeliveryFilter,
     ) -> Result<(), SessionError> {
-        tracing::debug!("[PUBLISHER] serve_datagrams: starting");
+        tracing::debug!(session_id = %self.publisher.session_id(), "[PUBLISHER] serve_datagrams: starting");
 
         let mut datagram_count = 0;
         while let Some(datagram) = datagrams.read().await? {
