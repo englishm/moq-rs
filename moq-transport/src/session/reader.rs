@@ -8,16 +8,18 @@ use bytes::{Buf, Bytes, BytesMut};
 
 use crate::coding::{Decode, DecodeError};
 
-use super::SessionError;
+use super::{SessionError, SessionId};
 
 pub struct Reader {
+    session_id: SessionId,
     stream: web_transport::RecvStream,
     buffer: BytesMut,
 }
 
 impl Reader {
-    pub fn new(stream: web_transport::RecvStream) -> Self {
+    pub fn new(session_id: SessionId, stream: web_transport::RecvStream) -> Self {
         Self {
+            session_id,
             stream,
             buffer: Default::default(),
         }
@@ -59,6 +61,7 @@ impl Reader {
                 }
                 Err(err) => {
                     tracing::error!(
+                        session_id = %self.session_id,
                         "[READER] decode: ERROR decoding {} - {:?} (buffer_len={})",
                         std::any::type_name::<T>(),
                         err,
@@ -74,6 +77,7 @@ impl Reader {
                 let before_read = self.buffer.len();
                 if self.stream.read_buf(&mut self.buffer).await?.is_none() {
                     tracing::warn!(
+                        session_id = %self.session_id,
                         "[READER] decode: stream ended while waiting for data (have={} bytes, need={})",
                         self.buffer.len(),
                         required

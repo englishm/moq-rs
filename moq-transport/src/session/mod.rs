@@ -610,13 +610,15 @@ impl Session {
 
         let mlog = mlog_path.and_then(|p| {
             mlog::MlogWriter::new(p)
-                .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
+                .map_err(
+                    |e| tracing::warn!(session_id = %session_id, "Failed to create mlog: {}", e),
+                )
                 .ok()
         });
 
         let control = session.open_bi().await?;
-        let mut sender = Writer::new(control.0);
-        let mut recver = Reader::new(control.1);
+        let mut sender = Writer::new(session_id.clone(), control.0);
+        let mut recver = Reader::new(session_id.clone(), control.1);
 
         let mut params = KeyValuePairs::default();
 
@@ -719,13 +721,15 @@ impl Session {
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|p| {
             mlog::MlogWriter::new(p)
-                .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
+                .map_err(
+                    |e| tracing::warn!(session_id = %session_id, "Failed to create mlog: {}", e),
+                )
                 .ok()
         });
 
         let control = session.accept_bi().await?;
-        let mut sender = Writer::new(control.0);
-        let mut recver = Reader::new(control.1);
+        let mut sender = Writer::new(session_id.clone(), control.0);
+        let mut recver = Reader::new(session_id.clone(), control.1);
 
         let client: setup::Client = recver.decode().await?;
         tracing::debug!(
@@ -750,7 +754,10 @@ impl Session {
         let connection_path = wt_path.or(client_setup_path);
 
         if connection_path.is_some() {
+            // FIXME(security): connection_path is the credential-bearing path.
+            // Redact along with the other URL log sites; tracked separately.
             tracing::debug!(
+                session_id = %session_id,
                 connection_path = connection_path.as_deref(),
                 "Connection path resolved"
             );
@@ -812,7 +819,7 @@ impl Session {
             res = Self::run_send(self.session_id.clone(), self.sender, self.outgoing, self.mlog.clone()) => res,
             res = Self::run_subscribe_namespace_open(self.session_id.clone(), self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
             res = Self::run_subscribe_namespace_accept(self.session_id.clone(), self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => res,
-            res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
+            res = Self::run_streams(self.session_id.clone(), self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
             res = Self::run_pending_timeouts(self.session_id, self.publisher, self.subscriber, self.pending_requests) => res,
         }
@@ -900,8 +907,8 @@ impl Session {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         let (send, recv) = webtransport.open_bi().await?;
-        let mut writer = Writer::new(send);
-        let reader = Reader::new(recv);
+        let mut writer = Writer::new(session_id.clone(), send);
+        let reader = Reader::new(session_id.clone(), recv);
 
         let msg = Message::SubscribeNamespace(request.message.clone());
         Self::log_control_message(&session_id, &msg, "sent");
@@ -950,8 +957,8 @@ impl Session {
         recv: web_transport::RecvStream,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
-        let writer = Writer::new(send);
-        let mut reader = Reader::new(recv);
+        let writer = Writer::new(session_id.clone(), send);
+        let mut reader = Reader::new(session_id.clone(), recv);
         // Bound the wait for the stream's opening SUBSCRIBE_NAMESPACE header so an
         // idle or malicious peer cannot hold an accept slot open forever (#2).
         let msg = tokio::time::timeout(
@@ -1128,10 +1135,10 @@ impl Session {
                         "received REQUESTS_BLOCKED"
                     );
                     // REQUESTS_BLOCKED tells us the peer's send budget is exhausted.
-                    request_id.handle_requests_blocked(m)?;
+                    request_id.handle_requests_blocked(&session_id, m)?;
                 }
                 other => {
-                    tracing::warn!(msg_type = other.name(), "received unhandled message type");
+                    tracing::warn!(session_id = %session_id, msg_type = other.name(), "received unhandled message type");
                     return Err(SessionError::unimplemented(&format!(
                         "message type {}",
                         other.name()
@@ -1296,6 +1303,7 @@ impl Session {
     /// Will read stream header to know what type of stream it is and create
     /// the appropriate stream handlers.
     async fn run_streams(
+        session_id: SessionId,
         webtransport: web_transport::Session,
         subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
@@ -1306,10 +1314,11 @@ impl Session {
                 res = webtransport.accept_uni() => {
                     let stream = res?;
                     let subscriber = subscriber.clone().ok_or(SessionError::RoleViolation)?;
+                    let session_id = session_id.clone();
 
                     tasks.push(async move {
                         if let Err(err) = Subscriber::recv_stream(subscriber, stream).await {
-                            tracing::warn!("failed to serve stream: {}", err);
+                            tracing::warn!(session_id = %session_id, "failed to serve stream: {}", err);
                         };
                     });
                 },

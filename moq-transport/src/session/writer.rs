@@ -6,20 +6,27 @@ use std::io;
 
 use crate::coding::{Encode, EncodeError};
 
-use super::SessionError;
+use super::{SessionError, SessionId};
 use bytes::Buf;
 
 pub struct Writer {
+    session_id: SessionId,
     stream: web_transport::SendStream,
     buffer: bytes::BytesMut,
 }
 
 impl Writer {
-    pub fn new(stream: web_transport::SendStream) -> Self {
+    pub fn new(session_id: SessionId, stream: web_transport::SendStream) -> Self {
         Self {
+            session_id,
             stream,
             buffer: Default::default(),
         }
+    }
+
+    /// The id of the session that owns this stream.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
     }
 
     pub async fn encode<T: Encode>(&mut self, msg: &T) -> Result<(), SessionError> {
@@ -70,6 +77,7 @@ impl Writer {
             let size = self.stream.write_buf(&mut cursor).await?;
             if size == 0 {
                 tracing::error!(
+                    session_id = %self.session_id,
                     "[WRITER] write: ERROR - wrote 0 bytes with {} bytes remaining",
                     cursor.remaining()
                 );

@@ -266,6 +266,7 @@ impl SubscribedNamespaceRecv {
                         }
                         Err(err) => {
                             tracing::debug!(
+                                session_id = %writer.session_id(),
                                 request_id = self.request_id,
                                 error = %err,
                                 "SUBSCRIBE_NAMESPACE request stream closed with error"

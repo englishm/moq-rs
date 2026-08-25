@@ -1045,7 +1045,7 @@ impl Subscriber {
         stream: web_transport::RecvStream,
     ) -> Result<(), SessionError> {
         tracing::trace!("[SUBSCRIBER] recv_stream: new stream received, decoding header");
-        let mut reader = Reader::new(stream);
+        let mut reader = Reader::new(self.session_id.clone(), stream);
 
         // Decode the stream header
         let stream_header: data::StreamHeader = reader.decode().await?;

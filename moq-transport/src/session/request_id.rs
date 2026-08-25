@@ -21,7 +21,7 @@ use std::{
 
 use crate::coding::KeyValuePairs;
 use crate::message::{MaxRequestId, RequestsBlocked};
-use crate::session::SessionError;
+use crate::session::{SessionError, SessionId};
 
 #[derive(Clone, Debug)]
 pub struct RequestId {
@@ -182,9 +182,14 @@ impl RequestId {
     /// If the peer has consumed our current advertised maximum and reports that
     /// same maximum as blocked, we currently ignore this. In the future, we may
     /// advertise new incremented MAX_REQUEST_ID.
-    pub fn handle_requests_blocked(&self, msg: &RequestsBlocked) -> Result<(), SessionError> {
+    pub fn handle_requests_blocked(
+        &self,
+        session_id: &SessionId,
+        msg: &RequestsBlocked,
+    ) -> Result<(), SessionError> {
         let recv = self.inner.recv.lock().map_err(|_| SessionError::Internal)?;
         tracing::warn!(
+            session_id = %session_id,
             "got requests blocked, peer max: {}, configured limit: {}, limit hit: {}, ignoring it",
             msg.max_request_id,
             recv.our_max,
