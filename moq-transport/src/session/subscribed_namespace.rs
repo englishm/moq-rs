@@ -301,7 +301,7 @@ impl SubscribedNamespaceRecv {
                 msg_type = "REQUEST_ERROR",
                 request_id = m.id,
                 error_code = m.error_code,
-                reason = %m.reason.0,
+                reason = ?m.reason.0,
                 "MoQT control message"
             );
         }

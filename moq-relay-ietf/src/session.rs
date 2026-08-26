@@ -360,33 +360,13 @@ impl SessionContext {
     /// ordinary sessions as errors. If no level is enabled, this returns a
     /// disabled span.
     pub fn span(&self) -> tracing::Span {
-        macro_rules! session_span {
-            ($level:expr) => {
-                tracing::span!(
-                    target: module_path!(),
-                    parent: None,
-                    $level,
-                    "moq_session",
-                    session_id = %self.session_id,
-                    interface = %self.interface,
-                    scope_present = self.scope.is_some(),
-                )
-            };
-        }
-
-        if tracing::enabled!(target: module_path!(), tracing::Level::TRACE) {
-            session_span!(tracing::Level::TRACE)
-        } else if tracing::enabled!(target: module_path!(), tracing::Level::DEBUG) {
-            session_span!(tracing::Level::DEBUG)
-        } else if tracing::enabled!(target: module_path!(), tracing::Level::INFO) {
-            session_span!(tracing::Level::INFO)
-        } else if tracing::enabled!(target: module_path!(), tracing::Level::WARN) {
-            session_span!(tracing::Level::WARN)
-        } else if tracing::enabled!(target: module_path!(), tracing::Level::ERROR) {
-            session_span!(tracing::Level::ERROR)
-        } else {
-            tracing::Span::none()
-        }
+        crate::enabled_root_span!(
+            target: module_path!(),
+            "moq_session",
+            session_id = %self.session_id,
+            interface = %self.interface,
+            scope_present = self.scope.is_some(),
+        )
     }
 
     /// The scope used for routing and coordinator calls, if any.

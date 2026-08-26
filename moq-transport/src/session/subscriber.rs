@@ -995,7 +995,7 @@ impl Subscriber {
                 request_kind = "subscribe",
                 error_code = msg.error_code,
                 retry_interval = msg.retry_interval,
-                reason = %msg.reason.0,
+                reason = ?msg.reason.0,
                 "received REQUEST_ERROR"
             );
             return Ok(());
@@ -1008,7 +1008,7 @@ impl Subscriber {
                 request_kind = "track_status",
                 error_code = msg.error_code,
                 retry_interval = msg.retry_interval,
-                reason = %msg.reason.0,
+                reason = ?msg.reason.0,
                 "received REQUEST_ERROR"
             );
             return Ok(());
@@ -1022,7 +1022,7 @@ impl Subscriber {
             request_kind = "unknown",
             error_code = msg.error_code,
             retry_interval = msg.retry_interval,
-            reason = %msg.reason.0,
+            reason = ?msg.reason.0,
             "received REQUEST_ERROR"
         );
         Ok(())

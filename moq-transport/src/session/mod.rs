@@ -358,7 +358,7 @@ impl Session {
                     msg_type = "PUBLISH_NAMESPACE_CANCEL",
                     request_id = m.id,
                     error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
+                    reason = ?m.reason_phrase.0,
                     "MoQT control message"
                 );
             }
@@ -450,7 +450,7 @@ impl Session {
                     status_code = m.status_code,
                     stream_count = m.stream_count,
                     // The reason carries the error id a client can quote back.
-                    reason = %m.reason.0,
+                    reason = ?m.reason.0,
                     "MoQT control message"
                 );
             }
@@ -505,7 +505,7 @@ impl Session {
                     retry_interval = m.retry_interval,
                     // The reason carries the error id a client can quote back.
                     // Logging it here is what ties that id to this session.
-                    reason = %m.reason.0,
+                    reason = ?m.reason.0,
                     "MoQT control message"
                 );
             }
@@ -1295,7 +1295,7 @@ impl Session {
                     request_id = msg.id,
                     error_code = msg.error_code,
                     retry_interval = msg.retry_interval,
-                    reason = %msg.reason.0,
+                    reason = ?msg.reason.0,
                     "received REQUEST_ERROR for unknown outbound request — ignoring"
                 );
                 Ok(())
@@ -1443,6 +1443,38 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(StdArc<StdMutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(emit: impl FnOnce()) -> String {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, emit);
+
+        let output = capture.0.lock().unwrap().clone();
+        String::from_utf8(output).unwrap()
+    }
 
     // ========================================================================
     // normalize_connection_path
@@ -1512,6 +1544,46 @@ mod tests {
         // Exactly at the limit (1024 total including leading slash)
         let path = format!("/{}", "a".repeat(Session::MAX_CONNECTION_PATH_LEN - 1));
         assert!(Session::normalize_connection_path(&path).is_ok());
+    }
+
+    #[test]
+    fn control_message_reasons_escape_log_forging_characters() {
+        let session_id = SessionId::new("log-safety-session");
+        let request_error = Message::RequestError(message::RequestError {
+            id: 7,
+            error_code: 1,
+            retry_interval: 0,
+            reason: crate::coding::ReasonPhrase("request\nforged\rline".to_string()),
+        });
+        let publish_done = Message::PublishDone(message::PublishDone {
+            id: 8,
+            status_code: 2,
+            stream_count: 1,
+            reason: crate::coding::ReasonPhrase("publish\nforged\rline".to_string()),
+        });
+
+        let output = capture_logs(|| {
+            Session::log_control_message(&session_id, &request_error, "recv");
+            Session::log_control_message(&session_id, &publish_done, "recv");
+        });
+
+        assert_eq!(
+            output.lines().count(),
+            2,
+            "unexpected log records: {output}"
+        );
+        assert!(
+            !output.contains('\r'),
+            "raw carriage return in log: {output}"
+        );
+        assert!(
+            output.contains(r#"reason="request\nforged\rline""#),
+            "REQUEST_ERROR reason was not escaped: {output}"
+        );
+        assert!(
+            output.contains(r#"reason="publish\nforged\rline""#),
+            "PUBLISH_DONE reason was not escaped: {output}"
+        );
     }
 
     #[test]

@@ -32,31 +32,11 @@ type TrackSlot = Arc<Mutex<Option<CachedTrack>>>;
 
 /// Build the root span used while connecting before the peer-observed CID exists.
 fn remote_connect_span() -> tracing::Span {
-    macro_rules! connect_span {
-        ($level:expr) => {
-            tracing::span!(
-                target: module_path!(),
-                parent: None,
-                $level,
-                "moq_remote_connect",
-                interface = %crate::SessionInterface::Internal,
-            )
-        };
-    }
-
-    if tracing::enabled!(target: module_path!(), tracing::Level::TRACE) {
-        connect_span!(tracing::Level::TRACE)
-    } else if tracing::enabled!(target: module_path!(), tracing::Level::DEBUG) {
-        connect_span!(tracing::Level::DEBUG)
-    } else if tracing::enabled!(target: module_path!(), tracing::Level::INFO) {
-        connect_span!(tracing::Level::INFO)
-    } else if tracing::enabled!(target: module_path!(), tracing::Level::WARN) {
-        connect_span!(tracing::Level::WARN)
-    } else if tracing::enabled!(target: module_path!(), tracing::Level::ERROR) {
-        connect_span!(tracing::Level::ERROR)
-    } else {
-        tracing::Span::none()
-    }
+    crate::enabled_root_span!(
+        target: module_path!(),
+        "moq_remote_connect",
+        interface = %crate::SessionInterface::Internal,
+    )
 }
 
 /// A cached cross-relay track reader plus the downstream interest in it.
