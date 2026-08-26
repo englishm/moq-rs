@@ -280,12 +280,6 @@ pub struct SessionContext {
     /// Whether this session is public client-facing or internal relay-to-relay.
     pub interface: SessionInterface,
 
-    /// Remote socket address for observability, when known.
-    ///
-    /// Unlike [`peer`](Self::peer), this is populated for both public and
-    /// internal sessions and is never used as a coordinator peer identity.
-    pub peer_addr: Option<SocketAddr>,
-
     /// Relay identity for internal sessions, when known.
     ///
     /// Populated for outbound connections the relay dials itself, where the
@@ -296,42 +290,24 @@ pub struct SessionContext {
 }
 
 impl SessionContext {
-    /// Build a public, client-facing context with no known peer address.
+    /// Build a public, client-facing context.
     pub fn public(session_id: SessionId, scope: Option<String>) -> Self {
         Self {
             session_id,
             scope,
             interface: SessionInterface::Public,
-            peer_addr: None,
-            peer: None,
-        }
-    }
-
-    /// Build a public, client-facing context with a known peer address.
-    pub fn public_with_peer_addr(
-        session_id: SessionId,
-        scope: Option<String>,
-        peer_addr: SocketAddr,
-    ) -> Self {
-        Self {
-            session_id,
-            scope,
-            interface: SessionInterface::Public,
-            peer_addr: Some(peer_addr),
             peer: None,
         }
     }
 
     /// Build an internal, relay-to-relay context for the given scope and peer.
     ///
-    /// The observability address is derived from [`RelayInfo::addr`].
+    /// The peer is forwarded as the [`CoordinatorContext::source`].
     pub fn internal(session_id: SessionId, scope: Option<String>, peer: Option<RelayInfo>) -> Self {
-        let peer_addr = peer.as_ref().and_then(|peer| peer.addr);
         Self {
             session_id,
             scope,
             interface: SessionInterface::Internal,
-            peer_addr,
             peer,
         }
     }
@@ -339,10 +315,9 @@ impl SessionContext {
     /// Build an inbound context from a resolved scope, connection tags, and
     /// the peer's socket address.
     ///
-    /// The interface is taken from the tags (see [`ConnectionTags::interface`])
-    /// and `remote_addr` is retained for observability regardless of interface.
+    /// The interface is taken from the tags (see [`ConnectionTags::interface`]).
     /// For connections classified [`SessionInterface::Internal`], the peer
-    /// identity is also derived from `remote_addr` (the relay trusts the inbound
+    /// identity is derived from `remote_addr` (the relay trusts the inbound
     /// socket address rather than asking the coordinator to resolve it; see
     /// [`RelayInfo::from_socket_addr`]). Public connections, and internal
     /// connections with no known address, leave `peer` as `None`.
@@ -361,7 +336,6 @@ impl SessionContext {
             session_id,
             scope,
             interface,
-            peer_addr: remote_addr,
             peer,
         }
     }
@@ -379,8 +353,8 @@ impl SessionContext {
     ///
     /// The span is an explicit root so an upstream session created while serving
     /// another session does not inherit the requesting session's identity.
-    /// The peer's socket address is included when known, but neither the scope
-    /// nor relay URL is recorded because either may contain credentials.
+    /// Neither the scope nor relay identity is recorded because either may
+    /// contain credentials.
     /// Its metadata uses the most verbose level currently enabled for this
     /// module, preserving correlation under restrictive filters without marking
     /// ordinary sessions as errors. If no level is enabled, this returns a
@@ -396,7 +370,6 @@ impl SessionContext {
                     session_id = %self.session_id,
                     interface = %self.interface,
                     scope_present = self.scope.is_some(),
-                    peer_addr = self.peer_addr.map(tracing::field::display),
                 )
             };
         }
@@ -643,21 +616,10 @@ mod tests {
     }
 
     #[test]
-    fn session_context_public_has_no_peer() {
+    fn session_context_public_has_no_peer_or_coordinator_source() {
         let context = SessionContext::public(SessionId::generate(), Some("scope-a".to_string()));
         assert_eq!(context.scope(), Some("scope-a"));
         assert_eq!(context.interface, SessionInterface::Public);
-        assert!(context.peer_addr.is_none());
-        assert!(context.peer.is_none());
-    }
-
-    #[test]
-    fn session_context_public_with_peer_addr_keeps_source_private() {
-        let addr: SocketAddr = "203.0.113.7:4443".parse().unwrap();
-        let context = SessionContext::public_with_peer_addr(SessionId::generate(), None, addr);
-
-        assert_eq!(context.interface, SessionInterface::Public);
-        assert_eq!(context.peer_addr, Some(addr));
         assert!(context.peer.is_none());
 
         let coordinator = context.coordinator_context();
@@ -676,7 +638,6 @@ mod tests {
         );
         assert_eq!(context.scope(), Some("scope-b"));
         assert_eq!(context.interface, SessionInterface::Internal);
-        assert_eq!(context.peer_addr, Some(addr));
         assert_eq!(context.peer.unwrap().url, url);
     }
 
@@ -693,7 +654,6 @@ mod tests {
         );
         assert_eq!(internal.interface, SessionInterface::Internal);
         assert_eq!(internal.scope(), Some("scope-c"));
-        assert_eq!(internal.peer_addr, Some(addr));
         let peer = internal.peer.expect("internal context should carry a peer");
         assert_eq!(peer.addr, Some(addr));
         assert_eq!(peer.url.as_str(), "https://10.0.0.7:4443/");
@@ -706,10 +666,9 @@ mod tests {
             None,
         );
         assert_eq!(internal_no_addr.interface, SessionInterface::Internal);
-        assert!(internal_no_addr.peer_addr.is_none());
         assert!(internal_no_addr.peer.is_none());
 
-        // Public retains the address for observability but never carries a peer.
+        // A public transport address never becomes a relay identity.
         let public = SessionContext::from_tags(
             SessionId::generate(),
             None,
@@ -718,8 +677,8 @@ mod tests {
         );
         assert_eq!(public.interface, SessionInterface::Public);
         assert!(public.scope().is_none());
-        assert_eq!(public.peer_addr, Some(addr));
         assert!(public.peer.is_none());
+        assert!(public.coordinator_context().source.is_none());
     }
 
     #[test]
@@ -779,8 +738,8 @@ mod tests {
             "scope presence missing from output: {out}"
         );
         assert!(
-            out.contains("10.0.0.7:4443"),
-            "peer address missing from output: {out}"
+            !out.contains("10.0.0.7:4443"),
+            "peer address unexpectedly present: {out}"
         );
     }
 
@@ -814,8 +773,8 @@ mod tests {
             "relay URL secret leaked into output: {out}"
         );
         assert!(
-            out.contains("10.0.0.9:4443"),
-            "peer address missing from output: {out}"
+            !out.contains("10.0.0.9:4443"),
+            "peer address unexpectedly present: {out}"
         );
     }
 

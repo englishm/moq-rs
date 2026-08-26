@@ -31,7 +31,7 @@ type TrackCacheKey = (TrackNamespace, TrackName);
 type TrackSlot = Arc<Mutex<Option<CachedTrack>>>;
 
 /// Build the root span used while connecting before the peer-observed CID exists.
-fn remote_connect_span(peer_addr: Option<SocketAddr>) -> tracing::Span {
+fn remote_connect_span() -> tracing::Span {
     macro_rules! connect_span {
         ($level:expr) => {
             tracing::span!(
@@ -40,7 +40,6 @@ fn remote_connect_span(peer_addr: Option<SocketAddr>) -> tracing::Span {
                 $level,
                 "moq_remote_connect",
                 interface = %crate::SessionInterface::Internal,
-                peer_addr = peer_addr.map(tracing::field::display),
             )
         };
     }
@@ -150,7 +149,6 @@ mod tests {
 
         assert_eq!(context.interface, crate::SessionInterface::Internal);
         assert!(context.scope().is_none());
-        assert_eq!(context.peer_addr, Some(addr));
         let peer = context.peer.unwrap();
         assert_eq!(peer.url, url);
         assert_eq!(peer.addr, Some(addr));
@@ -698,7 +696,7 @@ impl Remote {
         } = cache;
         let (session, upstream_cid, transport) = match client
             .connect(&url, addr)
-            .instrument(remote_connect_span(addr))
+            .instrument(remote_connect_span())
             .await
         {
             Ok(session) => session,
