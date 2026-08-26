@@ -435,7 +435,11 @@ impl Relay {
                                         Some(remote_addr),
                                     )
                                 }
-                                None => SessionContext::public(session_id.clone(), scope),
+                                None => SessionContext::public_with_peer_addr(
+                                    session_id.clone(),
+                                    scope,
+                                    remote_addr,
+                                ),
                             };
 
                             // The resolved interface decides whether a

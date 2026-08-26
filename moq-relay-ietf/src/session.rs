@@ -272,37 +272,66 @@ pub struct SessionContext {
     /// Correlation id for the MoQT session this context belongs to.
     pub session_id: SessionId,
 
-    /// The resolved scope identity for this session, if any.
+    /// Scope used for routing and coordinator calls, if any.
+    ///
+    /// This value may contain credentials and must not be emitted in telemetry.
     pub scope: Option<String>,
 
     /// Whether this session is public client-facing or internal relay-to-relay.
     pub interface: SessionInterface,
 
-    /// Relay endpoint for internal sessions, when known.
+    /// Remote socket address for observability, when known.
+    ///
+    /// Unlike [`peer`](Self::peer), this is populated for both public and
+    /// internal sessions and is never used as a coordinator peer identity.
+    pub peer_addr: Option<SocketAddr>,
+
+    /// Relay identity for internal sessions, when known.
     ///
     /// Populated for outbound connections the relay dials itself, where the
-    /// destination URL is known. Inbound connections leave this `None` even
-    /// when classified internal, since only the remote socket address is known.
+    /// destination URL is known, and derived from the remote socket address for
+    /// inbound connections classified as internal. Public sessions always
+    /// leave this `None`.
     pub peer: Option<RelayInfo>,
 }
 
 impl SessionContext {
-    /// Build a public, client-facing context for the given scope.
+    /// Build a public, client-facing context with no known peer address.
     pub fn public(session_id: SessionId, scope: Option<String>) -> Self {
         Self {
             session_id,
             scope,
             interface: SessionInterface::Public,
+            peer_addr: None,
+            peer: None,
+        }
+    }
+
+    /// Build a public, client-facing context with a known peer address.
+    pub fn public_with_peer_addr(
+        session_id: SessionId,
+        scope: Option<String>,
+        peer_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            session_id,
+            scope,
+            interface: SessionInterface::Public,
+            peer_addr: Some(peer_addr),
             peer: None,
         }
     }
 
     /// Build an internal, relay-to-relay context for the given scope and peer.
+    ///
+    /// The observability address is derived from [`RelayInfo::addr`].
     pub fn internal(session_id: SessionId, scope: Option<String>, peer: Option<RelayInfo>) -> Self {
+        let peer_addr = peer.as_ref().and_then(|peer| peer.addr);
         Self {
             session_id,
             scope,
             interface: SessionInterface::Internal,
+            peer_addr,
             peer,
         }
     }
@@ -310,12 +339,13 @@ impl SessionContext {
     /// Build an inbound context from a resolved scope, connection tags, and
     /// the peer's socket address.
     ///
-    /// The interface is taken from the tags (see [`ConnectionTags::interface`]).
+    /// The interface is taken from the tags (see [`ConnectionTags::interface`])
+    /// and `remote_addr` is retained for observability regardless of interface.
     /// For connections classified [`SessionInterface::Internal`], the peer
-    /// identity is derived from `remote_addr` (the relay trusts the inbound
+    /// identity is also derived from `remote_addr` (the relay trusts the inbound
     /// socket address rather than asking the coordinator to resolve it; see
-    /// [`RelayInfo::from_socket_addr`]). Public connections — and internal
-    /// connections with no known address — leave `peer` as `None`.
+    /// [`RelayInfo::from_socket_addr`]). Public connections, and internal
+    /// connections with no known address, leave `peer` as `None`.
     pub fn from_tags(
         session_id: SessionId,
         scope: Option<String>,
@@ -331,6 +361,7 @@ impl SessionContext {
             session_id,
             scope,
             interface,
+            peer_addr: remote_addr,
             peer,
         }
     }
@@ -346,23 +377,46 @@ impl SessionContext {
     /// each call site: the fields are recorded once per session instead of being
     /// re-formatted per record, and log lines added later inherit them for free.
     ///
-    /// The peer's socket address is included when known, but never the relay
-    /// URL: its path carries the scope, which in deployment holds a credential.
+    /// The span is an explicit root so an upstream session created while serving
+    /// another session does not inherit the requesting session's identity.
+    /// The peer's socket address is included when known, but neither the scope
+    /// nor relay URL is recorded because either may contain credentials.
+    /// Its metadata uses the most verbose level currently enabled for this
+    /// module, preserving correlation under restrictive filters without marking
+    /// ordinary sessions as errors. If no level is enabled, this returns a
+    /// disabled span.
     pub fn span(&self) -> tracing::Span {
-        tracing::info_span!(
-            "moq_session",
-            session_id = %self.session_id,
-            interface = %self.interface,
-            scope = self.scope.as_deref().unwrap_or("-"),
-            peer_addr = self
-                .peer
-                .as_ref()
-                .and_then(|peer| peer.addr)
-                .map(tracing::field::display),
-        )
+        macro_rules! session_span {
+            ($level:expr) => {
+                tracing::span!(
+                    target: module_path!(),
+                    parent: None,
+                    $level,
+                    "moq_session",
+                    session_id = %self.session_id,
+                    interface = %self.interface,
+                    scope_present = self.scope.is_some(),
+                    peer_addr = self.peer_addr.map(tracing::field::display),
+                )
+            };
+        }
+
+        if tracing::enabled!(target: module_path!(), tracing::Level::TRACE) {
+            session_span!(tracing::Level::TRACE)
+        } else if tracing::enabled!(target: module_path!(), tracing::Level::DEBUG) {
+            session_span!(tracing::Level::DEBUG)
+        } else if tracing::enabled!(target: module_path!(), tracing::Level::INFO) {
+            session_span!(tracing::Level::INFO)
+        } else if tracing::enabled!(target: module_path!(), tracing::Level::WARN) {
+            session_span!(tracing::Level::WARN)
+        } else if tracing::enabled!(target: module_path!(), tracing::Level::ERROR) {
+            session_span!(tracing::Level::ERROR)
+        } else {
+            tracing::Span::none()
+        }
     }
 
-    /// The resolved scope identity, if any.
+    /// The scope used for routing and coordinator calls, if any.
     pub fn scope(&self) -> Option<&str> {
         self.scope.as_deref()
     }
@@ -512,7 +566,39 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing::Instrument;
     use url::Url;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_output(filter: &str, emit: impl FnOnce()) -> String {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, emit);
+
+        let output = capture.0.lock().unwrap().clone();
+        String::from_utf8(output).unwrap()
+    }
 
     #[test]
     fn connection_tags_default_interface_is_public() {
@@ -561,19 +647,36 @@ mod tests {
         let context = SessionContext::public(SessionId::generate(), Some("scope-a".to_string()));
         assert_eq!(context.scope(), Some("scope-a"));
         assert_eq!(context.interface, SessionInterface::Public);
+        assert!(context.peer_addr.is_none());
         assert!(context.peer.is_none());
+    }
+
+    #[test]
+    fn session_context_public_with_peer_addr_keeps_source_private() {
+        let addr: SocketAddr = "203.0.113.7:4443".parse().unwrap();
+        let context = SessionContext::public_with_peer_addr(SessionId::generate(), None, addr);
+
+        assert_eq!(context.interface, SessionInterface::Public);
+        assert_eq!(context.peer_addr, Some(addr));
+        assert!(context.peer.is_none());
+
+        let coordinator = context.coordinator_context();
+        assert_eq!(coordinator.interface, SessionInterface::Public);
+        assert!(coordinator.source.is_none());
     }
 
     #[test]
     fn session_context_internal_carries_peer() {
         let url = Url::parse("https://relay.example.com/live").unwrap();
+        let addr: SocketAddr = "10.0.0.8:4443".parse().unwrap();
         let context = SessionContext::internal(
             SessionId::generate(),
             Some("scope-b".to_string()),
-            Some(RelayInfo::new(url.clone())),
+            Some(RelayInfo::with_addr(url.clone(), addr)),
         );
         assert_eq!(context.scope(), Some("scope-b"));
         assert_eq!(context.interface, SessionInterface::Internal);
+        assert_eq!(context.peer_addr, Some(addr));
         assert_eq!(context.peer.unwrap().url, url);
     }
 
@@ -590,6 +693,7 @@ mod tests {
         );
         assert_eq!(internal.interface, SessionInterface::Internal);
         assert_eq!(internal.scope(), Some("scope-c"));
+        assert_eq!(internal.peer_addr, Some(addr));
         let peer = internal.peer.expect("internal context should carry a peer");
         assert_eq!(peer.addr, Some(addr));
         assert_eq!(peer.url.as_str(), "https://10.0.0.7:4443/");
@@ -602,9 +706,10 @@ mod tests {
             None,
         );
         assert_eq!(internal_no_addr.interface, SessionInterface::Internal);
+        assert!(internal_no_addr.peer_addr.is_none());
         assert!(internal_no_addr.peer.is_none());
 
-        // Public → never carries a peer, even with a known address.
+        // Public retains the address for observability but never carries a peer.
         let public = SessionContext::from_tags(
             SessionId::generate(),
             None,
@@ -613,6 +718,7 @@ mod tests {
         );
         assert_eq!(public.interface, SessionInterface::Public);
         assert!(public.scope().is_none());
+        assert_eq!(public.peer_addr, Some(addr));
         assert!(public.peer.is_none());
     }
 
@@ -641,30 +747,6 @@ mod tests {
     /// `tracing::info!` with no fields of its own must still carry the id.
     #[test]
     fn session_span_fields_reach_a_record_that_names_none_of_them() {
-        use std::io;
-        use std::sync::{Arc, Mutex};
-        use tracing::Instrument;
-
-        #[derive(Clone, Default)]
-        struct Capture(Arc<Mutex<Vec<u8>>>);
-
-        impl io::Write for Capture {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let capture = Capture::default();
-        let writer = capture.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-
         let addr: SocketAddr = "10.0.0.7:4443".parse().unwrap();
         let context = SessionContext::from_tags(
             SessionId::new("deadbeefcafe1234"),
@@ -673,7 +755,7 @@ mod tests {
             Some(addr),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        let out = capture_output("info", || {
             let span = context.span();
             // A record naming none of the correlation fields itself.
             futures::executor::block_on(
@@ -684,7 +766,6 @@ mod tests {
             );
         });
 
-        let out = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert!(
             out.contains("deadbeefcafe1234"),
             "session id missing from output: {out}"
@@ -693,7 +774,10 @@ mod tests {
             out.contains("internal"),
             "interface missing from output: {out}"
         );
-        assert!(out.contains("scope-z"), "scope missing from output: {out}");
+        assert!(
+            out.contains("scope_present=true"),
+            "scope presence missing from output: {out}"
+        );
         assert!(
             out.contains("10.0.0.7:4443"),
             "peer address missing from output: {out}"
@@ -701,21 +785,115 @@ mod tests {
     }
 
     #[test]
-    fn session_span_never_carries_the_relay_url() {
-        // The relay URL path carries the scope, which in deployment holds a
-        // credential. The span must expose the socket address instead.
-        let url = Url::parse("https://relay.example.com/super-secret-jwt-key").unwrap();
+    fn session_span_never_formats_scope_or_relay_url_secrets() {
+        const SCOPE_SECRET: &str = "scope-credential-bearer-7f31";
+        const URL_SECRET: &str = "relay-url-secret-path-9ac2";
+
+        let url = Url::parse(&format!("https://relay.example.com/{URL_SECRET}")).unwrap();
         let context = SessionContext::internal(
-            SessionId::generate(),
-            Some("scope-b".to_string()),
+            SessionId::new("secret-redaction-session"),
+            Some(SCOPE_SECRET.to_string()),
             Some(RelayInfo::with_addr(url, "10.0.0.9:4443".parse().unwrap())),
         );
 
-        let meta = context.span().metadata().expect("span has metadata");
-        let fields: Vec<&str> = meta.fields().iter().map(|f| f.name()).collect();
+        let out = capture_output("info", || {
+            futures::executor::block_on(
+                async {
+                    tracing::info!("secret-free session event");
+                }
+                .instrument(context.span()),
+            );
+        });
+
         assert!(
-            !fields.iter().any(|f| f.contains("url")),
-            "span must not expose a url field: {fields:?}"
+            !out.contains(SCOPE_SECRET),
+            "scope secret leaked into output: {out}"
+        );
+        assert!(
+            !out.contains(URL_SECRET),
+            "relay URL secret leaked into output: {out}"
+        );
+        assert!(
+            out.contains("10.0.0.9:4443"),
+            "peer address missing from output: {out}"
+        );
+    }
+
+    #[test]
+    fn session_span_fields_survive_warn_and_error_filters() {
+        let context = SessionContext::public(SessionId::new("filtered-session-correlation"), None);
+
+        let warn_out = capture_output("warn", || {
+            futures::executor::block_on(
+                async {
+                    tracing::warn!("warning under warn filter");
+                }
+                .instrument(context.span()),
+            );
+        });
+        assert!(
+            warn_out.contains("filtered-session-correlation"),
+            "session id missing under warn filter: {warn_out}"
+        );
+
+        let error_out = capture_output("error", || {
+            futures::executor::block_on(
+                async {
+                    tracing::error!("error under error filter");
+                }
+                .instrument(context.span()),
+            );
+        });
+        assert!(
+            error_out.contains("filtered-session-correlation"),
+            "session id missing under error filter: {error_out}"
+        );
+    }
+
+    fn assert_session_span_level(filter: &str, expected: tracing::Level) {
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let context = SessionContext::public(SessionId::new("metadata-level-session"), None);
+            let span = context.span();
+            let metadata = span.metadata().expect("session span should be enabled");
+            assert_eq!(*metadata.level(), expected);
+        });
+    }
+
+    #[test]
+    fn session_span_uses_enabled_filter_level_for_metadata() {
+        assert_session_span_level("info", tracing::Level::INFO);
+        assert_session_span_level("warn", tracing::Level::WARN);
+        assert_session_span_level("error", tracing::Level::ERROR);
+    }
+
+    #[test]
+    fn session_span_does_not_inherit_the_current_session() {
+        let downstream = SessionContext::public(SessionId::new("outer-downstream-session"), None);
+        let upstream =
+            SessionContext::internal(SessionId::new("nested-upstream-session"), None, None);
+
+        let out = capture_output("warn", || {
+            let downstream_span = downstream.span();
+            let _downstream_guard = downstream_span.enter();
+
+            // Construct and enter the upstream span while the downstream span
+            // is current; it must still be an independent root.
+            let upstream_span = upstream.span();
+            let _upstream_guard = upstream_span.enter();
+            tracing::warn!("upstream session event");
+        });
+
+        assert!(
+            out.contains("nested-upstream-session"),
+            "upstream session id missing from output: {out}"
+        );
+        assert!(
+            !out.contains("outer-downstream-session"),
+            "upstream span inherited downstream session id: {out}"
         );
     }
 

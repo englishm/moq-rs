@@ -30,6 +30,36 @@ type RemoteSlot = Arc<Mutex<Option<Remote>>>;
 type TrackCacheKey = (TrackNamespace, TrackName);
 type TrackSlot = Arc<Mutex<Option<CachedTrack>>>;
 
+/// Build the root span used while connecting before the peer-observed CID exists.
+fn remote_connect_span(peer_addr: Option<SocketAddr>) -> tracing::Span {
+    macro_rules! connect_span {
+        ($level:expr) => {
+            tracing::span!(
+                target: module_path!(),
+                parent: None,
+                $level,
+                "moq_remote_connect",
+                interface = %crate::SessionInterface::Internal,
+                peer_addr = peer_addr.map(tracing::field::display),
+            )
+        };
+    }
+
+    if tracing::enabled!(target: module_path!(), tracing::Level::TRACE) {
+        connect_span!(tracing::Level::TRACE)
+    } else if tracing::enabled!(target: module_path!(), tracing::Level::DEBUG) {
+        connect_span!(tracing::Level::DEBUG)
+    } else if tracing::enabled!(target: module_path!(), tracing::Level::INFO) {
+        connect_span!(tracing::Level::INFO)
+    } else if tracing::enabled!(target: module_path!(), tracing::Level::WARN) {
+        connect_span!(tracing::Level::WARN)
+    } else if tracing::enabled!(target: module_path!(), tracing::Level::ERROR) {
+        connect_span!(tracing::Level::ERROR)
+    } else {
+        tracing::Span::none()
+    }
+}
+
 /// A cached cross-relay track reader plus the downstream interest in it.
 #[derive(Clone)]
 struct CachedTrack {
@@ -120,6 +150,7 @@ mod tests {
 
         assert_eq!(context.interface, crate::SessionInterface::Internal);
         assert!(context.scope().is_none());
+        assert_eq!(context.peer_addr, Some(addr));
         let peer = context.peer.unwrap();
         assert_eq!(peer.url, url);
         assert_eq!(peer.addr, Some(addr));
@@ -331,15 +362,20 @@ impl RemoteManager {
             }
         };
 
-        match remote.subscribe(namespace.clone(), track_name).await {
-            Ok(reader) => Ok(reader),
-            Err(err) => {
-                tracing::warn!(remote_url = %url, error = %err, "remote subscribe failed, removing from cache");
-                self.remove_if_same_remote(&cache_key, &remote).await;
+        let span = remote.span.clone();
+        async {
+            match remote.subscribe(namespace.clone(), track_name).await {
+                Ok(reader) => Ok(reader),
+                Err(err) => {
+                    tracing::warn!(remote_url = %url, error = %err, "remote subscribe failed, removing from cache");
+                    self.remove_if_same_remote(&cache_key, &remote).await;
 
-                Err(err)
+                    Err(err)
+                }
             }
         }
+        .instrument(span)
+        .await
     }
 
     /// Forward a `SUBSCRIBE_NAMESPACE` to a specific relay peer.
@@ -370,7 +406,11 @@ impl RemoteManager {
         // A namespace request owns a dedicated bidirectional stream. Its
         // rejection or reset must not evict the pooled session, which may still
         // carry exact-track subscriptions and other non-overlapping requests.
-        remote.subscribe_namespace(prefix, options).await
+        let span = remote.span.clone();
+        remote
+            .subscribe_namespace(prefix, options)
+            .instrument(span)
+            .await
     }
 
     /// Forward a `PUBLISH_NAMESPACE` to a specific relay peer.
@@ -396,14 +436,19 @@ impl RemoteManager {
             }
         };
 
-        match remote.publish_namespace(tracks).await {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                tracing::warn!(remote_url = %relay.url, error = %err, "remote publish_namespace failed, removing from cache");
-                self.remove_if_same_remote(&cache_key, &remote).await;
-                Err(err)
+        let span = remote.span.clone();
+        async {
+            match remote.publish_namespace(tracks).await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    tracing::warn!(remote_url = %relay.url, error = %err, "remote publish_namespace failed, removing from cache");
+                    self.remove_if_same_remote(&cache_key, &remote).await;
+                    Err(err)
+                }
             }
         }
+        .instrument(span)
+        .await
     }
 
     /// Get an existing remote connection or create a new one.
@@ -445,12 +490,16 @@ impl RemoteManager {
                 if remote.is_connected() {
                     return Ok(remote.clone());
                 }
-
-                tracing::info!(remote_url = %cache_key.0, "removing dead connection to remote relay");
             };
 
             if let Some(remote) = cached.take() {
-                remote.shutdown().await;
+                let span = remote.span.clone();
+                async {
+                    tracing::info!(remote_url = %cache_key.0, "removing dead connection to remote relay");
+                    remote.shutdown().await;
+                }
+                .instrument(span)
+                .await;
             }
 
             tracing::info!(remote_url = %cache_key.0, "connecting to remote relay");
@@ -511,10 +560,15 @@ impl RemoteManager {
         };
 
         for (cache_key, slot) in remotes {
-            tracing::info!(remote_url = %cache_key.0, "shutting down remote connection");
-            let mut remote = slot.lock().await;
-            if let Some(remote) = remote.take() {
-                remote.shutdown().await;
+            let mut cached = slot.lock().await;
+            if let Some(remote) = cached.take() {
+                let span = remote.span.clone();
+                async {
+                    tracing::info!(remote_url = %cache_key.0, "shutting down remote connection");
+                    remote.shutdown().await;
+                }
+                .instrument(span)
+                .await;
             }
         }
     }
@@ -603,6 +657,7 @@ async fn remove_empty_track_slot(
 struct Remote {
     url: Url,
     context: SessionContext,
+    span: tracing::Span,
     /// Subscriber role: exact-track `SUBSCRIBE` and `SUBSCRIBE_NAMESPACE`.
     subscriber: moq_transport::session::Subscriber,
     /// Publisher role: outbound `PUBLISH_NAMESPACE` to advertise namespaces
@@ -641,7 +696,11 @@ impl Remote {
             key: cache_key,
             slot: cache_slot,
         } = cache;
-        let (session, upstream_cid, transport) = match client.connect(&url, addr).await {
+        let (session, upstream_cid, transport) = match client
+            .connect(&url, addr)
+            .instrument(remote_connect_span(addr))
+            .await
+        {
             Ok(session) => session,
             Err(err) => {
                 metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
@@ -656,6 +715,8 @@ impl Remote {
         // PUBLISH_NAMESPACE). This mirrors the `--announce` forward path in
         // relay.rs rather than the subscriber-only upstream pull it replaces.
         let upstream_session_id = moq_transport::session::SessionId::new(upstream_cid);
+        let context = Self::context_for_endpoint(upstream_session_id.clone(), url.clone(), addr);
+        let span = context.span();
         // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
         // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
         let (session, publisher, subscriber) =
@@ -666,6 +727,7 @@ impl Remote {
                 transport,
                 session_config,
             )
+            .instrument(span.clone())
             .await
             {
                 Ok(parts) => parts,
@@ -679,13 +741,12 @@ impl Remote {
         let connected = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();
         let upstream_guard = GaugeGuard::new("moq_relay_upstream_connections");
-        let context = Self::context_for_endpoint(upstream_session_id, url.clone(), addr);
 
         let session_url = url.clone();
         let session_connected = connected.clone();
         let session_cancel = cancel.clone();
 
-        let session_span = context.span();
+        let session_span = span.clone();
         tokio::spawn(async move {
             let _upstream_guard = upstream_guard;
             tracing::info!("session established");
@@ -727,6 +788,7 @@ impl Remote {
         Ok(Self {
             url,
             context,
+            span,
             subscriber,
             publisher,
             tracks: Arc::new(Mutex::new(HashMap::new())),
@@ -872,6 +934,7 @@ impl Remote {
             let cleanup_reader = reader.clone();
             let cleanup_slot = slot.clone();
             let idle_timeout = self.cache_idle_timeout;
+            let cleanup_span = self.span.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     result = subscribe.closed() => {
@@ -911,7 +974,8 @@ impl Remote {
 
                     remove_empty_track_slot(&tracks, &cleanup_key, &cleanup_slot).await;
                 }
-            });
+            }
+            .instrument(cleanup_span));
 
             return Ok(Some((reader, guard)));
         }
