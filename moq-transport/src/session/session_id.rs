@@ -15,9 +15,13 @@ use std::{fmt, sync::Arc};
 /// [`Publisher`](super::Publisher), [`Subscriber`](super::Subscriber), both halves of the session
 /// run loop, and the relay's per-session context.
 ///
-/// The payload is always lowercase hex with no separators (`^[0-9a-f]+$`), so it can be compared
-/// directly against a qlog or mlog filename without stripping anything. The length is not fixed —
-/// a QUIC connection ID is 8 to 20 bytes, so a peer-supplied id is 16 to 40 characters.
+/// Native callers supply lowercase hex with no separators (`^[0-9a-f]*$`), so it can be compared
+/// directly against a qlog or mlog filename without stripping anything. The length is not fixed:
+/// RFC 9000 permits general QUIC connection IDs from 0 to 20 bytes, so a peer-supplied id may
+/// contain 0 to 40 characters. The Initial DCID captured by the in-repo native transport is
+/// generated as 16 bytes; [RFC 9000 section 7.2] recommends at least 8 bytes for Initial DCIDs.
+///
+/// [RFC 9000 section 7.2]: https://www.rfc-editor.org/rfc/rfc9000.html#section-7.2
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SessionId(Arc<str>);
 
@@ -127,11 +131,12 @@ mod tests {
     }
 
     #[test]
-    fn accepts_the_shortest_and_longest_legal_connection_ids() {
-        // RFC 9000 allows 8..=20 bytes, so 16..=40 hex characters. Neither is special-cased.
-        let shortest = "0011223344556677"; // 8 bytes
+    fn accepts_the_rfc_connection_id_length_bounds() {
+        // SessionId is general: RFC 9000 allows 0..=20-byte CIDs, even though the native
+        // transport generates the captured Initial DCID as 16 bytes.
+        let shortest = ""; // 0 bytes
         let longest = "0011223344556677889900aabbccddeeff001122"; // 20 bytes
-        assert_eq!(SessionId::new(shortest).as_str().len(), 16);
+        assert_eq!(SessionId::new(shortest).as_str().len(), 0);
         assert_eq!(SessionId::new(longest).as_str().len(), 40);
         assert!(is_lowercase_hex(longest));
     }
