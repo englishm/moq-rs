@@ -304,10 +304,8 @@ mod tests {
                     let gid = subgroup.group_id;
                     while let Ok(Some(mut obj)) = subgroup.next().await {
                         let oid = obj.object_id;
-                        let data: Bytes = obj
-                            .read_all()
-                            .await
-                            .expect("obj.read_all() should succeed");
+                        let data: Bytes =
+                            obj.read_all().await.expect("obj.read_all() should succeed");
                         received.push((gid, oid, data));
                     }
                 }
@@ -498,7 +496,7 @@ mod tests {
         let pub_handle = tokio::spawn(async move {
             let track_writer = request.next().await.expect("should receive track request");
 
-            assert_eq!(track_writer.name, track_name);
+            assert_eq!(track_writer.name, TrackName::from(track_name));
 
             let mut subgroups = track_writer.subgroups().unwrap();
             let mut sg = subgroups.append(0).unwrap();
