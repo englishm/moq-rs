@@ -13,7 +13,8 @@ use moq_transport::{
 use tokio::sync::Semaphore;
 
 use crate::{
-    metrics::GaugeGuard, Coordinator, Locals, Producer, RemoteManager, SessionContext, TrackRequest,
+    metrics::GaugeGuard, Coordinator, Locals, Producer, RemoteManager, SessionContext,
+    SessionInterface, TrackRequest,
 };
 
 const MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION: usize = 1024;
@@ -104,6 +105,71 @@ impl Consumer {
         }
     }
 
+    /// Serve a PUBLISH_NAMESPACE forwarded by a peer relay: advertise it for
+    /// discovery, and route nothing through this session.
+    ///
+    /// The peer that forwarded this is not the origin, it is relaying on the
+    /// origin's behalf, so this relay must not present itself as a source. It
+    /// registers the namespace the same way the SUBSCRIBE_NAMESPACE pull path
+    /// does — visible to `list_namespaces_matching`, absent from
+    /// `route_namespace` — so a downstream SUBSCRIBE misses locally and resolves
+    /// through the coordinator to whoever actually owns it.
+    ///
+    /// Deliberately absent, each for its own reason:
+    ///
+    /// * **No coordinator registration.** Ownership is the origin's. Claiming it
+    ///   here races the origin for one key and loses, and the losing path
+    ///   unwinds the local registration it had already published — which
+    ///   downstream reads as the namespace being withdrawn milliseconds after
+    ///   it appeared, while the publisher is still live.
+    ///
+    /// * **No request queue.** With no local route nothing can queue against
+    ///   this session, so there is no queue to strand and no need to drain one.
+    ///
+    /// * **No subscribe reaching this session.** That matters twice over: the
+    ///   forwarding peer publishes a placeholder track container whose request
+    ///   channel is closed at creation, and that publication takes priority
+    ///   over the peer's own unknown-subscribe fall-through — so a subscribe
+    ///   arriving there answers "does not exist" even though the peer holds a
+    ///   working route. And a dialed session has no `Producer` draining
+    ///   `subscribed()` at all, so it could not be served even if the
+    ///   placeholder were gone.
+    ///
+    /// * **No onward fan-out.** The coordinator already returns no subscriber
+    ///   relays for an internal context; not asking is one fewer way to
+    ///   propagate a forwarded announce into a loop.
+    async fn serve_proxied(
+        self,
+        mut published_ns: PublishedNamespace,
+    ) -> Result<(), anyhow::Error> {
+        let ns = published_ns.namespace.to_utf8_path();
+
+        let _registration = match self
+            .locals
+            .register_remote_namespace(self.context.scope(), published_ns.namespace.clone())
+        {
+            Ok(registration) => registration,
+            Err(err) => {
+                metrics::counter!("moq_relay_announce_errors_total", "phase" => "remote_register")
+                    .increment(1);
+                return Err(err);
+            }
+        };
+        tracing::debug!(namespace = %ns, "registered proxied namespace for discovery");
+
+        if let Err(err) = published_ns.ok() {
+            metrics::counter!("moq_relay_announce_errors_total", "phase" => "send_ok").increment(1);
+            return Err(err.into());
+        }
+        metrics::counter!("moq_relay_announce_ok_total", "kind" => "proxied").increment(1);
+        tracing::info!(namespace = %ns, "serving proxied PUBLISH_NAMESPACE from peer relay");
+
+        published_ns.closed().await?;
+        tracing::info!(namespace = %ns, "proxied PUBLISH_NAMESPACE closed");
+
+        Ok(())
+    }
+
     /// Serve an inbound PUBLISH_NAMESPACE.
     async fn serve(mut self, mut published_ns: PublishedNamespace) -> Result<(), anyhow::Error> {
         // Track active publishers - decrements when this function returns.
@@ -113,6 +179,12 @@ impl Consumer {
             futures::future::BoxFuture<'static, Result<(), anyhow::Error>>,
         > = FuturesUnordered::new();
         let ns = published_ns.namespace.to_utf8_path();
+
+        // A namespace forwarded by a peer relay is proxied, not ours, so it is
+        // advertised for discovery and nothing more.
+        if self.context.interface == SessionInterface::Internal {
+            return self.serve_proxied(published_ns).await;
+        }
 
         // Register namespace routing metadata locally. This does not register
         // any media tracks; it only creates a request queue used when a
@@ -159,13 +231,16 @@ impl Consumer {
             return Err(err.into());
         }
         tracing::debug!(namespace = %ns, "sent REQUEST_OK for PUBLISH_NAMESPACE");
-        metrics::counter!("moq_relay_announce_ok_total").increment(1);
+        metrics::counter!("moq_relay_announce_ok_total", "kind" => "client").increment(1);
 
         // Forward the namespace upstream, if configured.
         if let Some(mut forward) = self.forward {
-            // The forwarding API still uses the moq-transport Tracks helper.
-            // This helper is not the relay-local registry; it is only an
-            // adapter for the outgoing publish_namespace API.
+            // Same advertise-only container as the peer fan-out below, and the
+            // same defect: dropping the request half here means the `--announce`
+            // upstream cannot route a subscribe back down this session either.
+            // Latent rather than fixed — no deployment sets `--announce` today,
+            // and giving it a real route is the same work as making dialed
+            // sessions serve subscribes, which is deliberately out of scope.
             let (_, _forward_request, forward_reader) =
                 Tracks::new(published_ns.namespace.clone()).produce();
             tasks.push(
@@ -219,6 +294,15 @@ impl Consumer {
             // The forwarding API uses the moq-transport Tracks helper as an
             // adapter for the outgoing publish_namespace call; it is not the
             // relay-local registry.
+            // Advertise-only container. Its writer and request halves are
+            // dropped here, which closes the request channel at creation, so
+            // the reader can carry the namespace outward but can never answer a
+            // subscribe. That is load-bearing and fragile: on the receiving
+            // peer this publication takes priority over the unknown-subscribe
+            // fall-through, so any subscribe routed back down this session gets
+            // "does not exist" rather than the peer's real route. Nothing must
+            // route a subscribe here — see `serve_proxied`, and the guard test
+            // `fanout_adapter_accepts_a_subscribe_it_can_never_serve`.
             let (_, _request, reader) = Tracks::new(published_ns.namespace.clone()).produce();
             tasks.push(
                 async move {
@@ -406,5 +490,57 @@ impl Consumer {
         tracing::info!(namespace = %namespace, track = %track_name, "PUBLISH closed");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::FutureExt;
+    use moq_transport::serve::Tracks;
+
+    fn ns(path: &str) -> moq_transport::coding::TrackNamespace {
+        moq_transport::coding::TrackNamespace::try_from(path).expect("valid namespace")
+    }
+
+    /// Pins the defect in the fan-out adapter so it stays visible.
+    ///
+    /// `serve()` builds this container to carry a namespace outward and drops
+    /// its writer and request halves immediately, which closes the request
+    /// channel before anything can use it. The container is therefore incapable
+    /// of answering a subscribe — and on the receiving peer it takes priority
+    /// over the unknown-subscribe fall-through, so a subscribe routed to it is
+    /// answered "does not exist" rather than being served from the peer's real
+    /// route.
+    ///
+    /// The fix keeps subscribes away from it rather than repairing it, which
+    /// makes this a property nothing enforces at the type level. If a future
+    /// change routes a subscribe onto a fan-out session, this test is the
+    /// warning that the destination is a dead end.
+    #[test]
+    fn fanout_adapter_accepts_a_subscribe_it_can_never_serve() {
+        let namespace = ns("room/123");
+
+        // Note what it does NOT do: refuse. It accepts the subscribe and hands
+        // back a track, having pushed the matching writer onto a queue that has
+        // no consumer. The subscribe is answered, then never served.
+        let (_, _request, mut reader) = Tracks::new(namespace.clone()).produce();
+        assert!(
+            reader.subscribe(namespace.clone(), "video").is_some(),
+            "expected the advertise-only container to accept a subscribe it \
+             cannot serve; if it now refuses outright, the hazard has changed \
+             shape and the comments at both Tracks::produce call sites need \
+             revisiting"
+        );
+
+        // With the request half alive the same container does serve, which is
+        // what makes dropping it the whole defect rather than an incidental
+        // detail. Keeping both cases in one test stops the assertion above from
+        // being read as "this container is simply broken".
+        let (_, mut request, mut wired) = Tracks::new(namespace.clone()).produce();
+        assert!(wired.subscribe(namespace, "video").is_some());
+        assert!(
+            request.next().now_or_never().flatten().is_some(),
+            "a wired container must deliver the writer to its requester"
+        );
     }
 }
