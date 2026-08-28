@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.15](https://github.com/cloudflare/moq-rs/compare/moq-sub-v0.4.14...moq-sub-v0.4.15) - 2026-08-28
+
+### Added
+
+- *(moq-transport)* thread SessionId through Session, Publisher and Subscriber
+
+### Fixed
+
+- *(moq-transport)* preserve session constructor compatibility
+
 ## [0.4.14](https://github.com/cloudflare/moq-rs/compare/moq-sub-v0.4.13...moq-sub-v0.4.14) - 2026-07-31
 
 ### Fixed
