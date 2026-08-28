@@ -14,7 +14,7 @@ use cli::Cli;
 use moq_transport::{
     coding::TrackNamespace,
     serve,
-    session::{Publisher, Subscriber},
+    session::{Publisher, SessionId, Subscriber},
 };
 
 /// The main entry point for the MoQ Clock IETF example.
@@ -52,9 +52,15 @@ async fn main() -> anyhow::Result<()> {
     // Depending on whether we are publishing or subscribing, create the appropriate session
     if config.publish {
         // Create the publisher session
-        let (session, mut publisher) = Publisher::connect(session, transport)
-            .await
-            .context("failed to create MoQ Transport session")?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        let (session, mut publisher) = Publisher::connect_with_session_id(
+            session,
+            SessionId::new(connection_id.clone()),
+            transport,
+        )
+        .await
+        .context("failed to create MoQ Transport session")?;
 
         if config.datagrams {
             tracing::info!("publishing clock via datagrams");
@@ -91,9 +97,15 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         // Create the subscriber session
-        let (session, mut subscriber) = Subscriber::connect(session, transport)
-            .await
-            .context("failed to create MoQ Transport session")?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        let (session, mut subscriber) = Subscriber::connect_with_session_id(
+            session,
+            SessionId::new(connection_id.clone()),
+            transport,
+        )
+        .await
+        .context("failed to create MoQ Transport session")?;
 
         let track_namespace = TrackNamespace::from_utf8_path(&config.namespace);
 

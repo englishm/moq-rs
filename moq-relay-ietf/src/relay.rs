@@ -208,15 +208,20 @@ impl Relay {
                 tracing::info!("forwarding PUBLISH_NAMESPACE messages to {}", url);
 
                 // Establish a QUIC connection to the forward URL
-                let (session, _quic_client_initial_cid, transport) = quic_endpoints[0]
+                let (session, forward_cid, transport) = quic_endpoints[0]
                     .client
                     .connect(url, None)
                     .await
                     .context("failed to establish forward connection")?;
 
                 // Create the MoQ session over the connection
-                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config(
+                let forward_session_id = moq_transport::session::SessionId::new(forward_cid);
+                // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API,
+                // make `connect_with_config` accept it and remove
+                // `connect_with_config_and_session_id`.
+                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config_and_session_id(
                     session,
+                    forward_session_id.clone(),
                     None,
                     transport,
                     session_config,
@@ -224,7 +229,8 @@ impl Relay {
                 .await
                 .context("failed to establish forward session")?;
 
-                // Use the connection path already validated and stored by Session::connect().
+                // Use the connection path already validated and stored by
+                // Session::connect_with_config_and_session_id().
                 // The forward session is scoped to whatever path the announce URL specifies.
                 //
                 // Note: the forward connection intentionally does not call
@@ -238,10 +244,8 @@ impl Relay {
                 // Multi-scope forwarding (routing different incoming scopes to different
                 // upstream paths) would require per-scope forward connections.
                 let forward_scope = session.connection_path().map(|s| s.to_string());
-                let forward_context = SessionContext::internal(
-                    forward_scope,
-                    Some(RelayInfo::new(url.clone())),
-                );
+                let forward_context =
+                    SessionContext::internal(forward_scope, Some(RelayInfo::new(url.clone())));
 
                 let forward_coordinator = coordinator.clone();
                 let session = Session {
@@ -259,7 +263,7 @@ impl Relay {
                         forward_coordinator,
                         remote_manager.clone(),
                         None,
-                        forward_context,
+                        forward_context.clone(),
                     )),
                     // Forward connections are always full read-write relay peers,
                     // so no reject loops needed.
@@ -269,7 +273,15 @@ impl Relay {
 
                 let forward_producer = session.producer.clone();
 
-                tasks.push(async move { session.run().await.context("forwarding failed") }.boxed());
+                tasks.push(
+                    async move {
+                        session
+                            .run_with_context(&forward_context)
+                            .await
+                            .context("forwarding failed")
+                    }
+                    .boxed(),
+                );
 
                 forward_producer
             } else {
@@ -345,10 +357,20 @@ impl Relay {
                             let raw_conn = conn.clone();
 
                             // Create the MoQ session over the connection (setup handshake etc)
-                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config(conn, mlog_path, transport, session_config).await {
+                            let session_id = moq_transport::session::SessionId::new(connection_id.clone());
+                            // TODO(itzmanish): When SessionId becomes mandatory in the next
+                            // breaking API, make `accept_with_config` accept it and remove
+                            // `accept_with_config_and_session_id`.
+                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config_and_session_id(
+                                conn,
+                                session_id.clone(),
+                                mlog_path,
+                                transport,
+                                session_config,
+                            ).await {
                                 Ok(session) => session,
                                 Err(err) => {
-                                    tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
+                                    tracing::warn!(session_id = %session_id, error = %err, "failed to accept MoQ session: {}", err);
                                     metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
                                     // Maintain invariant: connections_total - connections_closed_total == active_connections
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
@@ -366,6 +388,7 @@ impl Relay {
                                 Ok(info) => info,
                                 Err(err) => {
                                     tracing::warn!(
+                                        session_id = %session_id,
                                         connection_path = moq_session.connection_path(),
                                         error = %err,
                                         "scope resolution failed, rejecting session"
@@ -406,7 +429,11 @@ impl Relay {
                                     )
                                     .with_local_ip(local_ip);
                                     let tags = tagger.tag(&meta);
-                                    SessionContext::from_tags(scope, &tags, Some(remote_addr))
+                                    SessionContext::from_tags(
+                                        scope,
+                                        &tags,
+                                        Some(remote_addr),
+                                    )
                                 }
                                 None => SessionContext::public(scope),
                             };
@@ -433,6 +460,7 @@ impl Relay {
                             // misclassification is what is being investigated.
                             match context.interface {
                                 SessionInterface::Internal => tracing::info!(
+                                    session_id = %session_id,
                                     interface = ?context.interface,
                                     local_ip = ?local_ip,
                                     remote_addr = %remote_addr,
@@ -440,6 +468,7 @@ impl Relay {
                                     "session accepted"
                                 ),
                                 SessionInterface::Public => tracing::debug!(
+                                    session_id = %session_id,
                                     interface = ?context.interface,
                                     local_ip = ?local_ip,
                                     remote_addr = %remote_addr,
@@ -450,6 +479,7 @@ impl Relay {
 
                             if let Some(ref info) = scope_info {
                                 tracing::debug!(
+                                    session_id = %session_id,
                                     connection_path = moq_session.connection_path(),
                                     scope_id = %info.scope_id,
                                     permissions = ?info.permissions,
@@ -472,7 +502,7 @@ impl Relay {
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context)), None)
+                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context.clone())), None)
                             } else {
                                 (None, subscriber)
                             };
@@ -485,19 +515,19 @@ impl Relay {
                                 reject_subscribes,
                             };
 
-                            match session.run().await {
+                            match session.run_with_context(&context).await {
                                 Ok(()) => {
                                     // Session ended cleanly (uncommon - usually ends via close)
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 }
                                 Err(err) if err.is_graceful_close() => {
                                     // Graceful close - peer sent APPLICATION_CLOSE with code 0
-                                    tracing::debug!("MoQ session closed gracefully");
+                                    tracing::debug!(session_id = %session_id, "MoQ session closed gracefully");
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 }
                                 Err(err) => {
                                     // Actual error - protocol violation, timeout, etc.
-                                    tracing::warn!(error = %err, "MoQ session error: {}", err);
+                                    tracing::warn!(session_id = %session_id, error = %err, "MoQ session error: {}", err);
                                     metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_run").increment(1);
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 }

@@ -16,7 +16,7 @@ use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
 
-use super::{DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
+use super::{DeliveryFilter, Publisher, SessionError, SessionId, SubscribeInfo, Writer};
 
 // This file defines Publisher handling of inbound Subscriptions
 
@@ -240,6 +240,7 @@ enum SubgroupSink {
 /// The accounting lives here rather than in the sink so there is exactly one
 /// place that knows whether a FIN is currently legal.
 struct SubgroupOutput {
+    session_id: SessionId,
     sink: SubgroupSink,
     /// Payload bytes still owed for the object whose header we already wrote.
     /// Non-zero means we are mid-object and MUST NOT FIN.
@@ -249,6 +250,7 @@ struct SubgroupOutput {
 impl SubgroupOutput {
     fn stream(writer: Writer) -> Self {
         Self {
+            session_id: writer.session_id().clone(),
             sink: SubgroupSink::Stream(SubgroupStream::new(writer)),
             owed: 0,
         }
@@ -257,6 +259,7 @@ impl SubgroupOutput {
     #[cfg(test)]
     fn buffer() -> Self {
         Self {
+            session_id: SessionId::generate(),
             sink: SubgroupSink::Buffer {
                 buffer: bytes::BytesMut::new(),
                 termination: None,
@@ -304,6 +307,7 @@ impl SubgroupOutput {
     fn finish(&mut self) -> Result<(), SessionError> {
         if !self.at_object_boundary() {
             tracing::warn!(
+                session_id = %self.session_id,
                 owed = self.owed,
                 "refusing to FIN a subgroup stream mid-object; resetting instead"
             );
@@ -513,13 +517,14 @@ impl ObjectForwarder {
                         let state = self.state.clone();
                         let info = subgroup.info.clone();
                         let mlog = self.mlog.clone();
+                        let session_id = self.publisher.session_id().clone();
 
                         tasks.push(async move {
                             if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await {
                                 if Subscribed::is_expected_serve_shutdown(&err) {
-                                    tracing::debug!(subgroup_info = ?info, error = %err, "stopped serving subgroup");
+                                    tracing::debug!(session_id = %session_id, subgroup_info = ?info, error = %err, "stopped serving subgroup");
                                 } else {
-                                    tracing::warn!(subgroup_info = ?info, error = %err, "failed to serve subgroup");
+                                    tracing::warn!(session_id = %session_id, subgroup_info = ?info, error = %err, "failed to serve subgroup");
                                 }
                             }
                         });
@@ -566,7 +571,8 @@ impl ObjectForwarder {
         // TODO figure out u32 vs u64 priority
         send_stream.set_priority(subgroup_reader.priority as i32);
 
-        let mut output = SubgroupOutput::stream(Writer::new(send_stream));
+        let mut output =
+            SubgroupOutput::stream(Writer::new(publisher.session_id().clone(), send_stream));
         let res = Self::serve_subgroup_objects(
             header,
             subgroup_reader,
@@ -756,6 +762,7 @@ impl ObjectForwarder {
             // FINed at a byte offset the receiver will read as a partial object.
             if !output.at_object_boundary() {
                 tracing::warn!(
+                    session_id = %output.session_id,
                     group_id = subgroup_reader.group_id,
                     object_id = subgroup_object_reader.object_id,
                     promised = subgroup_object.payload_length,
@@ -845,7 +852,7 @@ impl ObjectForwarder {
         mut datagrams: serve::DatagramsReader,
         delivery_filter: DeliveryFilter,
     ) -> Result<(), SessionError> {
-        tracing::debug!("[PUBLISHER] serve_datagrams: starting");
+        tracing::debug!(session_id = %self.publisher.session_id(), "[PUBLISHER] serve_datagrams: starting");
 
         let mut datagram_count = 0;
         while let Some(datagram) = datagrams.read().await? {

@@ -11,6 +11,7 @@ mod published_namespace;
 mod publisher;
 mod reader;
 mod request_id;
+mod session_id;
 mod subscribe;
 mod subscribe_namespace;
 mod subscribed;
@@ -29,6 +30,7 @@ pub use published::{Published, PublishedInfo};
 pub use published_namespace::*;
 pub use publisher::*;
 pub use request_id::{RequestId, RequestIdAllocation};
+pub use session_id::SessionId;
 pub use subscribe::*;
 pub use subscribe_namespace::*;
 pub use subscribed::*;
@@ -59,6 +61,44 @@ where
             let event = make_event(mlog.elapsed_ms());
             let _ = mlog.add_event(event);
         }
+    }
+}
+
+/// `fmt::Display` adapter that sanitizes peer-supplied strings for logging.
+///
+/// Replaces every Unicode control character (Rust's `char::is_control()`, which
+/// covers U+0000–U+001F, U+007F, and the C1 range U+0080–U+009F) and the Unicode
+/// line/paragraph separators U+2028/U+2029 with `?` to prevent log-injection
+/// attacks (CWE-117). Other codepoints are passed through unchanged. Pair with
+/// [`HexDisplay`] to retain the exact raw bytes.
+struct SanitizedDisplay<'a>(&'a str);
+
+impl std::fmt::Display for SanitizedDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for c in self.0.chars() {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                write!(f, "?")?;
+            } else {
+                write!(f, "{c}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `fmt::Display` adapter that encodes a peer-supplied string as lowercase hex.
+///
+/// Retains every raw byte of the original value so analysts can reconstruct
+/// exactly what the peer sent, even if [`SanitizedDisplay`] replaced some
+/// characters with `?`.
+struct HexDisplay<'a>(&'a str);
+
+impl std::fmt::Display for HexDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in self.0.bytes() {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -145,15 +185,21 @@ pub struct Session {
     /// (takes precedence) or the CLIENT_SETUP PATH parameter (key 0x1).
     /// For outgoing connections: auto-extracted from the session URL in connect().
     connection_path: Option<String>,
+
+    /// Correlation id for this session, tagged onto every session-scoped log record.
+    /// Normally the QUIC connection ID hex, which the peer also observes and which names this
+    /// connection's qlog and mlog files.
+    session_id: SessionId,
 }
 
 impl Session {
     const MAX_CONNECTION_PATH_LEN: usize = 1024;
 
-    fn log_peer_max_request_id(peer_max: u64) {
+    fn log_peer_max_request_id(session_id: &SessionId, peer_max: u64) {
         if peer_max == 0 {
             tracing::warn!(
                 target: "moq_transport::control",
+                session_id = %session_id,
                 "peer MAX_REQUEST_ID is 0; outbound requests are disabled until MAX_REQUEST_ID increases"
             );
         }
@@ -256,13 +302,22 @@ impl Session {
         self.connection_path.as_deref()
     }
 
+    /// This session's correlation id, tagged onto its log records.
+    ///
+    /// Normally the QUIC connection ID hex, so it also names this connection's qlog and mlog
+    /// files and matches what the peer observes.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     /// Log a control message with structured fields for observability.
     /// Uses target "moq_transport::control" so it can be filtered independently.
-    fn log_control_message(msg: &Message, direction: &str) {
+    fn log_control_message(session_id: &SessionId, msg: &Message, direction: &str) {
         match msg {
             Message::Subscribe(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "SUBSCRIBE",
                     subscribe_id = m.id,
@@ -274,6 +329,7 @@ impl Session {
             Message::SubscribeOk(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "SUBSCRIBE_OK",
                     subscribe_id = m.id,
@@ -284,6 +340,7 @@ impl Session {
             Message::Unsubscribe(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "UNSUBSCRIBE",
                     subscribe_id = m.id,
@@ -293,6 +350,7 @@ impl Session {
             Message::PublishNamespace(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "PUBLISH_NAMESPACE",
                     request_id = m.id,
@@ -303,6 +361,7 @@ impl Session {
             Message::PublishNamespaceDone(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "PUBLISH_NAMESPACE_DONE",
                     request_id = m.id,
@@ -312,6 +371,7 @@ impl Session {
             Message::Namespace(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "NAMESPACE",
                     namespace_suffix = %m.track_namespace_suffix,
@@ -321,6 +381,7 @@ impl Session {
             Message::NamespaceDone(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "NAMESPACE_DONE",
                     namespace_suffix = %m.track_namespace_suffix,
@@ -330,17 +391,19 @@ impl Session {
             Message::PublishNamespaceCancel(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "PUBLISH_NAMESPACE_CANCEL",
                     request_id = m.id,
                     error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
+                    reason = ?m.reason_phrase.0,
                     "MoQT control message"
                 );
             }
             Message::TrackStatus(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "TRACK_STATUS",
                     request_id = m.id,
@@ -352,6 +415,7 @@ impl Session {
             Message::SubscribeNamespace(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "SUBSCRIBE_NAMESPACE",
                     request_id = m.id,
@@ -362,6 +426,7 @@ impl Session {
             Message::Fetch(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "FETCH",
                     request_id = m.id,
@@ -372,6 +437,7 @@ impl Session {
             Message::FetchOk(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "FETCH_OK",
                     request_id = m.id,
@@ -382,6 +448,7 @@ impl Session {
             Message::FetchCancel(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "FETCH_CANCEL",
                     request_id = m.id,
@@ -391,6 +458,7 @@ impl Session {
             Message::Publish(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "PUBLISH",
                     request_id = m.id,
@@ -403,6 +471,7 @@ impl Session {
             Message::PublishOk(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "PUBLISH_OK",
                     request_id = m.id,
@@ -412,17 +481,24 @@ impl Session {
             Message::PublishDone(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "PUBLISH_DONE",
                     request_id = m.id,
                     status_code = m.status_code,
                     stream_count = m.stream_count,
+                    // The reason is peer-supplied (up to 1024 bytes, arbitrary UTF-8).
+                    // Log a sanitized form (control chars → '?') and the raw hex so
+                    // analysts can reconstruct the exact bytes without log-injection risk.
+                    reason_lossy = ?SanitizedDisplay(&m.reason.0).to_string(),
+                    reason_hex = %HexDisplay(&m.reason.0),
                     "MoQT control message"
                 );
             }
             Message::GoAway(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "GOAWAY",
                     uri = %m.uri.0,
@@ -432,6 +508,7 @@ impl Session {
             Message::MaxRequestId(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "MAX_REQUEST_ID",
                     request_id = m.request_id,
@@ -441,6 +518,7 @@ impl Session {
             Message::RequestsBlocked(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "REQUESTS_BLOCKED",
                     max_request_id = m.max_request_id,
@@ -450,6 +528,7 @@ impl Session {
             Message::RequestOk(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "REQUEST_OK",
                     request_id = m.id,
@@ -459,17 +538,24 @@ impl Session {
             Message::RequestError(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "REQUEST_ERROR",
                     request_id = m.id,
                     error_code = m.error_code,
                     retry_interval = m.retry_interval,
+                    // The reason is peer-supplied (up to 1024 bytes, arbitrary UTF-8).
+                    // Log a sanitized form (control chars → '?') and the raw hex so
+                    // analysts can reconstruct the exact bytes without log-injection risk.
+                    reason_lossy = ?SanitizedDisplay(&m.reason.0).to_string(),
+                    reason_hex = %HexDisplay(&m.reason.0),
                     "MoQT control message"
                 );
             }
             Message::RequestUpdate(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     direction,
                     msg_type = "REQUEST_UPDATE",
                     request_id = m.id,
@@ -480,8 +566,10 @@ impl Session {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         webtransport: web_transport::Session,
+        session_id: SessionId,
         sender: Writer,
         recver: Reader,
         mlog: Option<mlog::MlogWriter>,
@@ -502,6 +590,7 @@ impl Session {
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
+            session_id.clone(),
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
@@ -509,6 +598,7 @@ impl Session {
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
+            session_id.clone(),
         ));
 
         let session = Self {
@@ -524,6 +614,7 @@ impl Session {
             mlog: mlog_shared,
             transport,
             connection_path,
+            session_id,
         };
 
         (session, publisher, subscriber)
@@ -537,17 +628,69 @@ impl Session {
     /// For native `moqt://` connections the PATH and AUTHORITY parameters are
     /// sent automatically.  For WebTransport the path is carried in the HTTP/3
     /// CONNECT URL so PATH is not sent.
+    ///
+    /// Generates a local [`SessionId`] fallback. Use [`Self::connect_with_session_id`]
+    /// when a peer-observed QUIC connection ID is available.
     pub async fn connect(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
-        Self::connect_with_config(session, mlog_path, transport, SessionConfig::default()).await
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        Self::connect_with_session_id(session, SessionId::generate(), mlog_path, transport).await
+    }
+
+    /// Create an outbound/client QUIC connection with an explicit correlation ID.
+    ///
+    /// `session_id` should normally be the peer-observed QUIC connection ID.
+    pub async fn connect_with_session_id(
+        session: web_transport::Session,
+        session_id: SessionId,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        Self::connect_with_config_and_session_id(
+            session,
+            session_id,
+            mlog_path,
+            transport,
+            SessionConfig::default(),
+        )
+        .await
     }
 
     /// Create an outbound/client QUIC connection with explicit session configuration.
+    ///
+    /// Generates a local [`SessionId`] fallback. Use
+    /// [`Self::connect_with_config_and_session_id`] when a peer-observed QUIC connection ID is
+    /// available.
     pub async fn connect_with_config(
         session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        Self::connect_with_config_and_session_id(
+            session,
+            SessionId::generate(),
+            mlog_path,
+            transport,
+            config,
+        )
+        .await
+    }
+
+    /// Create an outbound/client QUIC connection with explicit configuration and correlation ID.
+    ///
+    /// `session_id` should normally be the peer-observed QUIC connection ID.
+    pub async fn connect_with_config_and_session_id(
+        session: web_transport::Session,
+        session_id: SessionId,
         mlog_path: Option<PathBuf>,
         transport: Transport,
         config: SessionConfig,
@@ -558,13 +701,15 @@ impl Session {
 
         let mlog = mlog_path.and_then(|p| {
             mlog::MlogWriter::new(p)
-                .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
+                .map_err(
+                    |e| tracing::warn!(session_id = %session_id, "Failed to create mlog: {}", e),
+                )
                 .ok()
         });
 
         let control = session.open_bi().await?;
-        let mut sender = Writer::new(control.0);
-        let mut recver = Reader::new(control.1);
+        let mut sender = Writer::new(session_id.clone(), control.0);
+        let mut recver = Reader::new(session_id.clone(), control.1);
 
         let mut params = KeyValuePairs::default();
 
@@ -606,6 +751,7 @@ impl Session {
 
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %session_id,
             direction = "sent",
             msg_type = "CLIENT_SETUP",
             ?transport,
@@ -617,16 +763,22 @@ impl Session {
         let server: setup::Server = recver.decode().await?;
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %session_id,
             direction = "recv",
             msg_type = "SERVER_SETUP",
             "MoQT control message"
         );
 
         let peer_max = max_request_id_from_params(&server.params);
-        Self::log_peer_max_request_id(peer_max);
+        Self::log_peer_max_request_id(&session_id, peer_max);
         // Client sends even IDs (0); peer server sends odd IDs (1).
-        let request_id = RequestId::new(0, peer_max, our_max_request_id, 1);
-        let session = Session::new(session, sender, recver, mlog, transport, path, request_id);
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `RequestId::new` accept it and remove `RequestId::new_with_session_id`.
+        let request_id =
+            RequestId::new_with_session_id(session_id.clone(), 0, peer_max, our_max_request_id, 1);
+        let session = Session::new(
+            session, session_id, sender, recver, mlog, transport, path, request_id,
+        );
         let publisher = session.1.ok_or(SessionError::Internal)?;
         let subscriber = session.2.ok_or(SessionError::Internal)?;
         Ok((session.0, publisher, subscriber))
@@ -637,34 +789,89 @@ impl Session {
     /// Waits for the bidirectional control stream, decodes CLIENT_SETUP,
     /// sends SERVER_SETUP with parameters only.  Version is already agreed
     /// via ALPN before this is called.
+    ///
+    /// Generates a local [`SessionId`] fallback. Use [`Self::accept_with_session_id`]
+    /// when a peer-observed QUIC connection ID is available.
     pub async fn accept(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
-        Self::accept_with_config(session, mlog_path, transport, SessionConfig::default()).await
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept` accept it and remove `accept_with_session_id`.
+        Self::accept_with_session_id(session, SessionId::generate(), mlog_path, transport).await
+    }
+
+    /// Accept an inbound server connection with an explicit correlation ID.
+    ///
+    /// `session_id` should normally be the peer-observed QUIC connection ID.
+    pub async fn accept_with_session_id(
+        session: web_transport::Session,
+        session_id: SessionId,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+    ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        Self::accept_with_config_and_session_id(
+            session,
+            session_id,
+            mlog_path,
+            transport,
+            SessionConfig::default(),
+        )
+        .await
     }
 
     /// Accept an inbound server connection with explicit session configuration.
+    ///
+    /// Generates a local [`SessionId`] fallback. Use
+    /// [`Self::accept_with_config_and_session_id`] when a peer-observed QUIC connection ID is
+    /// available.
     pub async fn accept_with_config(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
         config: SessionConfig,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        Self::accept_with_config_and_session_id(
+            session,
+            SessionId::generate(),
+            mlog_path,
+            transport,
+            config,
+        )
+        .await
+    }
+
+    /// Accept an inbound server connection with explicit configuration and correlation ID.
+    ///
+    /// `session_id` should normally be the peer-observed QUIC connection ID.
+    pub async fn accept_with_config_and_session_id(
+        session: web_transport::Session,
+        session_id: SessionId,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|p| {
             mlog::MlogWriter::new(p)
-                .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
+                .map_err(
+                    |e| tracing::warn!(session_id = %session_id, "Failed to create mlog: {}", e),
+                )
                 .ok()
         });
 
         let control = session.accept_bi().await?;
-        let mut sender = Writer::new(control.0);
-        let mut recver = Reader::new(control.1);
+        let mut sender = Writer::new(session_id.clone(), control.0);
+        let mut recver = Reader::new(session_id.clone(), control.1);
 
         let client: setup::Client = recver.decode().await?;
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %session_id,
             direction = "recv",
             msg_type = "CLIENT_SETUP",
             "MoQT control message"
@@ -685,6 +892,7 @@ impl Session {
 
         if connection_path.is_some() {
             tracing::debug!(
+                session_id = %session_id,
                 connection_path = connection_path.as_deref(),
                 "Connection path resolved"
             );
@@ -696,7 +904,7 @@ impl Session {
         }
 
         let peer_max = max_request_id_from_params(&client.params);
-        Self::log_peer_max_request_id(peer_max);
+        Self::log_peer_max_request_id(&session_id, peer_max);
 
         // The MAX_REQUEST_ID we advertise to the client.
         let our_max_request_id = config.max_request_id;
@@ -710,6 +918,7 @@ impl Session {
 
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %session_id,
             direction = "sent",
             msg_type = "SERVER_SETUP",
             "MoQT control message"
@@ -723,9 +932,13 @@ impl Session {
         sender.encode(&server).await?;
 
         // Server sends odd IDs (1); peer client sends even IDs (0).
-        let request_id = RequestId::new(1, peer_max, our_max_request_id, 0);
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `RequestId::new` accept it and remove `RequestId::new_with_session_id`.
+        let request_id =
+            RequestId::new_with_session_id(session_id.clone(), 1, peer_max, our_max_request_id, 0);
         Ok(Session::new(
             session,
+            session_id,
             sender,
             recver,
             mlog,
@@ -740,25 +953,26 @@ impl Session {
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
         tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
-            res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
-            res = Self::run_subscribe_namespace_open(self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
-            res = Self::run_subscribe_namespace_accept(self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => res,
-            res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
+            res = Self::run_recv(self.session_id.clone(), self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
+            res = Self::run_send(self.session_id.clone(), self.sender, self.outgoing, self.mlog.clone()) => res,
+            res = Self::run_subscribe_namespace_open(self.session_id.clone(), self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
+            res = Self::run_subscribe_namespace_accept(self.session_id.clone(), self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => res,
+            res = Self::run_streams(self.session_id.clone(), self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
-            res = Self::run_pending_timeouts(self.publisher, self.subscriber, self.pending_requests) => res,
+            res = Self::run_pending_timeouts(self.session_id, self.publisher, self.subscriber, self.pending_requests) => res,
         }
     }
 
     /// Processes the outgoing control message queue, and sends queued messages on the control stream sender/writer.
     async fn run_send(
+        session_id: SessionId,
         mut sender: Writer,
         mut outgoing: Queue<message::Message>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         while let Some(msg) = outgoing.pop().await {
             // Emit structured tracing log for sent control messages
-            Self::log_control_message(&msg, "sent");
+            Self::log_control_message(&session_id, &msg, "sent");
 
             // Emit mlog event for sent control messages
             if let Some(ref mlog) = mlog {
@@ -799,6 +1013,7 @@ impl Session {
     }
 
     async fn run_subscribe_namespace_open(
+        session_id: SessionId,
         webtransport: web_transport::Session,
         mut requests: Queue<OpenSubscribeNamespace>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
@@ -812,7 +1027,7 @@ impl Session {
                     match request {
                         Some(request) => {
                             let webtransport = webtransport.clone();
-                            tasks.push(Self::open_subscribe_namespace(webtransport, request, mlog.clone()));
+                            tasks.push(Self::open_subscribe_namespace(session_id.clone(), webtransport, request, mlog.clone()));
                         }
                         None => requests_done = true,
                     }
@@ -824,16 +1039,17 @@ impl Session {
     }
 
     async fn open_subscribe_namespace(
+        session_id: SessionId,
         webtransport: web_transport::Session,
         request: OpenSubscribeNamespace,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         let (send, recv) = webtransport.open_bi().await?;
-        let mut writer = Writer::new(send);
-        let reader = Reader::new(recv);
+        let mut writer = Writer::new(session_id.clone(), send);
+        let reader = Reader::new(session_id.clone(), recv);
 
         let msg = Message::SubscribeNamespace(request.message.clone());
-        Self::log_control_message(&msg, "sent");
+        Self::log_control_message(&session_id, &msg, "sent");
         add_mlog_event(&mlog, |time| {
             mlog::events::subscribe_namespace_created(time, 0, &request.message)
         });
@@ -848,6 +1064,7 @@ impl Session {
     }
 
     async fn run_subscribe_namespace_accept(
+        session_id: SessionId,
         webtransport: web_transport::Session,
         publisher: Option<Publisher>,
         request_id: RequestId,
@@ -863,7 +1080,7 @@ impl Session {
                     let (send, recv) = stream?;
                     let publisher = publisher.clone().ok_or(SessionError::RoleViolation)?;
                     let request_id = request_id.clone();
-                    tasks.push(Self::accept_subscribe_namespace_stream(publisher, request_id, send, recv, mlog.clone()));
+                    tasks.push(Self::accept_subscribe_namespace_stream(session_id.clone(), publisher, request_id, send, recv, mlog.clone()));
                 }
                 Some(res) = tasks.next(), if !tasks.is_empty() => res?,
             }
@@ -871,14 +1088,15 @@ impl Session {
     }
 
     async fn accept_subscribe_namespace_stream(
+        session_id: SessionId,
         mut publisher: Publisher,
         request_id: RequestId,
         send: web_transport::SendStream,
         recv: web_transport::RecvStream,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
-        let writer = Writer::new(send);
-        let mut reader = Reader::new(recv);
+        let writer = Writer::new(session_id.clone(), send);
+        let mut reader = Reader::new(session_id.clone(), recv);
         // Bound the wait for the stream's opening SUBSCRIBE_NAMESPACE header so an
         // idle or malicious peer cannot hold an accept slot open forever (#2).
         let msg = tokio::time::timeout(
@@ -903,7 +1121,7 @@ impl Session {
             }
         };
         let log_msg = Message::SubscribeNamespace(subscribe_namespace.clone());
-        Self::log_control_message(&log_msg, "recv");
+        Self::log_control_message(&session_id, &log_msg, "recv");
         add_mlog_event(&mlog, |time| {
             mlog::events::subscribe_namespace_parsed(time, 0, &subscribe_namespace)
         });
@@ -920,6 +1138,7 @@ impl Session {
     /// Handles session-level messages (GOAWAY, MAX_REQUEST_ID, REQUESTS_BLOCKED)
     /// directly and routes role-specific messages to Publisher or Subscriber.
     async fn run_recv(
+        session_id: SessionId,
         mut recver: Reader,
         mut publisher: Option<Publisher>,
         mut subscriber: Option<Subscriber>,
@@ -933,7 +1152,7 @@ impl Session {
             let msg: message::Message = recver.decode().await?;
 
             // Emit structured tracing log for received control messages
-            Self::log_control_message(&msg, "recv");
+            Self::log_control_message(&session_id, &msg, "recv");
 
             // Emit mlog event for received control messages
             if let Some(ref mlog) = mlog {
@@ -973,11 +1192,12 @@ impl Session {
 
             let msg = match msg {
                 Message::RequestOk(msg) => {
-                    Self::recv_request_ok(&pending_requests, &mut publisher, msg)?;
+                    Self::recv_request_ok(&session_id, &pending_requests, &mut publisher, msg)?;
                     continue;
                 }
                 Message::RequestError(msg) => {
                     Self::recv_request_error(
+                        &session_id,
                         &pending_requests,
                         &mut publisher,
                         &mut subscriber,
@@ -986,11 +1206,11 @@ impl Session {
                     continue;
                 }
                 Message::PublishOk(msg) => {
-                    Self::recv_publish_ok(&pending_requests, &mut publisher, msg)?;
+                    Self::recv_publish_ok(&session_id, &pending_requests, &mut publisher, msg)?;
                     continue;
                 }
                 Message::SubscribeOk(msg) => {
-                    Self::recv_subscribe_ok(&pending_requests, &mut subscriber, msg)?;
+                    Self::recv_subscribe_ok(&session_id, &pending_requests, &mut subscriber, msg)?;
                     continue;
                 }
                 msg => msg,
@@ -1030,6 +1250,7 @@ impl Session {
                     goaway_received = true;
                     tracing::info!(
                         target: "moq_transport::control",
+                        session_id = %session_id,
                         new_uri = %m.uri.0,
                         "received GOAWAY"
                     );
@@ -1039,6 +1260,7 @@ impl Session {
                     request_id.apply_max_request_id(m)?;
                     tracing::debug!(
                         target: "moq_transport::control",
+                        session_id = %session_id,
                         max_request_id = m.request_id,
                         "received MAX_REQUEST_ID"
                     );
@@ -1046,6 +1268,7 @@ impl Session {
                 Message::RequestsBlocked(ref m) => {
                     tracing::debug!(
                         target: "moq_transport::control",
+                        session_id = %session_id,
                         max_request_id = m.max_request_id,
                         "received REQUESTS_BLOCKED"
                     );
@@ -1053,7 +1276,7 @@ impl Session {
                     request_id.handle_requests_blocked(m)?;
                 }
                 other => {
-                    tracing::warn!(msg_type = other.name(), "received unhandled message type");
+                    tracing::warn!(session_id = %session_id, msg_type = other.name(), "received unhandled message type");
                     return Err(SessionError::unimplemented(&format!(
                         "message type {}",
                         other.name()
@@ -1064,6 +1287,7 @@ impl Session {
     }
 
     fn recv_request_ok(
+        session_id: &SessionId,
         pending_requests: &PendingRequests,
         publisher: &mut Option<Publisher>,
         msg: message::RequestOk,
@@ -1080,6 +1304,7 @@ impl Session {
             None => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     request_id = msg.id,
                     "received REQUEST_OK for unknown outbound request — ignoring"
                 );
@@ -1089,6 +1314,7 @@ impl Session {
     }
 
     fn recv_request_error(
+        session_id: &SessionId,
         pending_requests: &PendingRequests,
         publisher: &mut Option<Publisher>,
         subscriber: &mut Option<Subscriber>,
@@ -1106,10 +1332,11 @@ impl Session {
             None => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     request_id = msg.id,
                     error_code = msg.error_code,
                     retry_interval = msg.retry_interval,
-                    reason = %msg.reason.0,
+                    reason = ?msg.reason.0,
                     "received REQUEST_ERROR for unknown outbound request — ignoring"
                 );
                 Ok(())
@@ -1118,6 +1345,7 @@ impl Session {
     }
 
     fn recv_publish_ok(
+        session_id: &SessionId,
         pending_requests: &PendingRequests,
         publisher: &mut Option<Publisher>,
         msg: message::PublishOk,
@@ -1134,6 +1362,7 @@ impl Session {
             None => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     request_id = msg.id,
                     "received PUBLISH_OK for unknown outbound request — ignoring"
                 );
@@ -1143,6 +1372,7 @@ impl Session {
     }
 
     fn recv_subscribe_ok(
+        session_id: &SessionId,
         pending_requests: &PendingRequests,
         subscriber: &mut Option<Subscriber>,
         msg: message::SubscribeOk,
@@ -1159,6 +1389,7 @@ impl Session {
             None => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     request_id = msg.id,
                     "received SUBSCRIBE_OK for unknown outbound request — ignoring"
                 );
@@ -1168,6 +1399,7 @@ impl Session {
     }
 
     async fn run_pending_timeouts(
+        session_id: SessionId,
         mut publisher: Option<Publisher>,
         mut subscriber: Option<Subscriber>,
         pending_requests: PendingRequests,
@@ -1186,6 +1418,7 @@ impl Session {
             for (id, request) in pending_requests.expire()? {
                 tracing::warn!(
                     target: "moq_transport::control",
+                    session_id = %session_id,
                     request_id = id,
                     request = ?request,
                     "outbound request timed out waiting for response"
@@ -1208,6 +1441,7 @@ impl Session {
     /// Will read stream header to know what type of stream it is and create
     /// the appropriate stream handlers.
     async fn run_streams(
+        session_id: SessionId,
         webtransport: web_transport::Session,
         subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
@@ -1218,10 +1452,11 @@ impl Session {
                 res = webtransport.accept_uni() => {
                     let stream = res?;
                     let subscriber = subscriber.clone().ok_or(SessionError::RoleViolation)?;
+                    let session_id = session_id.clone();
 
                     tasks.push(async move {
                         if let Err(err) = Subscriber::recv_stream(subscriber, stream).await {
-                            tracing::warn!("failed to serve stream: {}", err);
+                            tracing::warn!(session_id = %session_id, "failed to serve stream: {}", err);
                         };
                     });
                 },
@@ -1249,6 +1484,38 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(StdArc<StdMutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(emit: impl FnOnce()) -> String {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, emit);
+
+        let output = capture.0.lock().unwrap().clone();
+        String::from_utf8(output).unwrap()
+    }
 
     // ========================================================================
     // normalize_connection_path
@@ -1321,11 +1588,84 @@ mod tests {
     }
 
     #[test]
+    fn control_message_reasons_escape_log_forging_characters() {
+        let session_id = SessionId::new("log-safety-session");
+        let request_error = Message::RequestError(message::RequestError {
+            id: 7,
+            error_code: 1,
+            retry_interval: 0,
+            reason: crate::coding::ReasonPhrase("request\nforged\rline".to_string()),
+        });
+        let publish_done = Message::PublishDone(message::PublishDone {
+            id: 8,
+            status_code: 2,
+            stream_count: 1,
+            reason: crate::coding::ReasonPhrase("publish\nforged\rline".to_string()),
+        });
+
+        let output = capture_logs(|| {
+            Session::log_control_message(&session_id, &request_error, "recv");
+            Session::log_control_message(&session_id, &publish_done, "recv");
+        });
+
+        assert_eq!(
+            output.lines().count(),
+            2,
+            "unexpected log records: {output}"
+        );
+        assert!(
+            !output.contains('\r'),
+            "raw carriage return in log: {output}"
+        );
+        // Our approach: reason_lossy (control chars → '?') + reason_hex (raw bytes).
+        // The output itself contains '\n' as line terminators — only the peer-supplied
+        // control chars must be absent, which is validated by the '\r' check above and
+        // the reason_lossy assertions below.
+        // '\n' (0x0a) and '\r' (0x0d) become '?' in the lossy display.
+        assert!(
+            output.contains(r#"reason_lossy="request?forged?line""#),
+            "REQUEST_ERROR reason_lossy was not sanitized: {output}"
+        );
+        assert!(
+            output.contains("reason_hex=726571756573740a666f726765640d6c696e65"),
+            "REQUEST_ERROR reason_hex missing raw bytes: {output}"
+        );
+        assert!(
+            output.contains(r#"reason_lossy="publish?forged?line""#),
+            "PUBLISH_DONE reason_lossy was not sanitized: {output}"
+        );
+        assert!(
+            output.contains("reason_hex=7075626c6973680a666f726765640d6c696e65"),
+            "PUBLISH_DONE reason_hex missing raw bytes: {output}"
+        );
+    }
+
+    #[test]
+    fn control_message_reason_is_quoted_in_text_logs() {
+        let message = Message::RequestError(message::RequestError {
+            id: 7,
+            error_code: 1,
+            retry_interval: 0,
+            reason: crate::coding::ReasonPhrase("ok level=ERROR fake=true".to_string()),
+        });
+
+        let output = capture_logs(|| {
+            Session::log_control_message(&SessionId::generate(), &message, "recv");
+        });
+
+        assert!(
+            output.contains(r#"reason_lossy="ok level=ERROR fake=true""#),
+            "reason field was not quoted: {output}"
+        );
+    }
+
+    #[test]
     fn subscribe_ok_for_unknown_request_id_is_ignored() {
         let pending_requests = PendingRequests::default();
         let mut subscriber = None;
 
         Session::recv_subscribe_ok(
+            &SessionId::generate(),
             &pending_requests,
             &mut subscriber,
             message::SubscribeOk {
@@ -1336,5 +1676,65 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    // ========================================================================
+    // SanitizedDisplay and HexDisplay
+    // ========================================================================
+
+    #[test]
+    fn sanitized_display_passes_printable_ascii() {
+        let s = "hello world 123 !@#";
+        assert_eq!(SanitizedDisplay(s).to_string(), s);
+    }
+
+    #[test]
+    fn sanitized_display_replaces_control_chars() {
+        // Controls and Unicode line/paragraph separators must all become '?'.
+        let input = "a\nb\rc\0d\te\x1bf\x7fg\u{0085}h\u{2028}i\u{2029}j";
+        let out = SanitizedDisplay(input).to_string();
+        assert!(!out.contains('\n'), "LF not sanitized: {out:?}");
+        assert!(!out.contains('\r'), "CR not sanitized: {out:?}");
+        assert!(!out.contains('\0'), "NUL not sanitized: {out:?}");
+        assert!(!out.contains('\t'), "TAB not sanitized: {out:?}");
+        assert!(!out.contains('\x1b'), "ESC not sanitized: {out:?}");
+        assert!(!out.contains('\x7f'), "DEL not sanitized: {out:?}");
+        assert!(!out.contains('\u{0085}'), "C1 NEL not sanitized: {out:?}");
+        assert!(
+            !out.contains('\u{2028}'),
+            "line separator not sanitized: {out:?}"
+        );
+        assert!(
+            !out.contains('\u{2029}'),
+            "paragraph separator not sanitized: {out:?}"
+        );
+        // Each control char replaced by exactly one '?'.
+        assert_eq!(out, "a?b?c?d?e?f?g?h?i?j");
+    }
+
+    #[test]
+    fn sanitized_display_preserves_non_ascii_non_control_unicode() {
+        let s = "café résumé 日本語 🎉";
+        assert_eq!(SanitizedDisplay(s).to_string(), s);
+    }
+
+    #[test]
+    fn hex_display_empty_string() {
+        assert_eq!(HexDisplay("").to_string(), "");
+    }
+
+    #[test]
+    fn hex_display_encodes_bytes_as_lowercase_hex() {
+        // "AB" → 0x41 0x42 → "4142"
+        assert_eq!(HexDisplay("AB").to_string(), "4142");
+        // Multi-byte UTF-8: '€' = 0xE2 0x82 0xAC
+        assert_eq!(HexDisplay("€").to_string(), "e282ac");
+    }
+
+    #[test]
+    fn hex_display_round_trips_control_chars() {
+        // Ensure the hex is faithful to the raw bytes even when SanitizedDisplay
+        // would replace them.  '\n' = 0x0A, '\r' = 0x0D.
+        assert_eq!(HexDisplay("\n\r").to_string(), "0a0d");
     }
 }

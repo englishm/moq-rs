@@ -74,6 +74,8 @@ metrics-exporter-prometheus = { version = "0.16", optional = true }
 # test-util provides the paused-clock runtime used to test idle timeouts without
 # sleeping for real.
 tokio = { version = "1", features = ["full", "test-util"] }
+# Used to assert that session correlation fields actually reach formatted output.
+tracing-subscriber = { workspace = true }
 
 [features]
 default = []
