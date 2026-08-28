@@ -1669,16 +1669,10 @@ impl Subscriber {
                     }
                 };
 
-            let current_object_id = match previous_object_id {
-                Some(previous) => previous
-                    .checked_add(object_id_delta)
-                    .and_then(|value| value.checked_add(1))
-                    .ok_or_else(|| {
-                        SessionError::ProtocolViolation("subgroup object id overflow".to_string())
-                    })?,
-                None => object_id_delta,
-            };
-            previous_object_id = Some(current_object_id);
+            let current_object_id =
+                data::decode_object_id_delta(&mut previous_object_id, object_id_delta).map_err(
+                    |_| SessionError::ProtocolViolation("subgroup object id overflow".to_string()),
+                )?;
 
             // Extract extension headers if present
             let extension_headers = decoded_object
@@ -1737,11 +1731,15 @@ impl Subscriber {
                 }
             }
 
-            // Pass extension headers through to the serve layer
-            // TODO SLG - object_id_delta and object status are still being ignored
+            // Pass the absolute Object ID and extension headers through to the serve layer.
+            // TODO SLG - object status is still being ignored.
 
             let subgroup_writer = subgroup_writer.as_mut().ok_or(SessionError::Internal)?;
-            let mut object_writer = subgroup_writer.create(remaining_bytes, extension_headers)?;
+            let mut object_writer = subgroup_writer.create_with_id(
+                current_object_id,
+                remaining_bytes,
+                extension_headers,
+            )?;
             tracing::trace!(
                 "[SUBSCRIBER] recv_subgroup: reading payload for object #{} ({} bytes)",
                 object_count + 1,
@@ -1904,7 +1902,7 @@ impl Subscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::test_support::loopback_session;
+    use crate::session::test_support::{loopback_session, loopback_session_pair};
 
     fn test_subscriber(session: web_transport::Session) -> Subscriber {
         let outgoing = Queue::default().split().0;
@@ -1934,6 +1932,109 @@ mod tests {
         let (writer, _reader) =
             serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), name).produce();
         writer
+    }
+
+    fn register_test_subscribe(
+        subscriber: &Subscriber,
+        track: serve::TrackWriter,
+        request_id: u64,
+        track_alias: u64,
+    ) -> Subscribe {
+        let (subscribe, mut recv, _message) = Subscribe::new(
+            subscriber.clone(),
+            request_id,
+            track,
+            KeyValuePairs::default(),
+        )
+        .unwrap();
+        recv.ok(track_alias).unwrap();
+        subscriber
+            .subscribes
+            .lock()
+            .unwrap()
+            .insert(request_id, recv);
+        subscriber
+            .track_alias_map
+            .lock()
+            .unwrap()
+            .insert(track_alias, TrackOrigin::Subscribe(request_id))
+            .unwrap();
+        subscribe
+    }
+
+    async fn send_test_subgroup(
+        session: web_transport::Session,
+        track_alias: u64,
+        object_id_deltas: &[u64],
+    ) {
+        let stream = session.open_uni().await.unwrap();
+        let mut writer = Writer::new(stream);
+        writer
+            .encode(&data::SubgroupHeader {
+                header_type: data::StreamHeaderType::SubgroupIdExt,
+                track_alias,
+                group_id: 0,
+                subgroup_id: Some(0),
+                publisher_priority: 128,
+            })
+            .await
+            .unwrap();
+
+        for delta in object_id_deltas {
+            writer
+                .encode(&data::SubgroupObjectExt {
+                    object_id_delta: *delta,
+                    extension_headers: Default::default(),
+                    payload_length: 1,
+                    status: None,
+                })
+                .await
+                .unwrap();
+            writer.write(&[0]).await.unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn decoded_subgroup_object_ids_are_preserved() {
+        let (receiver_session, peer_session) = loopback_session_pair().await;
+        let subscriber = test_subscriber(receiver_session.clone());
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), "video").produce();
+        let _subscribe = register_test_subscribe(&subscriber, track_writer, 0, 42);
+
+        let send = send_test_subgroup(peer_session, 42, &[7, 1, 2]);
+        let receive = async {
+            let stream = receiver_session.accept_uni().await.unwrap();
+            Subscriber::recv_stream(subscriber, stream).await.unwrap();
+        };
+        tokio::join!(send, receive);
+
+        let serve::TrackReaderMode::Subgroups(mut subgroups) = track_reader.mode().await.unwrap()
+        else {
+            panic!("expected subgroup delivery");
+        };
+        let mut subgroup = subgroups.next().await.unwrap().unwrap();
+        for expected_object_id in [7, 9, 12] {
+            let mut object = subgroup.next().await.unwrap().unwrap();
+            assert_eq!(object.object_id, expected_object_id);
+            assert_eq!(object.read_all().await.unwrap().as_ref(), &[0]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_streams_propagates_subgroup_object_id_overflow() {
+        let (receiver_session, peer_session) = loopback_session_pair().await;
+        let subscriber = test_subscriber(receiver_session.clone());
+        let (track_writer, _track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), "overflow").produce();
+        let _subscribe = register_test_subscribe(&subscriber, track_writer, 0, 42);
+
+        let send = send_test_subgroup(peer_session, 42, &[u64::MAX, 0]);
+        let run = Session::run_streams(receiver_session, Some(subscriber));
+        let ((), result) = tokio::join!(send, run);
+
+        assert!(matches!(result, Err(SessionError::ProtocolViolation(_))));
     }
 
     #[test]

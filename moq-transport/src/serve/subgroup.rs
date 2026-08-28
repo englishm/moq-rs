@@ -296,7 +296,7 @@ pub struct SubgroupWriter {
     pub info: Arc<SubgroupInfo>,
 
     // The next object sequence number to use.
-    next_object_id: u64,
+    next_object_id: Option<u64>,
 }
 
 impl SubgroupWriter {
@@ -304,7 +304,7 @@ impl SubgroupWriter {
         Self {
             state,
             info: group,
-            next_object_id: 0,
+            next_object_id: Some(0),
         }
     }
 
@@ -323,19 +323,34 @@ impl SubgroupWriter {
         size: usize,
         extension_headers: Option<crate::data::ExtensionHeaders>,
     ) -> Result<SubgroupObjectWriter, ServeError> {
+        let object_id = self.next_object_id.ok_or(ServeError::Duplicate)?;
+        self.create_with_id(object_id, size, extension_headers)
+    }
+
+    /// Write an object with an explicit absolute Object ID.
+    pub fn create_with_id(
+        &mut self,
+        object_id: u64,
+        size: usize,
+        extension_headers: Option<crate::data::ExtensionHeaders>,
+    ) -> Result<SubgroupObjectWriter, ServeError> {
+        let next_object_id = self.next_object_id.ok_or(ServeError::Duplicate)?;
+        if object_id < next_object_id {
+            return Err(ServeError::Duplicate);
+        }
+
         let (writer, reader) = SubgroupObject {
             group: self.info.clone(),
-            object_id: self.next_object_id,
+            object_id,
             status: ObjectStatus::NormalObject,
             size,
             extension_headers: extension_headers.unwrap_or_default(),
         }
         .produce();
 
-        self.next_object_id += 1;
-
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
         state.objects.push(reader);
+        self.next_object_id = object_id.checked_add(1);
 
         Ok(writer)
     }
@@ -630,5 +645,63 @@ impl Deref for SubgroupObjectReader {
 
     fn deref(&self) -> &Self::Target {
         &self.info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::TrackNamespace;
+
+    fn subgroup() -> (SubgroupWriter, SubgroupReader) {
+        SubgroupInfo {
+            track: Arc::new(Track::new(TrackNamespace::from_utf8_path("test"), "track")),
+            group_id: 0,
+            subgroup_id: 0,
+            priority: 128,
+        }
+        .produce()
+    }
+
+    #[tokio::test]
+    async fn create_with_id_preserves_nonzero_and_gapped_object_ids() {
+        let (mut writer, mut reader) = subgroup();
+
+        for object_id in [7, 9] {
+            let mut object = writer.create_with_id(object_id, 1, None).unwrap();
+            object.write(Bytes::from_static(b"x")).unwrap();
+        }
+
+        for expected in [7, 9] {
+            let object = reader.next().await.unwrap().unwrap();
+            assert_eq!(object.object_id, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_with_id_accepts_u64_max_as_the_final_object() {
+        let (mut writer, mut reader) = subgroup();
+
+        drop(writer.create_with_id(u64::MAX, 0, None).unwrap());
+
+        assert_eq!(reader.next().await.unwrap().unwrap().object_id, u64::MAX);
+        assert!(writer.create(0, None).is_err());
+        assert!(writer.create_with_id(u64::MAX, 0, None).is_err());
+    }
+
+    #[test]
+    fn create_with_id_rejects_duplicate_and_decreasing_ids() {
+        let (mut writer, _reader) = subgroup();
+
+        drop(writer.create_with_id(7, 0, None).unwrap());
+
+        assert!(matches!(
+            writer.create_with_id(7, 0, None),
+            Err(ServeError::Duplicate)
+        ));
+        assert!(matches!(
+            writer.create_with_id(6, 0, None),
+            Err(ServeError::Duplicate)
+        ));
     }
 }

@@ -515,6 +515,7 @@ impl ObjectForwarder {
 
         let mut writer: Option<Writer> = None;
         let mut object_count = 0;
+        let mut previous_object_id = None;
         while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
             if !delivery_filter.allows(subgroup_reader.group_id, subgroup_object_reader.object_id) {
                 tracing::trace!(
@@ -564,11 +565,13 @@ impl ObjectForwarder {
             }
 
             let writer = writer.as_mut().ok_or(SessionError::Internal)?;
+            let object_id_delta = data::encode_object_id_delta(
+                &mut previous_object_id,
+                subgroup_object_reader.object_id,
+            )
+            .map_err(|err| SessionError::Serve(ServeError::internal_ctx(err.to_string())))?;
             let subgroup_object = data::SubgroupObjectExt {
-                // TODO(itzmanish): compute real delta when the receive side uses object IDs
-                // for ordering. Both sender and receiver must agree on the same prev tracking
-                // semantics before this is meaningful.
-                object_id_delta: 0,
+                object_id_delta,
                 extension_headers: subgroup_object_reader.extension_headers.clone(), // Pass through extension headers
                 payload_length: subgroup_object_reader.size,
                 status: if subgroup_object_reader.size == 0 {
@@ -766,6 +769,9 @@ impl ObjectForwarderRecv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::loopback_session_pair;
+    use crate::session::Reader;
+    use bytes::Bytes;
 
     async fn test_subscribed() -> (
         Subscribed,
@@ -793,6 +799,83 @@ mod tests {
         )
         .unwrap();
         (subscribed, recv, outgoing_recv)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filtered_subgroup_deltas_follow_transmitted_object_ids() {
+        let (publisher_session, peer_session) = loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (forwarder, _recv) = ObjectForwarder::new(publisher, 42, None);
+
+        let track = Arc::new(serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        ));
+        let (mut source, source_reader) = serve::SubgroupInfo {
+            track,
+            group_id: 0,
+            subgroup_id: 0,
+            priority: 128,
+        }
+        .produce();
+        for object_id in [0, 1, 5, 6, 9] {
+            let mut object = source.create_with_id(object_id, 1, None).unwrap();
+            object.write(Bytes::from(vec![object_id as u8])).unwrap();
+        }
+        drop(source);
+
+        let header = data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupIdExt,
+            track_alias: 42,
+            group_id: 0,
+            subgroup_id: Some(0),
+            publisher_priority: 128,
+        };
+        let filter = DeliveryFilter {
+            forward: true,
+            start_location: Some(Location::new(0, 5)),
+            end_group_id: None,
+        };
+
+        let receive = async move {
+            let stream = peer_session.accept_uni().await.unwrap();
+            let mut reader = Reader::new(stream);
+            let stream_header: data::StreamHeader = reader.decode().await.unwrap();
+            assert_eq!(stream_header.subgroup_header.unwrap().track_alias, 42);
+
+            let mut received = Vec::new();
+            for expected_payload in [5, 6, 9] {
+                let object: data::SubgroupObjectExt = reader.decode().await.unwrap();
+                let payload = reader
+                    .read_chunk(object.payload_length)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(payload.as_ref(), &[expected_payload]);
+                received.push(object.object_id_delta);
+            }
+            received
+        };
+        let send = ObjectForwarder::serve_subgroup(
+            header,
+            source_reader,
+            forwarder.publisher.clone(),
+            forwarder.state.clone(),
+            None,
+            filter,
+        );
+
+        let (send_result, received_deltas) = tokio::join!(send, receive);
+        send_result.unwrap();
+        assert_eq!(received_deltas, [5, 0, 2]);
     }
 
     #[tokio::test]
