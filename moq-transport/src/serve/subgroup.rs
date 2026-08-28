@@ -80,19 +80,14 @@ impl SubgroupsWriter {
 
     // Helper to increment the group by one.
     pub fn append(&mut self, priority: u8) -> Result<SubgroupWriter, ServeError> {
-        let group_id;
-        let subgroup_id;
-
         // TODO: refactor here... For now, every subgroup is mapped to a new group...
         let start_new_group = true;
 
-        if start_new_group {
-            group_id = self.next_group_id;
-            subgroup_id = 0;
+        let (group_id, subgroup_id) = if start_new_group {
+            (self.next_group_id, 0)
         } else {
-            group_id = self.last_group_id;
-            subgroup_id = self.next_subgroup_id;
-        }
+            (self.last_group_id, self.next_subgroup_id)
+        };
 
         self.create(Subgroup {
             group_id,
@@ -934,7 +929,8 @@ mod tests {
         })
         .await;
 
-        let latest_sub = result.expect("higher_subgroup_id_updates_latest timed out after 5 seconds");
+        let latest_sub =
+            result.expect("higher_subgroup_id_updates_latest timed out after 5 seconds");
         assert_eq!(latest_sub.unwrap().subgroup_id, 1);
     }
 
