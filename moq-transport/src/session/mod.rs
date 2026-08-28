@@ -70,6 +70,13 @@ type BidiReaderFuture = Pin<Box<dyn Future<Output = Result<(), SessionError>> + 
 /// concurrency — no task is spawned, so a reader cannot outlive the session.
 type BidiTaskSender = tokio::sync::mpsc::UnboundedSender<BidiReaderFuture>;
 
+/// Validate and encode a request before allocating its bidirectional stream.
+fn encode_request_frame(msg: &Message) -> Result<bytes::BytesMut, SessionError> {
+    let mut frame = bytes::BytesMut::new();
+    msg.encode(&mut frame)?;
+    Ok(frame)
+}
+
 /// The transport protocol negotiated for this MoQT connection.
 ///
 /// MoQT can run over either WebTransport (HTTP/3 + QUIC) or raw QUIC.
@@ -1211,6 +1218,10 @@ impl Session {
     fn encode_bidi_response_frame(msg: &Message) -> Result<bytes::BytesMut, SessionError> {
         use bytes::BufMut;
 
+        if !msg.parameter_scopes_valid() {
+            return Err(crate::coding::EncodeError::InvalidValue.into());
+        }
+
         // Encode the payload (all fields EXCEPT Request ID, which is
         // implicit from the bidi stream identity in draft-18).
         let mut payload = bytes::BytesMut::new();
@@ -1306,7 +1317,7 @@ impl Session {
 
         use message::wire_id;
 
-        match msg_type {
+        let msg = match msg_type {
             wire_id::RequestError => {
                 let error_code = u64::decode(&mut buf)?;
                 let retry_interval = u64::decode(&mut buf)?;
@@ -1394,7 +1405,13 @@ impl Session {
                     other
                 )))
             }
+        }?;
+
+        if !msg.parameter_scopes_valid() {
+            return Err(DecodeError::InvalidParameter.into());
         }
+
+        Ok(msg)
     }
 
     /// Receives inbound messages from the control stream reader/receiver.
@@ -1701,6 +1718,20 @@ mod tests {
         // type (1 byte) + length 0x0001 (2 bytes) + params_count=0 (1 byte) = 4 bytes
         assert_eq!(bytes[0], wire_id::RequestOk as u8);
         assert_eq!(bytes.len(), 4);
+    }
+
+    #[test]
+    fn encode_bidi_response_rejects_parameter_outside_its_scope() {
+        let mut params = crate::coding::KeyValuePairs::default();
+        params.set_rendezvous_timeout(1_000);
+        let msg = Message::RequestOk(message::RequestOk { id: 1, params });
+
+        assert!(matches!(
+            Session::encode_bidi_response_frame(&msg),
+            Err(SessionError::Encode(
+                crate::coding::EncodeError::InvalidValue
+            ))
+        ));
     }
 
     #[test]

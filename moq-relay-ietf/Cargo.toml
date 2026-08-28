@@ -74,6 +74,9 @@ metrics-exporter-prometheus = { version = "0.16", optional = true }
 # test-util provides the paused-clock runtime used to test idle timeouts without
 # sleeping for real.
 tokio = { version = "1", features = ["full", "test-util"] }
+# Real loopback sessions exercise relay admission through the MoQT request path.
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
 [features]
 default = []

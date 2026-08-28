@@ -3,6 +3,7 @@
 
 use std::collections::hash_map;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use moq_transport::{
     coding::{TrackNamespace, TrackNamespacePrefix},
     serve::{FullTrackName, ServeError, Track, TrackReader, TrackWriter},
 };
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::interest::{TrackInterest, TrackInterestGuard};
 use crate::metrics::GaugeGuard;
@@ -36,6 +37,20 @@ const NAMESPACE_REQUEST_CHANNEL_CAPACITY: usize = 1024;
 /// paying a fresh upstream SUBSCRIBE round trip. Past that we stop paying to
 /// receive a track nobody is watching.
 pub const DEFAULT_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum rendezvous requests that may hold relay state at once.
+///
+/// One [`Locals`] registry is shared by every session on a relay. Matching the
+/// per-session bidirectional stream limit bounds aggregate rendezvous work to
+/// what one fully occupied session could create.
+pub(crate) const MAX_CONCURRENT_RENDEZVOUS_HOLDS: usize = 128;
+
+// REQUEST_ERROR stores the minimum delay in milliseconds plus one. The stride
+// is coprime with the spread, so one relay-wide sequence visits every delay
+// before repeating.
+const RENDEZVOUS_RETRY_INTERVAL_MIN: u64 = 1_001;
+const RENDEZVOUS_RETRY_INTERVAL_SPREAD: u64 = 1_000;
+const RENDEZVOUS_RETRY_INTERVAL_STRIDE: u64 = 577;
 
 /// Capacity of the namespace add/remove notification broadcast channel used by
 /// SUBSCRIBE_NAMESPACE handlers.
@@ -297,6 +312,37 @@ pub struct Locals {
     /// How long an unwatched pull-through cache entry is retained before its
     /// upstream subscription is released. Zero disables eviction.
     cache_idle_timeout: Duration,
+
+    /// Shared by every session using this relay-local registry. Admission never
+    /// waits because queued requests would still pin their bidirectional streams.
+    rendezvous_hold_permits: Arc<Semaphore>,
+
+    /// Shared sequence keeps overload responses from separate sessions from
+    /// choosing the same point in the retry window.
+    rendezvous_retry_sequence: Arc<AtomicU64>,
+}
+
+struct CacheGenerationCleanup {
+    locals: Locals,
+    scope_key: ScopeKey,
+    full_name: FullTrackName,
+    interest: TrackInterest,
+    armed: bool,
+}
+
+impl CacheGenerationCleanup {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CacheGenerationCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            self.locals
+                .remove_cache_generation(&self.scope_key, &self.full_name, &self.interest);
+        }
+    }
 }
 
 impl Default for Locals {
@@ -315,6 +361,16 @@ impl Locals {
     /// A zero timeout disables idle eviction, holding upstream subscriptions for
     /// as long as the upstream session lives.
     pub fn with_cache_idle_timeout(cache_idle_timeout: Duration) -> Self {
+        Self::with_cache_idle_timeout_and_rendezvous_capacity(
+            cache_idle_timeout,
+            MAX_CONCURRENT_RENDEZVOUS_HOLDS,
+        )
+    }
+
+    fn with_cache_idle_timeout_and_rendezvous_capacity(
+        cache_idle_timeout: Duration,
+        rendezvous_capacity: usize,
+    ) -> Self {
         let (namespace_changes, _) = broadcast::channel(NAMESPACE_CHANGE_CHANNEL_CAPACITY);
         let (track_changes, _) = broadcast::channel(TRACK_CHANGE_CHANNEL_CAPACITY);
         Self {
@@ -323,7 +379,33 @@ impl Locals {
             namespace_changes,
             track_changes,
             cache_idle_timeout,
+            rendezvous_hold_permits: Arc::new(Semaphore::new(rendezvous_capacity)),
+            rendezvous_retry_sequence: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_rendezvous_capacity(rendezvous_capacity: usize) -> Self {
+        Self::with_cache_idle_timeout_and_rendezvous_capacity(
+            DEFAULT_CACHE_IDLE_TIMEOUT,
+            rendezvous_capacity,
+        )
+    }
+
+    pub(crate) fn try_acquire_rendezvous_hold(&self) -> Option<OwnedSemaphorePermit> {
+        self.rendezvous_hold_permits
+            .clone()
+            .try_acquire_owned()
+            .ok()
+    }
+
+    pub(crate) fn rendezvous_overload_retry_interval(&self) -> u64 {
+        let sequence = self
+            .rendezvous_retry_sequence
+            .fetch_add(1, Ordering::Relaxed);
+        RENDEZVOUS_RETRY_INTERVAL_MIN
+            + sequence.wrapping_mul(RENDEZVOUS_RETRY_INTERVAL_STRIDE)
+                % RENDEZVOUS_RETRY_INTERVAL_SPREAD
     }
 
     pub fn subscribe_namespace_changes(&self) -> broadcast::Receiver<NamespaceChange> {
@@ -789,6 +871,13 @@ impl Locals {
             full_name: full_name.clone(),
             interest: interest.clone(),
         };
+        let cleanup = CacheGenerationCleanup {
+            locals: self.clone(),
+            scope_key: scope_key.clone(),
+            full_name: full_name.clone(),
+            interest: interest.clone(),
+            armed: true,
+        };
 
         if source
             .requests
@@ -800,12 +889,10 @@ impl Locals {
             .await
             .is_err()
         {
-            // The source is gone, so nothing will ever fill this reader. Remove
-            // the slot we claimed, but only if it is still ours: a concurrent
-            // caller may already have replaced it with a live generation.
-            self.remove_cache_generation(&scope_key, &full_name, &interest);
             return None;
         }
+
+        cleanup.disarm();
 
         Some(LocalTrack {
             reader,
@@ -1024,6 +1111,44 @@ mod tests {
         let change =
             tokio::time::timeout(std::time::Duration::from_millis(50), changes.recv()).await;
         assert!(change.is_err(), "unexpected namespace change: {change:?}");
+    }
+
+    #[test]
+    fn rendezvous_hold_capacity_is_shared_across_sessions() {
+        let locals = Locals::with_rendezvous_capacity(2);
+        let other_session = locals.clone();
+        let mut permits = (0..2)
+            .map(|_| {
+                locals
+                    .try_acquire_rendezvous_hold()
+                    .expect("capacity should admit the configured number of holds")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(other_session.try_acquire_rendezvous_hold().is_none());
+
+        permits.pop();
+        assert!(other_session.try_acquire_rendezvous_hold().is_some());
+    }
+
+    #[test]
+    fn overload_retries_use_one_relay_wide_sequence() {
+        let locals = Locals::new();
+        let other_session = locals.clone();
+        let intervals = (0..1_000)
+            .map(|index| {
+                if index % 2 == 0 {
+                    locals.rendezvous_overload_retry_interval()
+                } else {
+                    other_session.rendezvous_overload_retry_interval()
+                }
+            })
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(intervals.len(), 1_000);
+        assert!(intervals
+            .iter()
+            .all(|interval| (1_001..=2_000).contains(interval)));
     }
 
     #[tokio::test]
@@ -1247,6 +1372,64 @@ mod tests {
         assert!(
             no_second_request.is_err(),
             "cache hit should not request again"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_track_request_removes_cache_generation() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/cancelled");
+        let (requests, _request_reader) = mpsc::channel(1);
+        locals
+            .namespaces
+            .write()
+            .unwrap()
+            .entry(UNSCOPED.to_string())
+            .or_default()
+            .insert(
+                namespace.clone(),
+                NamespaceEntry {
+                    local: Some(NamespaceSource { requests }),
+                    remote: Weak::new(),
+                },
+            );
+
+        // Fill the source channel so the next miss is cancelled while sending
+        // its TrackRequest, after reserving a cache generation.
+        let _first = locals
+            .get_or_request_track(None, namespace.clone(), "first")
+            .await
+            .expect("first request should fill the source channel");
+
+        let mut task_locals = locals.clone();
+        let task_namespace = namespace.clone();
+        let task = tokio::spawn(async move {
+            task_locals
+                .get_or_request_track(None, task_namespace, "cancelled")
+                .await
+        });
+        let cancelled = full(&namespace, "cancelled");
+
+        for _ in 0..10 {
+            if locals.retrieve_track(None, &cancelled).is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            locals.retrieve_track(None, &cancelled).is_some(),
+            "pending request should reserve its cache generation"
+        );
+
+        task.abort();
+        let join_error = match task.await {
+            Err(err) => err,
+            Ok(_) => panic!("request task should have been cancelled"),
+        };
+        assert!(join_error.is_cancelled());
+        assert!(
+            locals.retrieve_track(None, &cancelled).is_none(),
+            "cancelling the request must remove its cache generation"
         );
     }
 

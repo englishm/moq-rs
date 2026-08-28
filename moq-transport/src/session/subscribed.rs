@@ -23,6 +23,7 @@ use super::{DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
 struct ObjectForwarderState {
     largest_location: Option<Location>,
     stream_count: u64,
+    retry_interval: u64,
     /// Set to true when UNSUBSCRIBE is received.  When true, Drop skips sending
     /// PUBLISH_DONE or REQUEST_ERROR because the subscriber already terminated.
     unsubscribed: bool,
@@ -51,6 +52,7 @@ impl Default for ObjectForwarderState {
         Self {
             largest_location: None,
             stream_count: 0,
+            retry_interval: 0,
             unsubscribed: false,
             closed: Ok(()),
         }
@@ -67,6 +69,18 @@ pub struct Subscribed {
     /// Tracks if SubscribeOk has been sent yet or not. Used to send
     /// PUBLISH_DONE vs REQUEST_ERROR on drop.
     ok: bool,
+}
+
+/// Failure while serving a track under a pre-acceptance deadline.
+#[derive(Debug, thiserror::Error)]
+pub enum ServeWithDeadlineError {
+    /// The deadline passed before SUBSCRIBE_OK was committed.
+    #[error("subscribe deadline expired before acceptance")]
+    DeadlineExpired,
+
+    /// Serving failed before or after acceptance for another reason.
+    #[error(transparent)]
+    Session(#[from] SessionError),
 }
 
 /// Serves a track's Objects on a session, keyed by Track Alias.
@@ -116,6 +130,24 @@ impl ObjectForwarder {
         Ok(())
     }
 
+    /// Commit the decision to accept a SUBSCRIBE while holding the same state
+    /// lock used by withdrawal.
+    fn prepare_subscribe_ok(
+        &self,
+        largest_location: Option<Location>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), ServeError> {
+        let state = self.state.lock();
+        state.closed.clone()?;
+
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(ServeError::Timeout);
+        }
+
+        state.into_mut().ok_or(ServeError::Cancel)?.largest_location = largest_location;
+        Ok(())
+    }
+
     /// Subgroup streams opened so far. The PUBLISH path needs this separately
     /// from [`Self::terminal_state`], because there the terminal message is sent
     /// by `Published::drop` after the forwarder is gone.
@@ -125,7 +157,7 @@ impl ObjectForwarder {
 
     /// Snapshot the fields a terminal message needs, without holding the lock
     /// across the send that follows.
-    fn terminal_state(&self) -> (ServeError, u64, bool) {
+    fn terminal_state(&self) -> (ServeError, u64, u64, bool) {
         let state = self.state.lock();
         let err = state
             .closed
@@ -133,15 +165,21 @@ impl ObjectForwarder {
             .err()
             .cloned()
             .unwrap_or(ServeError::Done);
-        (err, state.stream_count, state.unsubscribed)
+        (
+            err,
+            state.stream_count,
+            state.retry_interval,
+            state.unsubscribed,
+        )
     }
 
-    fn close(&self, err: ServeError) -> Result<(), ServeError> {
+    fn close(&self, err: ServeError, retry_interval: u64) -> Result<(), ServeError> {
         let state = self.state.lock();
         state.closed.clone()?;
 
         let mut state = state.into_mut().ok_or(ServeError::Done)?;
         state.closed = Err(err);
+        state.retry_interval = retry_interval;
 
         Ok(())
     }
@@ -198,8 +236,41 @@ impl Subscribed {
         Ok((send, recv))
     }
 
-    pub async fn serve(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
-        let res = self.serve_inner(track).await;
+    pub async fn serve(self, track: serve::TrackReader) -> Result<(), SessionError> {
+        self.serve_before(track, None).await
+    }
+
+    /// Serve a track only if acceptance is committed before `deadline`.
+    pub async fn serve_with_deadline(
+        mut self,
+        track: serve::TrackReader,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ServeWithDeadlineError> {
+        let result = self.serve_inner(track, Some(deadline)).await;
+        let deadline_expired =
+            !self.ok && matches!(result, Err(SessionError::Serve(ServeError::Timeout)));
+
+        let Err(err) = result else {
+            return Ok(());
+        };
+
+        if deadline_expired {
+            // A simultaneous UNSUBSCRIBE may have closed the shared state first,
+            // but the relay still needs the deadline result for its response and metric.
+            let _ = self.close(err.clone().into());
+            return Err(ServeWithDeadlineError::DeadlineExpired);
+        }
+
+        self.close(err.clone().into()).map_err(SessionError::from)?;
+        Err(err.into())
+    }
+
+    async fn serve_before(
+        mut self,
+        track: serve::TrackReader,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), SessionError> {
+        let res = self.serve_inner(track, deadline).await;
         if let Err(err) = &res {
             self.close(err.clone().into())?;
         }
@@ -207,10 +278,15 @@ impl Subscribed {
         res
     }
 
-    async fn serve_inner(&mut self, track: serve::TrackReader) -> Result<(), SessionError> {
+    async fn serve_inner(
+        &mut self,
+        track: serve::TrackReader,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), SessionError> {
         // Update largest location before sending SubscribeOk
         let largest_location = track.largest_location();
-        self.forwarder.set_largest_location(largest_location)?;
+        self.forwarder
+            .prepare_subscribe_ok(largest_location, deadline)?;
 
         // Send SubscribeOk using send_message_and_wait to ensure it is sent at least to the QUIC stack before
         // we start serving the track.  If a subscriber gets the stream before SubscribeOk
@@ -240,7 +316,15 @@ impl Subscribed {
     }
 
     pub fn close(self, err: ServeError) -> Result<(), ServeError> {
-        self.forwarder.close(err)
+        self.close_with_retry(err, 0)
+    }
+
+    /// Reject a pending subscription and tell the subscriber when it may retry.
+    ///
+    /// `retry_interval` uses the REQUEST_ERROR wire encoding: minimum delay in
+    /// milliseconds plus one, or zero when the request should not be retried.
+    pub fn close_with_retry(self, err: ServeError, retry_interval: u64) -> Result<(), ServeError> {
+        self.forwarder.close(err, retry_interval)
     }
 
     pub async fn closed(&self) -> Result<(), ServeError> {
@@ -258,7 +342,7 @@ impl ops::Deref for Subscribed {
 
 impl Drop for Subscribed {
     fn drop(&mut self) {
-        let (err, stream_count, unsubscribed) = self.forwarder.terminal_state();
+        let (err, stream_count, retry_interval, unsubscribed) = self.forwarder.terminal_state();
 
         // Subscriber already sent UNSUBSCRIBE — no terminal message needed.
         if unsubscribed {
@@ -280,7 +364,7 @@ impl Drop for Subscribed {
                 message::RequestError {
                     id: self.info.id,
                     error_code: Self::request_error_code(&err),
-                    retry_interval: 0,
+                    retry_interval,
                     reason: ReasonPhrase(err.to_string()),
                 },
             );
@@ -304,6 +388,10 @@ impl Subscribed {
             ServeError::NotFound | ServeError::NotFoundWithId(_, _) => {
                 RequestErrorCode::DoesNotExist as u64
             }
+            // draft-18 §10.2.6 distinguishes the two: DOES_NOT_EXIST when the relay
+            // did not wait, TIMEOUT when it held the subscription and no publisher
+            // arrived before the subscriber's RENDEZVOUS_TIMEOUT elapsed.
+            ServeError::Timeout => RequestErrorCode::Timeout as u64,
             ServeError::Duplicate => RequestErrorCode::DuplicateSubscription as u64,
             ServeError::Cancel | ServeError::Done => RequestErrorCode::Uninterested as u64,
             ServeError::Mode
@@ -679,6 +767,127 @@ impl ObjectForwarderRecv {
 mod tests {
     use super::*;
 
+    async fn test_subscribed() -> (
+        Subscribed,
+        ObjectForwarderRecv,
+        crate::watch::Queue<message::Message>,
+    ) {
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (outgoing, outgoing_recv) = crate::watch::Queue::default().split();
+        let publisher = Publisher::new(
+            outgoing,
+            crate::session::test_support::loopback_session().await,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (subscribed, recv) = Subscribed::new(
+            publisher,
+            message::Subscribe {
+                id: 0,
+                track_namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
+                track_name: "track".into(),
+                params: KeyValuePairs::default(),
+            },
+            None,
+        )
+        .unwrap();
+        (subscribed, recv, outgoing_recv)
+    }
+
+    #[tokio::test]
+    async fn deadline_prevents_subscribe_ok() {
+        let (subscribed, _recv, _outgoing) = test_subscribed().await;
+        let (_writer, reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        )
+        .produce();
+
+        let error = subscribed
+            .serve_with_deadline(reader, tokio::time::Instant::now())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ServeWithDeadlineError::DeadlineExpired));
+    }
+
+    #[tokio::test]
+    async fn withdrawal_prevents_subscribe_ok() {
+        let (subscribed, mut recv, _outgoing) = test_subscribed().await;
+        recv.recv_unsubscribe().unwrap();
+        let (_writer, reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        )
+        .produce();
+
+        let error = subscribed
+            .serve_with_deadline(
+                reader,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ServeWithDeadlineError::Session(SessionError::Serve(ServeError::Cancel))
+        ));
+    }
+
+    /// A publisher-side timeout after SUBSCRIBE_OK is a track failure, not an
+    /// expired rendezvous window.
+    #[tokio::test]
+    async fn accepted_track_timeout_is_not_a_deadline_expiration() {
+        let (subscribed, _recv, mut outgoing) = test_subscribed().await;
+        let (writer, reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        )
+        .produce();
+
+        let serve = subscribed.serve_with_deadline(
+            reader,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        let close_after_accept = async move {
+            assert!(matches!(
+                outgoing.pop().await,
+                Some(message::Message::SubscribeOk(_))
+            ));
+            writer.close(ServeError::Timeout).unwrap();
+        };
+
+        let (result, ()) = tokio::join!(serve, close_after_accept);
+        assert!(matches!(
+            result.unwrap_err(),
+            ServeWithDeadlineError::Session(SessionError::Serve(ServeError::Timeout))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejection_preserves_retry_interval() {
+        let (subscribed, _recv, mut outgoing) = test_subscribed().await;
+        // The session retains a Publisher while individual requests come and go.
+        let _publisher = subscribed.forwarder.publisher.clone();
+        let retry_interval = 1_500;
+
+        subscribed
+            .close_with_retry(
+                ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64),
+                retry_interval,
+            )
+            .unwrap();
+
+        let outgoing = outgoing.pop().await;
+        let Some(message::Message::RequestError(rejection)) = outgoing else {
+            panic!("expected REQUEST_ERROR, got {outgoing:?}");
+        };
+        assert_eq!(rejection.error_code, RequestErrorCode::ExcessiveLoad as u64);
+        assert_eq!(rejection.retry_interval, retry_interval);
+    }
+
     #[test]
     fn subscribed_state_counts_opened_streams() {
         let mut state = ObjectForwarderState::default();
@@ -739,6 +948,11 @@ mod tests {
         assert_eq!(
             Subscribed::request_error_code(&ServeError::Duplicate),
             RequestErrorCode::DuplicateSubscription as u64
+        );
+        // A rendezvous hold that expired is TIMEOUT, not DOES_NOT_EXIST.
+        assert_eq!(
+            Subscribed::request_error_code(&ServeError::Timeout),
+            RequestErrorCode::Timeout as u64
         );
         assert_eq!(
             Subscribed::request_error_code(&ServeError::NotImplemented("fetch".to_string())),

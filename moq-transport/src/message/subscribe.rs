@@ -79,6 +79,28 @@ mod tests {
         assert_eq!(decoded, msg);
     }
 
+    /// The interop guarantee: RENDEZVOUS_TIMEOUT survives the wire unchanged.
+    /// 0x04 is even, so the KVP codec carries it as a varint with no length prefix.
+    #[test]
+    fn rendezvous_timeout_survives_the_wire() {
+        let mut buf = BytesMut::new();
+
+        let mut params = KeyValuePairs::default();
+        params.set_rendezvous_timeout(30_000);
+
+        let msg = Subscribe {
+            id: 7,
+            track_namespace: TrackNamespace::from_utf8_path("meeting/room"),
+            track_name: "camera".into(),
+            params,
+        };
+        msg.encode(&mut buf).unwrap();
+
+        let decoded = Subscribe::decode(&mut buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(decoded.params.rendezvous_timeout().unwrap(), Some(30_000));
+    }
+
     #[test]
     fn default_params_roundtrip() {
         // Verify a minimal SUBSCRIBE with no params still round-trips cleanly.

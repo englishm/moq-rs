@@ -17,6 +17,10 @@ pub enum ServeError {
     #[error("not found")]
     NotFound,
 
+    /// A request ended with draft-18 REQUEST_ERROR TIMEOUT.
+    #[error("request timed out")]
+    Timeout,
+
     #[error("not found: {0} [error:{1}]")]
     NotFoundWithId(String, uuid::Uuid),
 
@@ -72,6 +76,8 @@ impl ServeError {
             Self::Closed(code) => *code,
             // TRACK_DOES_NOT_EXIST (0x4) from SUBSCRIBE_ERROR codes
             Self::NotFound | Self::NotFoundWithId(_, _) => 0x4,
+            // TIMEOUT (0x2) in the REQUEST_ERROR registry
+            Self::Timeout => 0x2,
             // This is more of a session-level error, but keeping a reasonable code
             Self::Duplicate => 0x5,
             // NOT_SUPPORTED (0x3) - appears in multiple error code registries
