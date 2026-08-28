@@ -1963,7 +1963,7 @@ mod tests {
     }
 
     async fn send_test_subgroup(
-        session: web_transport::Session,
+        session: &web_transport::Session,
         track_alias: u64,
         object_id_deltas: &[u64],
     ) {
@@ -2003,7 +2003,7 @@ mod tests {
             serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), "video").produce();
         let _subscribe = register_test_subscribe(&subscriber, track_writer, 0, 42);
 
-        let send = send_test_subgroup(peer_session, 42, &[7, 1, 2]);
+        let send = send_test_subgroup(&peer_session, 42, &[7, 1, 2]);
         let receive = async {
             let stream = receiver_session.accept_uni().await.unwrap();
             Subscriber::recv_stream(subscriber, stream).await.unwrap();
@@ -2030,7 +2030,7 @@ mod tests {
             serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), "overflow").produce();
         let _subscribe = register_test_subscribe(&subscriber, track_writer, 0, 42);
 
-        let send = send_test_subgroup(peer_session, 42, &[u64::MAX, 0]);
+        let send = send_test_subgroup(&peer_session, 42, &[u64::MAX, 0]);
         let run = Session::run_streams(receiver_session, Some(subscriber));
         let ((), result) = tokio::join!(send, run);
 
