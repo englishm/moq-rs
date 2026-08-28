@@ -300,9 +300,13 @@ impl Subscriber {
         &self,
         msg: &message::Message,
     ) -> Result<(Writer, Reader), SessionError> {
+        // Validate and encode before allocating a QUIC stream, so malformed
+        // local parameters cannot consume a request-stream slot.
+        let frame = super::encode_request_frame(msg)?;
+
         let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
         let mut writer = Writer::new(send_stream);
-        writer.encode(msg).await?;
+        writer.write(&frame).await?;
         Ok((writer, Reader::new(recv_stream)))
     }
 
@@ -346,6 +350,23 @@ impl Subscriber {
         &mut self,
         track: serve::TrackWriter,
     ) -> Result<Subscribe, ServeError> {
+        self.subscribe_open_with_params(track, KeyValuePairs::default())
+            .await
+    }
+
+    /// Like [`Self::subscribe_open`], but with SUBSCRIBE parameters.
+    ///
+    /// Draft-18 moved subscriber priority, group order, forward and the
+    /// subscription filter out of fixed fields and into parameters, and added
+    /// RENDEZVOUS_TIMEOUT (§10.2.6) for holding a subscription open until a
+    /// publisher appears. None of that is reachable without a way to attach
+    /// parameters, so this is the API that makes those features usable; the
+    /// no-parameter form above delegates here.
+    pub async fn subscribe_open_with_params(
+        &mut self,
+        track: serve::TrackWriter,
+        params: KeyValuePairs,
+    ) -> Result<Subscribe, ServeError> {
         let request_id = self
             .get_next_request_id()
             .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
@@ -369,7 +390,18 @@ impl Subscriber {
             names.insert(full_name, request_id);
         }
 
-        let (send, recv, subscribe) = Subscribe::new(self.clone(), request_id, track);
+        let (send, recv, subscribe) = match Subscribe::new(self.clone(), request_id, track, params)
+        {
+            Ok(subscribe) => subscribe,
+            Err(err) => {
+                if let Ok(mut names) = self.subscriber_names.lock() {
+                    names.remove_by_request_id(request_id);
+                }
+                return Err(ServeError::internal_ctx(format!(
+                    "invalid subscribe parameters: {err}"
+                )));
+            }
+        };
 
         // Open a bidi stream and send the SUBSCRIBE message BEFORE
         // registering in the subscribes map — avoids a leaked entry if
@@ -1282,6 +1314,8 @@ impl Subscriber {
             c if c == RequestErrorCode::InternalError as u64 => {
                 ServeError::internal_ctx(msg.reason.0.clone())
             }
+            // Preserve TIMEOUT as a semantic variant rather than an opaque code.
+            c if c == RequestErrorCode::Timeout as u64 => ServeError::Timeout,
             c if c == RequestErrorCode::DuplicateSubscription as u64 => ServeError::Duplicate,
             c if c == RequestErrorCode::NotSupported as u64 => {
                 ServeError::NotImplemented(msg.reason.0.clone())
@@ -1902,6 +1936,25 @@ mod tests {
         writer
     }
 
+    #[test]
+    fn request_frame_rejects_invalid_params_before_stream_open() {
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(0x100, vec![1]);
+        let msg = Message::Subscribe(message::Subscribe {
+            id: 0,
+            track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+            track_name: "video".into(),
+            params,
+        });
+
+        assert!(matches!(
+            super::super::encode_request_frame(&msg),
+            Err(SessionError::Encode(
+                crate::coding::EncodeError::InvalidValue
+            ))
+        ));
+    }
+
     /// `Subscribe::drop` must remove the request's entry from the subscribes map
     /// (the real Drop impl calls `Subscriber::remove_subscribe`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1909,8 +1962,13 @@ mod tests {
         let subscriber = test_subscriber(loopback_session().await);
         let request_id = 4;
 
-        let (subscribe, recv, _msg) =
-            Subscribe::new(subscriber.clone(), request_id, test_track("video"));
+        let (subscribe, recv, _msg) = Subscribe::new(
+            subscriber.clone(),
+            request_id,
+            test_track("video"),
+            Default::default(),
+        )
+        .unwrap();
         // Mimic subscribe_open: register the recv state under the request id.
         subscriber
             .subscribes
@@ -1945,8 +2003,13 @@ mod tests {
         let request_id = 6;
         let track_alias = 42;
 
-        let (subscribe, mut recv, _msg) =
-            Subscribe::new(subscriber.clone(), request_id, test_track("audio"));
+        let (subscribe, mut recv, _msg) = Subscribe::new(
+            subscriber.clone(),
+            request_id,
+            test_track("audio"),
+            Default::default(),
+        )
+        .unwrap();
         // Record the track alias while the Subscribe (the state's send half) is
         // still alive, so the recv state accepts the mutation. Then drop the
         // handle — its Drop runs against the still-empty map (a no-op) — and

@@ -122,12 +122,20 @@ macro_rules! message_types {
                     return Err(DecodeError::InvalidMessage(t));
                 }
 
+                if !msg.parameter_scopes_valid() {
+                    return Err(DecodeError::InvalidParameter);
+                }
+
                 Ok(msg)
             }
         }
 
         impl Encode for Message {
             fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+                if !self.parameter_scopes_valid() {
+                    return Err(EncodeError::InvalidValue);
+                }
+
                 match self {
                     $(Self::$name(ref m) => {
                         self.id().encode(w)?;
@@ -158,6 +166,25 @@ macro_rules! message_types {
                 match self {
                     $(Self::$name(_) => stringify!($name),)*
                 }
+            }
+
+            pub(crate) fn parameter_scopes_valid(&self) -> bool {
+                let params = match self {
+                    Self::RequestUpdate(m) => &m.params,
+                    Self::RequestOk(m) => &m.params,
+                    Self::Subscribe(m) => &m.params,
+                    Self::SubscribeOk(m) => &m.params,
+                    Self::PublishNamespace(m) => &m.params,
+                    Self::TrackStatus(m) => &m.params,
+                    Self::Publish(m) => &m.params,
+                    Self::PublishOk(m) => &m.params,
+                    Self::Fetch(m) => &m.params,
+                    Self::FetchOk(m) => &m.params,
+                    Self::SubscribeNamespace(m) => &m.params,
+                    _ => return true,
+                };
+
+                params.parameters_allowed_on(self.id())
             }
 
             /// Return the request ID if this message participates in request ID sequencing.
@@ -405,6 +432,47 @@ mod tests {
 
         let err = Message::decode(&mut buf).unwrap_err();
         assert!(matches!(err, DecodeError::InvalidMessage(0x100)));
+    }
+
+    #[test]
+    fn message_boundary_enforces_parameter_scope() {
+        let mut params = KeyValuePairs::default();
+        params.set_rendezvous_timeout(1_000);
+        let request_ok = RequestOk { id: 1, params };
+
+        let mut encoded = bytes::BytesMut::new();
+        let err = Message::RequestOk(request_ok.clone())
+            .encode(&mut encoded)
+            .unwrap_err();
+        assert!(matches!(err, EncodeError::InvalidValue));
+
+        encoded.clear();
+        let mut payload = bytes::BytesMut::new();
+        request_ok.encode(&mut payload).unwrap();
+        wire_id::RequestOk.encode(&mut encoded).unwrap();
+        (payload.len() as u16).encode(&mut encoded).unwrap();
+        encoded.extend_from_slice(&payload);
+
+        let err = Message::decode(&mut encoded).unwrap_err();
+        assert!(matches!(err, DecodeError::InvalidParameter));
+
+        let mut params = KeyValuePairs::default();
+        params.set_rendezvous_timeout(1_000);
+        params.set_bytesvalue(123, vec![1, 2, 3]);
+        let subscribe = Message::Subscribe(Subscribe {
+            id: 2,
+            track_namespace: namespace(),
+            track_name: "track".into(),
+            params,
+        });
+
+        encoded.clear();
+        subscribe.encode(&mut encoded).unwrap();
+        let Message::Subscribe(decoded) = Message::decode(&mut encoded).unwrap() else {
+            panic!("expected SUBSCRIBE");
+        };
+        assert_eq!(decoded.params.rendezvous_timeout().unwrap(), Some(1_000));
+        assert!(decoded.params.get(123).is_some());
     }
 
     #[test]

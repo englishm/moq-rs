@@ -6,12 +6,15 @@ use bytes::Buf as _;
 use crate::coding::{
     Decode, DecodeError, Encode, EncodeError, KeyValuePair, KeyValuePairs, Location, Value,
 };
-use crate::message::{FilterType, GroupOrder};
+use crate::message::{wire_id, FilterType, GroupOrder};
 
 /// Draft-16 message-parameter type IDs.
 pub mod parameter_type {
     pub const DELIVERY_TIMEOUT: u64 = 0x02;
     pub const AUTHORIZATION_TOKEN: u64 = 0x03;
+    /// draft-18 §10.2.6. Milliseconds a subscriber will wait for a publisher to
+    /// appear. Valid on SUBSCRIBE only, unlike the delivery timeouts.
+    pub const RENDEZVOUS_TIMEOUT: u64 = 0x04;
     pub const EXPIRES: u64 = 0x08;
     pub const LARGEST_OBJECT: u64 = 0x09;
     pub const FORWARD: u64 = 0x10;
@@ -37,6 +40,11 @@ pub const U8_VALUE_PARAMETER_TYPES: &[u64] = &[
     parameter_type::SUBSCRIBER_PRIORITY, // 0x20
     parameter_type::GROUP_ORDER,         // 0x22
 ];
+
+/// Message scopes enforced for supported parameters with restricted use.
+/// Unknown parameter types remain available for negotiated extensions.
+const MESSAGE_PARAMETER_SCOPES: &[(u64, &[u64])] =
+    &[(parameter_type::RENDEZVOUS_TIMEOUT, &[wire_id::Subscribe])];
 
 /// Draft-16 extension-header type IDs.
 pub mod extension_type {
@@ -286,6 +294,15 @@ impl KeyValuePairs {
         self.encode_with_u8_types(w, U8_VALUE_PARAMETER_TYPES)
     }
 
+    pub(crate) fn parameters_allowed_on(&self, message_type: u64) -> bool {
+        self.0.iter().all(|parameter| {
+            MESSAGE_PARAMETER_SCOPES
+                .iter()
+                .find(|(parameter_type, _)| *parameter_type == parameter.key)
+                .is_none_or(|(_, message_types)| message_types.contains(&message_type))
+        })
+    }
+
     fn int_parameter(&self, key: u64) -> Result<Option<u64>, DecodeError> {
         get_kvp_int(&self.0, key)
     }
@@ -384,6 +401,17 @@ impl KeyValuePairs {
         self.int_parameter(parameter_type::DELIVERY_TIMEOUT)
     }
 
+    pub fn set_rendezvous_timeout(&mut self, timeout_ms: u64) {
+        self.set_intvalue(parameter_type::RENDEZVOUS_TIMEOUT, timeout_ms);
+    }
+
+    /// Milliseconds the subscriber will wait for a publisher to become available
+    /// (draft-18 §10.2.6). `None` and `Some(0)` are equivalent in effect: the
+    /// spec's default is 0, meaning respond immediately rather than hold.
+    pub fn rendezvous_timeout(&self) -> Result<Option<u64>, DecodeError> {
+        self.int_parameter(parameter_type::RENDEZVOUS_TIMEOUT)
+    }
+
     pub fn set_new_group_request(&mut self, group_id: u64) {
         self.set_intvalue(parameter_type::NEW_GROUP_REQUEST, group_id);
     }
@@ -414,6 +442,7 @@ mod tests {
         params.set_expires(6);
         params.set_delivery_timeout(8);
         params.set_new_group_request(9);
+        params.set_rendezvous_timeout(30_000);
 
         assert_eq!(params.forward().unwrap(), Some(false));
         assert_eq!(params.subscriber_priority().unwrap(), Some(7));
@@ -423,6 +452,23 @@ mod tests {
         assert_eq!(params.expires().unwrap(), Some(6));
         assert_eq!(params.delivery_timeout().unwrap(), Some(8));
         assert_eq!(params.new_group_request().unwrap(), Some(9));
+        assert_eq!(params.rendezvous_timeout().unwrap(), Some(30_000));
+    }
+
+    /// 0x04 is even, so the KVP codec carries it as a varint. A peer sending a
+    /// byte string under that key is malformed rather than something to coerce.
+    #[test]
+    fn rendezvous_timeout_rejects_a_bytes_value() {
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(parameter_type::RENDEZVOUS_TIMEOUT, vec![1, 2, 3]);
+
+        assert!(params.rendezvous_timeout().is_err());
+    }
+
+    /// Absent means the spec default of 0: do not hold, answer immediately.
+    #[test]
+    fn rendezvous_timeout_absent_is_none() {
+        assert_eq!(KeyValuePairs::default().rendezvous_timeout().unwrap(), None);
     }
 
     #[test]

@@ -174,8 +174,17 @@ impl Publisher {
         };
         // Lock released here.
 
-        // Phase 2: open bidi stream and send (async, no lock held).
-        // If open_bi fails, remove the entry we inserted in Phase 1.
+        // Phase 2: encode before allocating a QUIC stream, then open and send
+        // (async, no lock held). Any failure removes the entry from Phase 1.
+        let frame = match super::encode_request_frame(&wire_msg) {
+            Ok(frame) => frame,
+            Err(e) => {
+                if let Ok(mut ns) = self.publish_namespaces.lock() {
+                    ns.remove(&tracks.namespace);
+                }
+                return Err(e);
+            }
+        };
         let (send_stream, recv_stream) = match self.webtransport.open_bi().await {
             Ok(streams) => streams,
             Err(e) => {
@@ -186,7 +195,7 @@ impl Publisher {
             }
         };
         let mut writer = super::Writer::new(send_stream);
-        if let Err(e) = writer.encode(&wire_msg).await {
+        if let Err(e) = writer.write(&frame).await {
             if let Ok(mut ns) = self.publish_namespaces.lock() {
                 ns.remove(&tracks.namespace);
             }
@@ -389,9 +398,11 @@ impl Publisher {
         request_id: u64,
         msg: message::Publish,
     ) -> Result<super::RequestStreamSink, SessionError> {
+        // Validate local parameters before consuming a peer request-stream slot.
+        let frame = super::encode_request_frame(&Message::Publish(msg))?;
         let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
         let mut writer = super::Writer::new(send_stream);
-        writer.encode(&Message::Publish(msg)).await?;
+        writer.write(&frame).await?;
 
         let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
         let mut this = self.clone();
@@ -1065,7 +1076,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::{
-        coding::{TrackName, TrackNamespace},
+        coding::{KeyValuePairs, TrackName, TrackNamespace},
+        message::{self, Message},
         serve::FullTrackName,
     };
 
@@ -1095,5 +1107,26 @@ mod tests {
         let names = subscribed_names.lock().unwrap();
         assert!(!names.contains_name(&unsubscribed_track));
         assert_eq!(names.get_by_name(&active_track), Some(8));
+    }
+
+    #[test]
+    fn publish_frame_rejects_subscribe_only_params_before_stream_open() {
+        let mut params = KeyValuePairs::default();
+        params.set_rendezvous_timeout(1_000);
+        let msg = Message::Publish(message::Publish {
+            id: 0,
+            track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+            track_name: "video".into(),
+            track_alias: 0,
+            params,
+            track_extensions: Default::default(),
+        });
+
+        assert!(matches!(
+            super::super::encode_request_frame(&msg),
+            Err(crate::session::SessionError::Encode(
+                crate::coding::EncodeError::InvalidValue
+            ))
+        ));
     }
 }

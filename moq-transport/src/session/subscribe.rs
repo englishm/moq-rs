@@ -89,6 +89,7 @@ impl SubscribeInfo {
             .unwrap_or(FilterType::AbsoluteStart);
         let start_location = filter.as_ref().and_then(|filter| filter.start_location);
         let end_group_id = filter.as_ref().and_then(|filter| filter.end_group_id);
+        msg.params.rendezvous_timeout()?;
 
         Ok(Self {
             id: msg.id,
@@ -175,31 +176,19 @@ pub struct Subscribe {
 }
 
 impl Subscribe {
-    fn build_info(request_id: u64, track: &TrackWriter) -> (message::Subscribe, SubscribeInfo) {
+    fn build_info(
+        request_id: u64,
+        track: &TrackWriter,
+        params: KeyValuePairs,
+    ) -> Result<(message::Subscribe, SubscribeInfo), SessionError> {
         let subscribe_message = message::Subscribe {
             id: request_id,
             track_namespace: track.namespace.clone(),
             track_name: track.name.clone(),
-            params: KeyValuePairs::default(),
+            params,
         };
-        let info = SubscribeInfo::new_from_subscribe(&subscribe_message).unwrap_or_else(|err| {
-            tracing::warn!(error = %err, "failed to decode outbound subscribe parameters");
-            SubscribeInfo {
-                id: request_id,
-                track_namespace: track.namespace.clone(),
-                track_name: track.name.clone(),
-                subscriber_priority: 128,
-                group_order: GroupOrder::Publisher,
-                forward: true,
-                filter_type: FilterType::AbsoluteStart,
-                start_location: None,
-                end_group_id: None,
-                filter: None,
-                params: Default::default(),
-                track_status: false,
-            }
-        });
-        (subscribe_message, info)
+        let info = SubscribeInfo::new_from_subscribe(&subscribe_message)?;
+        Ok((subscribe_message, info))
     }
 
     /// Create a Subscribe without sending on the control stream, returning the
@@ -210,10 +199,11 @@ impl Subscribe {
         subscriber: Subscriber,
         request_id: u64,
         track: TrackWriter,
-    ) -> (Subscribe, SubscribeRecv, message::Subscribe) {
-        let (msg, info) = Self::build_info(request_id, &track);
+        params: KeyValuePairs,
+    ) -> Result<(Subscribe, SubscribeRecv, message::Subscribe), SessionError> {
+        let (msg, info) = Self::build_info(request_id, &track, params)?;
         let (send, recv) = Self::from_parts(subscriber, info, track);
-        (send, recv, msg)
+        Ok((send, recv, msg))
     }
 
     fn from_parts(
@@ -516,7 +506,8 @@ mod tests {
         );
         let (writer, _reader) =
             crate::serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
-        let (send, recv, _msg) = Subscribe::new(subscriber, 0, writer);
+        let (send, recv, _msg) =
+            Subscribe::new(subscriber, 0, writer, KeyValuePairs::default()).unwrap();
         (send, recv)
     }
 
@@ -567,6 +558,60 @@ mod tests {
 
         assert!(recv.drain_timeout());
         assert_eq!(send.closed().await, Err(ServeError::Closed(0x6)));
+    }
+
+    #[test]
+    fn rendezvous_timeout_is_parsed_from_params() {
+        let mut params = KeyValuePairs::default();
+        params.set_rendezvous_timeout(30_000);
+
+        assert_eq!(
+            subscribe_info_with(params)
+                .params
+                .rendezvous_timeout()
+                .unwrap(),
+            Some(30_000)
+        );
+    }
+
+    #[test]
+    fn invalid_outbound_params_are_rejected() {
+        let (writer, _reader) =
+            crate::serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(message::parameter_type::RENDEZVOUS_TIMEOUT, vec![1]);
+
+        assert!(Subscribe::build_info(0, &writer, params).is_err());
+    }
+
+    /// Absent carries draft-18's default of 0, so a relay must not hold the
+    /// subscription. Kept as None rather than defaulted to 0 so a relay can tell
+    /// "not requested" from "explicitly zero" if it ever wants to.
+    #[test]
+    fn omitted_rendezvous_timeout_is_none() {
+        assert_eq!(
+            subscribe_info_with(KeyValuePairs::default())
+                .params
+                .rendezvous_timeout()
+                .unwrap(),
+            None
+        );
+    }
+
+    /// Zero is meaningful and distinct from absent on the wire, even though both
+    /// mean "answer immediately".
+    #[test]
+    fn explicit_zero_rendezvous_timeout_is_preserved() {
+        let mut params = KeyValuePairs::default();
+        params.set_rendezvous_timeout(0);
+
+        assert_eq!(
+            subscribe_info_with(params)
+                .params
+                .rendezvous_timeout()
+                .unwrap(),
+            Some(0)
+        );
     }
 
     #[test]
