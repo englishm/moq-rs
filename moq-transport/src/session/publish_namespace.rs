@@ -8,7 +8,7 @@ use crate::coding::TrackNamespace;
 use crate::watch::State;
 use crate::{message, serve::ServeError};
 
-use super::{Publisher, Subscribed, TrackStatusRequested};
+use super::{Publisher, Subscribed, TrackStatusRequested, CANCELLED_STREAM_CODE};
 
 /// Information about an outbound PUBLISH_NAMESPACE request.
 #[derive(Debug, Clone)]
@@ -49,11 +49,12 @@ impl Drop for PublishNamespaceState {
 
 /// Represents an outbound PUBLISH_NAMESPACE sent by a publisher.
 ///
-/// Dropped with PUBLISH_NAMESPACE_DONE unless already closed with an error.
-#[must_use = "send PUBLISH_NAMESPACE_DONE on drop"]
+/// Dropping the handle cancels the request stream unless the peer already closed it.
+#[must_use = "cancels PUBLISH_NAMESPACE on drop"]
 pub struct PublishNamespace {
     publisher: Publisher,
     state: State<PublishNamespaceState>,
+    cancel: Option<tokio::sync::oneshot::Sender<u32>>,
 
     pub info: PublishNamespaceInfo,
 }
@@ -65,7 +66,11 @@ impl PublishNamespace {
         publisher: Publisher,
         request_id: u64,
         namespace: TrackNamespace,
-    ) -> (PublishNamespace, PublishNamespaceRecv) {
+    ) -> (
+        PublishNamespace,
+        PublishNamespaceRecv,
+        tokio::sync::oneshot::Receiver<u32>,
+    ) {
         let info = PublishNamespaceInfo {
             request_id,
             namespace: namespace.clone(),
@@ -86,20 +91,26 @@ impl PublishNamespace {
         publisher: Publisher,
         info: PublishNamespaceInfo,
         request_id: u64,
-    ) -> (PublishNamespace, PublishNamespaceRecv) {
+    ) -> (
+        PublishNamespace,
+        PublishNamespaceRecv,
+        tokio::sync::oneshot::Receiver<u32>,
+    ) {
         let (send, recv) = State::default().split();
+        let (cancel, recv_cancel) = tokio::sync::oneshot::channel();
 
         let send = Self {
             publisher,
             info,
             state: send,
+            cancel: Some(cancel),
         };
         let recv = PublishNamespaceRecv {
             state: recv,
             request_id,
         };
 
-        (send, recv)
+        (send, recv, recv_cancel)
     }
 
     /// Wait until the namespace publish is closed (error or peer disconnect).
@@ -186,11 +197,10 @@ impl Drop for PublishNamespace {
             return;
         }
 
-        // Draft-16 §9.22: PUBLISH_NAMESPACE_DONE carries the Request ID,
-        // not the namespace.
-        self.publisher.send_message(message::PublishNamespaceDone {
-            id: self.info.request_id,
-        });
+        self.publisher.drop_publish_namespace(self.info.request_id);
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(CANCELLED_STREAM_CODE);
+        }
     }
 }
 
@@ -250,5 +260,34 @@ impl PublishNamespaceRecv {
             .track_statuses_requested
             .push_back(track_status_requested);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        coding::TrackNamespace,
+        session::{test_support::loopback_session, Publisher, RequestId},
+        watch::Queue,
+    };
+
+    use super::PublishNamespace;
+
+    #[tokio::test]
+    async fn drop_cancels_request_stream() {
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(
+            Queue::default(),
+            loopback_session().await,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (publish, _recv, cancel) =
+            PublishNamespace::new(publisher, 6, TrackNamespace::from_utf8_path("test"));
+
+        drop(publish);
+
+        assert_eq!(cancel.await.unwrap(), super::CANCELLED_STREAM_CODE);
     }
 }

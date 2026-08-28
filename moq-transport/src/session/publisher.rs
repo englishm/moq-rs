@@ -136,6 +136,23 @@ pub struct Publisher {
     pub(super) bidi_response_map: BidiResponseMap,
 }
 
+struct PublishNamespaceCleanup {
+    publisher: Publisher,
+    request_id: u64,
+}
+
+enum PublishNamespaceEvent {
+    Cancel(Result<u32, tokio::sync::oneshot::error::RecvError>),
+    Response(Result<Message, SessionError>),
+    Stopped(Result<Option<u8>, SessionError>),
+}
+
+impl Drop for PublishNamespaceCleanup {
+    fn drop(&mut self) {
+        self.publisher.abort_publish_namespace(self.request_id);
+    }
+}
+
 impl Publisher {
     pub(crate) fn new(
         outgoing: Queue<Message>,
@@ -187,7 +204,7 @@ impl Publisher {
     /// concurrently, since `run` polls the bidi response reader.
     pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
         // Phase 1: allocate under lock, release before any await.
-        let (publish_ns, wire_msg, request_id) = {
+        let (publish_ns, wire_msg, request_id, cancel) = {
             let mut namespaces = self
                 .publish_namespaces
                 .lock()
@@ -198,64 +215,16 @@ impl Publisher {
             }
 
             let request_id = self.request_id.allocate()?;
-            let (send, recv) =
+            let (send, recv, cancel) =
                 PublishNamespace::new(self.clone(), request_id, tracks.namespace.clone());
             namespaces.insert(tracks.namespace.clone(), recv);
-            let wire_msg: Message = send.wire_message().into();
-            (send, wire_msg, request_id)
+            let wire_msg = send.wire_message();
+            (send, wire_msg, request_id, cancel)
         };
         // Lock released here.
 
-        // Phase 2: encode before allocating a QUIC stream, then open and send
-        // (async, no lock held). Any failure removes the entry from Phase 1.
-        let frame = match super::encode_request_frame(&wire_msg) {
-            Ok(frame) => frame,
-            Err(e) => {
-                if let Ok(mut ns) = self.publish_namespaces.lock() {
-                    ns.remove(&tracks.namespace);
-                }
-                return Err(e);
-            }
-        };
-        let (send_stream, recv_stream) = match self.webtransport.open_bi().await {
-            Ok(streams) => streams,
-            Err(e) => {
-                if let Ok(mut ns) = self.publish_namespaces.lock() {
-                    ns.remove(&tracks.namespace);
-                }
-                return Err(e.into());
-            }
-        };
-        let mut writer = super::Writer::new(send_stream);
-        if let Err(e) = writer.write(&frame).await {
-            if let Ok(mut ns) = self.publish_namespaces.lock() {
-                ns.remove(&tracks.namespace);
-            }
-            return Err(e);
-        }
-
-        // Hand a reader future for responses on this bidi stream to
-        // Session::run, which polls it cooperatively (structured concurrency).
-        // Draft-18: responses omit Request ID (the stream identity provides it).
-        // No task is spawned; the future is dropped/cancelled on session exit.
-        let mut this = self.clone();
-        let bidi_request_id = request_id;
-        let _ = self.bidi_task_tx.send(Box::pin(async move {
-            let mut reader = super::Reader::new(recv_stream);
-            loop {
-                match Session::decode_bidi_response(&mut reader, bidi_request_id).await {
-                    Ok(msg) => {
-                        if let Ok(sub_msg) = TryInto::<message::Subscriber>::try_into(msg) {
-                            // Propagate instead of logging: Session::run closes the
-                            // session for protocol violations and ignores the rest.
-                            this.recv_message(sub_msg)?;
-                        }
-                    }
-                    Err(err) if err.is_stream_ended() => return Ok(()),
-                    Err(err) => return Err(err),
-                }
-            }
-        }));
+        self.open_publish_namespace_stream(request_id, wire_msg, cancel)
+            .await?;
 
         let mut subscribe_tasks = FuturesUnordered::new();
         let mut status_tasks = FuturesUnordered::new();
@@ -305,6 +274,118 @@ impl Publisher {
                 else => return Ok(()),
             }
         }
+    }
+
+    /// Open a PUBLISH_NAMESPACE request stream and cancel both halves when the
+    /// application drops the publish.
+    async fn open_publish_namespace_stream(
+        &mut self,
+        request_id: u64,
+        msg: message::PublishNamespace,
+        mut cancel: tokio::sync::oneshot::Receiver<u32>,
+    ) -> Result<(), SessionError> {
+        let frame = super::encode_request_frame(&Message::PublishNamespace(msg))?;
+        let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
+        let mut writer = super::Writer::new(send_stream);
+        writer.write(&frame).await?;
+
+        let mut this = self.clone();
+        let cleanup = PublishNamespaceCleanup {
+            publisher: this.clone(),
+            request_id,
+        };
+
+        if self
+            .bidi_task_tx
+            .send(Box::pin(async move {
+                let _cleanup = cleanup;
+                let mut reader = super::Reader::new(recv_stream);
+                let mut reading = true;
+                let mut responded = false;
+                let mut request_stopped = false;
+
+                loop {
+                    let event = tokio::select! {
+                        reset = &mut cancel => PublishNamespaceEvent::Cancel(reset),
+                        response = Session::decode_bidi_response(&mut reader, request_id), if reading => {
+                            PublishNamespaceEvent::Response(response)
+                        }
+                        stopped = writer.closed(), if !request_stopped => {
+                            PublishNamespaceEvent::Stopped(stopped)
+                        }
+                    };
+
+                    match event {
+                        PublishNamespaceEvent::Cancel(reset) => {
+                            if let Ok(code) = reset {
+                                writer.reset(code);
+                                reader.stop(code);
+                            }
+                            return Ok(());
+                        }
+                        PublishNamespaceEvent::Stopped(stopped) => {
+                            let _ = stopped?;
+                            if responded {
+                                reader.stop(super::CANCELLED_STREAM_CODE);
+                                return Ok(());
+                            }
+                            request_stopped = true;
+                        }
+                        PublishNamespaceEvent::Response(Ok(Message::RequestOk(msg))) => {
+                            if responded {
+                                return Err(SessionError::ProtocolViolation(
+                                    "multiple responses to PUBLISH_NAMESPACE".to_string(),
+                                ));
+                            }
+                            responded = true;
+                            this.recv_publish_namespace_ok(&msg)?;
+                            if request_stopped {
+                                reader.stop(super::CANCELLED_STREAM_CODE);
+                                return Ok(());
+                            }
+                        }
+                        PublishNamespaceEvent::Response(Ok(Message::RequestError(msg))) => {
+                            if responded {
+                                return Err(SessionError::ProtocolViolation(
+                                    "multiple responses to PUBLISH_NAMESPACE".to_string(),
+                                ));
+                            }
+                            this.recv_request_error(msg)?;
+                            let _ = writer.finish();
+                            return Ok(());
+                        }
+                        PublishNamespaceEvent::Response(Ok(msg)) => {
+                            return Err(SessionError::ProtocolViolation(format!(
+                                "unexpected {} on PUBLISH_NAMESPACE request stream",
+                                msg.name()
+                            )));
+                        }
+                        PublishNamespaceEvent::Response(Err(err)) if err.is_stream_error() => {
+                            writer.reset(super::CANCELLED_STREAM_CODE);
+                            return Ok(());
+                        }
+                        PublishNamespaceEvent::Response(Err(err)) if err.is_stream_ended() => {
+                            if !responded {
+                                return Ok(());
+                            }
+                            tracing::debug!(
+                                request_id,
+                                "PUBLISH_NAMESPACE response stream finished after acceptance"
+                            );
+                            reading = false;
+                        }
+                        PublishNamespaceEvent::Response(Err(err)) => {
+                            return Err(err);
+                        }
+                    }
+                }
+            }))
+            .is_err()
+        {
+            return Err(SessionError::Internal);
+        }
+
+        Ok(())
     }
 
     /// Offer a single track to the peer with PUBLISH (draft-18 §10.13).
@@ -815,8 +896,10 @@ impl Publisher {
             message::Subscriber::SubscribeNamespace(msg) => {
                 self.send_not_supported(msg.id, "subscribe_namespace");
             }
-            message::Subscriber::PublishNamespaceCancel(msg) => {
-                self.recv_publish_namespace_cancel(msg)?;
+            message::Subscriber::PublishNamespaceCancel(_) => {
+                return Err(SessionError::ProtocolViolation(
+                    "PUBLISH_NAMESPACE_CANCEL is not part of draft-18".to_string(),
+                ));
             }
             // Draft-18 removed the dedicated PUBLISH_OK type in favour of
             // REQUEST_OK, so we never send it. Accepting it on receive keeps
@@ -953,17 +1036,6 @@ impl Publisher {
             self.log_request_ok_parsed("publish", msg);
         }
         Ok(matched)
-    }
-
-    fn recv_publish_namespace_cancel(
-        &mut self,
-        msg: message::PublishNamespaceCancel,
-    ) -> Result<(), SessionError> {
-        // Draft-16 §9.24: PUBLISH_NAMESPACE_CANCEL now carries Request ID.
-        if let Some(recv) = self.drop_publish_namespace(msg.id) {
-            recv.recv_error(ServeError::Cancel)?;
-        }
-        Ok(())
     }
 
     fn recv_subscribe(&mut self, msg: message::Subscribe) -> Result<(), SessionError> {
@@ -1116,10 +1188,10 @@ impl Publisher {
         msg: T,
     ) -> message::Publisher {
         let msg = msg.into();
-        // Draft-16: PUBLISH_NAMESPACE_DONE carries Request ID, not namespace.
-        // Dropping the recv state signals that the namespace is done.
         if let message::Publisher::PublishNamespaceDone(m) = &msg {
             let _ = self.drop_publish_namespace(m.id);
+        } else if let message::Publisher::PublishDone(m) = &msg {
+            self.drop_subscribe(m.id);
         }
         msg
     }
@@ -1163,7 +1235,7 @@ impl Publisher {
         Ok(())
     }
 
-    fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishNamespaceRecv> {
+    pub(super) fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishNamespaceRecv> {
         if let Ok(mut ns) = self.publish_namespaces.lock() {
             let key = ns
                 .iter()
@@ -1174,6 +1246,19 @@ impl Publisher {
             }
         }
         None
+    }
+
+    fn abort_publish_namespace(&mut self, id: u64) {
+        let Some(recv) = self.drop_publish_namespace(id) else {
+            return;
+        };
+        if let Err(err) = recv.recv_error(ServeError::Cancel) {
+            tracing::debug!(
+                request_id = id,
+                error = %err,
+                "failed to fail aborted PUBLISH_NAMESPACE"
+            );
+        }
     }
 
     pub(super) async fn open_uni(&mut self) -> Result<web_transport::SendStream, SessionError> {
@@ -1190,17 +1275,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::{
-        coding::{KeyValuePairs, TrackName, TrackNamespace},
+        coding::{KeyValuePairs, ReasonPhrase, TrackName, TrackNamespace},
         data,
         message::{self, Message},
-        serve::{self, FullTrackName},
+        serve::{self, FullTrackName, ServeError},
         session::{test_support::loopback_session_pair, Reader, RequestId, Session, Writer},
+        watch::Queue,
     };
     use bytes::Bytes;
 
     use super::{
         split_published_state, AbortPublishedOnDrop, NameRegistry, PublishedEntry, PublishedRecv,
-        Publisher,
+        PublishNamespace, Publisher,
     };
 
     fn full_track_name(namespace: &str, name: &str) -> FullTrackName {
@@ -1579,5 +1665,196 @@ mod tests {
             .contains_name(&full_track_name("test", "track")));
         drop(subgroup);
         drop(subgroups);
+    }
+
+    #[tokio::test]
+    async fn legacy_namespace_cancel_is_a_protocol_violation() {
+        let (client, _server) = loopback_session_pair().await;
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut publisher = Publisher::new(
+            Queue::default(),
+            client,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+
+        let err = publisher
+            .recv_message(message::Subscriber::PublishNamespaceCancel(
+                message::PublishNamespaceCancel {
+                    id: 0,
+                    error_code: 1,
+                    reason_phrase: ReasonPhrase("cancelled".to_string()),
+                },
+            ))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::session::SessionError::ProtocolViolation(reason)
+                if reason == "PUBLISH_NAMESPACE_CANCEL is not part of draft-18"
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_namespace_survives_response_fin_until_local_cancel() {
+        let (client, server) = loopback_session_pair().await;
+        let (bidi_task_tx, mut bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut publisher = Publisher::new(
+            Queue::default(),
+            client,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let namespace = TrackNamespace::from_utf8_path("test");
+        let (publish, recv, cancel) =
+            PublishNamespace::new(publisher.clone(), 0, namespace.clone());
+        publisher
+            .publish_namespaces
+            .lock()
+            .unwrap()
+            .insert(namespace, recv);
+        publisher
+            .open_publish_namespace_stream(0, publish.wire_message(), cancel)
+            .await
+            .unwrap();
+
+        let pump = tokio::spawn(bidi_task_rx.recv().await.unwrap());
+        let (peer_send, peer_recv) = server.accept_bi().await.unwrap();
+        let mut peer_writer = Writer::new(peer_send);
+        let mut peer_reader = Reader::new(peer_recv);
+        assert!(matches!(
+            peer_reader.decode::<Message>().await.unwrap(),
+            Message::PublishNamespace(_)
+        ));
+        Session::encode_bidi_response(
+            &mut peer_writer,
+            &Message::RequestOk(message::RequestOk {
+                id: 0,
+                params: Default::default(),
+            }),
+        )
+        .await
+        .unwrap();
+        peer_writer.finish().unwrap();
+
+        publish.ok().await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), publish.closed())
+                .await
+                .is_err()
+        );
+
+        drop(publish);
+
+        pump.await.unwrap().unwrap();
+        let reset = peer_reader.done().await.unwrap_err();
+        assert!(reset.is_stream_error());
+    }
+
+    #[tokio::test]
+    async fn response_reset_closes_accepted_namespace() {
+        let (client, server) = loopback_session_pair().await;
+        let (bidi_task_tx, mut bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut publisher = Publisher::new(
+            Queue::default(),
+            client,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let namespace = TrackNamespace::from_utf8_path("test");
+        let (publish, recv, cancel) =
+            PublishNamespace::new(publisher.clone(), 0, namespace.clone());
+        publisher
+            .publish_namespaces
+            .lock()
+            .unwrap()
+            .insert(namespace, recv);
+        publisher
+            .open_publish_namespace_stream(0, publish.wire_message(), cancel)
+            .await
+            .unwrap();
+
+        let pump = tokio::spawn(bidi_task_rx.recv().await.unwrap());
+        let (peer_send, peer_recv) = server.accept_bi().await.unwrap();
+        let mut peer_writer = Writer::new(peer_send);
+        let mut peer_reader = Reader::new(peer_recv);
+        assert!(matches!(
+            peer_reader.decode::<Message>().await.unwrap(),
+            Message::PublishNamespace(_)
+        ));
+        Session::encode_bidi_response(
+            &mut peer_writer,
+            &Message::RequestOk(message::RequestOk {
+                id: 0,
+                params: Default::default(),
+            }),
+        )
+        .await
+        .unwrap();
+        publish.ok().await.unwrap();
+
+        peer_writer.reset(super::super::CANCELLED_STREAM_CODE);
+
+        assert!(matches!(publish.closed().await, Err(ServeError::Cancel)));
+        pump.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_stop_does_not_discard_namespace_rejection() {
+        let (client, server) = loopback_session_pair().await;
+        let (bidi_task_tx, mut bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut publisher = Publisher::new(
+            Queue::default(),
+            client,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let namespace = TrackNamespace::from_utf8_path("test");
+        let (publish, recv, cancel) =
+            PublishNamespace::new(publisher.clone(), 0, namespace.clone());
+        publisher
+            .publish_namespaces
+            .lock()
+            .unwrap()
+            .insert(namespace, recv);
+        publisher
+            .open_publish_namespace_stream(0, publish.wire_message(), cancel)
+            .await
+            .unwrap();
+
+        let pump = tokio::spawn(bidi_task_rx.recv().await.unwrap());
+        let (peer_send, peer_recv) = server.accept_bi().await.unwrap();
+        let mut peer_writer = Writer::new(peer_send);
+        let mut peer_reader = Reader::new(peer_recv);
+        assert!(matches!(
+            peer_reader.decode::<Message>().await.unwrap(),
+            Message::PublishNamespace(_)
+        ));
+
+        peer_reader.stop(super::super::CANCELLED_STREAM_CODE);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        Session::encode_bidi_response(
+            &mut peer_writer,
+            &Message::RequestError(message::RequestError {
+                id: 0,
+                error_code: message::RequestErrorCode::Uninterested as u64,
+                retry_interval: 0,
+                reason: crate::coding::ReasonPhrase("not interested".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        peer_writer.finish().unwrap();
+
+        assert!(matches!(
+            publish.ok().await,
+            Err(ServeError::Closed(code))
+                if code == message::RequestErrorCode::Uninterested as u64
+        ));
+        pump.await.unwrap().unwrap();
     }
 }

@@ -149,7 +149,7 @@ impl TrackAliasRegistry {
 #[derive(Clone)]
 pub struct Subscriber {
     /// Active inbound PUBLISH_NAMESPACE messages, keyed by namespace.
-    published_namespaces: Arc<Mutex<HashMap<TrackNamespace, PublishedNamespaceRecv>>>,
+    published_namespaces: Arc<Mutex<HashMap<TrackNamespace, u64>>>,
 
     /// Queue of inbound PUBLISH_NAMESPACE events waiting to be consumed by the application.
     published_namespace_queue: Queue<PublishedNamespace>,
@@ -316,11 +316,6 @@ impl Subscriber {
 
     fn log_request_error_created(&self, request_kind: &str, msg: &message::RequestError) {
         self.add_mlog_event(|time| mlog::events::request_error_created(time, 0, request_kind, msg));
-    }
-
-    pub(super) fn send_request_ok(&mut self, request_kind: &str, msg: message::RequestOk) {
-        self.add_mlog_event(|time| mlog::events::request_ok_created(time, 0, request_kind, &msg));
-        self.send_message(msg);
     }
 
     pub(super) fn send_request_error(&mut self, request_kind: &str, msg: message::RequestError) {
@@ -641,13 +636,6 @@ impl Subscriber {
     pub(super) fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
         let msg = msg.into();
 
-        // Remove our entry on terminal state.
-        // Draft-16: PUBLISH_NAMESPACE_CANCEL carries Request ID, so look up
-        // the namespace by iterating the map.
-        if let message::Subscriber::PublishNamespaceCancel(msg) = &msg {
-            let _ = self.drop_publish_namespace(msg.id);
-        }
-
         // TODO report dropped messages?
         let _ = self.outgoing.push(msg.into());
     }
@@ -655,9 +643,15 @@ impl Subscriber {
     /// Receive a message from the publisher via the control stream.
     pub(super) fn recv_message(&mut self, msg: message::Publisher) -> Result<(), SessionError> {
         match &msg {
-            message::Publisher::PublishNamespace(msg) => self.recv_publish_namespace(msg)?,
-            message::Publisher::PublishNamespaceDone(msg) => {
-                self.recv_publish_namespace_done(msg)?;
+            message::Publisher::PublishNamespace(_) => {
+                return Err(SessionError::ProtocolViolation(
+                    "PUBLISH_NAMESPACE must start a request stream".to_string(),
+                ));
+            }
+            message::Publisher::PublishNamespaceDone(_) => {
+                return Err(SessionError::ProtocolViolation(
+                    "PUBLISH_NAMESPACE_DONE is not part of draft-18".to_string(),
+                ));
             }
             message::Publisher::Publish(msg) => self.recv_publish(msg)?,
             message::Publisher::PublishDone(msg) => self.recv_publish_done(msg)?,
@@ -679,42 +673,28 @@ impl Subscriber {
     }
 
     /// Handle reception of an inbound PUBLISH_NAMESPACE from the publisher.
-    fn recv_publish_namespace(
+    pub(super) fn recv_publish_namespace(
         &mut self,
         msg: &message::PublishNamespace,
-    ) -> Result<(), SessionError> {
+    ) -> Result<PublishedNamespaceRecv, SessionError> {
         let mut published_namespaces = self
             .published_namespaces
             .lock()
             .map_err(|_| SessionError::Internal)?;
 
         // Duplicate PUBLISH_NAMESPACE for the same namespace within a session is invalid.
-        let entry = match published_namespaces.entry(msg.track_namespace.clone()) {
+        match published_namespaces.entry(msg.track_namespace.clone()) {
             hash_map::Entry::Occupied(_) => return Err(SessionError::Duplicate),
-            hash_map::Entry::Vacant(entry) => entry,
+            hash_map::Entry::Vacant(entry) => entry.insert(msg.id),
         };
+        drop(published_namespaces);
 
         let (published_ns, recv) =
             PublishedNamespace::new(self.clone(), msg.id, msg.track_namespace.clone());
         if let Err(published_ns) = self.published_namespace_queue.push(published_ns) {
             published_ns.close(ServeError::Cancel)?;
-            return Ok(());
         }
-        entry.insert(recv);
-
-        Ok(())
-    }
-
-    /// Handle reception of PUBLISH_NAMESPACE_DONE from the publisher.
-    fn recv_publish_namespace_done(
-        &mut self,
-        msg: &message::PublishNamespaceDone,
-    ) -> Result<(), SessionError> {
-        // Draft-16 §9.22: PUBLISH_NAMESPACE_DONE carries Request ID, not namespace.
-        if let Some(recv) = self.drop_publish_namespace(msg.id) {
-            recv.recv_done()?;
-        }
-        Ok(())
+        Ok(recv)
     }
 
     /// Handle the reception of a SubscribeOk message from the publisher.
@@ -1420,17 +1400,16 @@ impl Subscriber {
         }
     }
 
-    fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishedNamespaceRecv> {
+    pub(super) fn remove_published_namespace(&self, id: u64) {
         if let Ok(mut ns) = self.published_namespaces.lock() {
             let key = ns
                 .iter()
-                .find(|(_k, v)| v.request_id == id)
+                .find(|(_k, request_id)| **request_id == id)
                 .map(|(k, _)| k.clone());
             if let Some(key) = key {
-                return ns.remove(&key);
+                ns.remove(&key);
             }
         }
-        None
     }
 
     /// Resolve a Track Alias to its owning subscription, waiting up to the
