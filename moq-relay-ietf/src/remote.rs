@@ -29,6 +29,94 @@ type RemoteSlot = Arc<Mutex<Option<Remote>>>;
 type TrackCacheKey = (TrackNamespace, TrackName);
 type TrackSlot = Arc<Mutex<Option<CachedTrack>>>;
 
+struct EmptyRemoteSlotCleanup {
+    remotes: Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
+    key: RemoteCacheKey,
+    slot: RemoteSlot,
+    armed: bool,
+}
+
+impl EmptyRemoteSlotCleanup {
+    fn new(
+        remotes: Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
+        key: RemoteCacheKey,
+        slot: RemoteSlot,
+    ) -> Self {
+        Self {
+            remotes,
+            key,
+            slot,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EmptyRemoteSlotCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let remotes = self.remotes.clone();
+        let key = self.key.clone();
+        let slot = self.slot.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // The map uses an async mutex, so a cancelled routing future hands
+            // cleanup to a detached task after releasing its slot lock.
+            std::mem::drop(runtime.spawn(async move {
+                remove_empty_remote_slot(&remotes, &key, &slot).await;
+            }));
+        }
+    }
+}
+
+struct EmptyTrackSlotCleanup {
+    tracks: Arc<Mutex<HashMap<TrackCacheKey, TrackSlot>>>,
+    key: TrackCacheKey,
+    slot: TrackSlot,
+    armed: bool,
+}
+
+impl EmptyTrackSlotCleanup {
+    fn new(
+        tracks: Arc<Mutex<HashMap<TrackCacheKey, TrackSlot>>>,
+        key: TrackCacheKey,
+        slot: TrackSlot,
+    ) -> Self {
+        Self {
+            tracks,
+            key,
+            slot,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EmptyTrackSlotCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let tracks = self.tracks.clone();
+        let key = self.key.clone();
+        let slot = self.slot.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            std::mem::drop(runtime.spawn(async move {
+                remove_empty_track_slot(&tracks, &key, &slot).await;
+            }));
+        }
+    }
+}
+
 /// A cached cross-relay track reader plus the downstream interest in it.
 #[derive(Clone)]
 struct CachedTrack {
@@ -90,6 +178,43 @@ mod tests {
         }
     }
 
+    struct FoundCoordinator;
+
+    #[async_trait::async_trait]
+    impl Coordinator for FoundCoordinator {
+        async fn register_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+            _context: &crate::CoordinatorContext,
+        ) -> crate::CoordinatorResult<crate::NamespaceRegistration> {
+            Ok(crate::NamespaceRegistration::new(()))
+        }
+
+        async fn unregister_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> crate::CoordinatorResult<()> {
+            Ok(())
+        }
+
+        async fn lookup(
+            &self,
+            _scope: Option<&str>,
+            namespace: &TrackNamespace,
+        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
+            Ok((
+                crate::NamespaceOrigin::new(
+                    namespace.clone(),
+                    Url::parse("https://relay.example.com/live").unwrap(),
+                    None,
+                ),
+                None,
+            ))
+        }
+    }
+
     #[test]
     fn new_uses_default_session_config() {
         let manager = RemoteManager::new(Arc::new(NoopCoordinator), vec![]);
@@ -104,6 +229,43 @@ mod tests {
             RemoteManager::new_with_session_config(Arc::new(NoopCoordinator), vec![], config);
 
         assert_eq!(manager.session_config, config);
+    }
+
+    #[tokio::test]
+    async fn namespace_not_found_counts_as_successful_coordinator_lookup() {
+        let manager = RemoteManager::new(Arc::new(NoopCoordinator), vec![]);
+        let mut lookup_succeeded = false;
+
+        let result = manager
+            .subscribe_with_lookup_status(
+                None,
+                &TrackNamespace::from_utf8_path("example.com"),
+                "video",
+                &mut lookup_succeeded,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert!(lookup_succeeded);
+    }
+
+    #[tokio::test]
+    async fn successful_coordinator_lookup_survives_later_connection_error() {
+        let manager = RemoteManager::new(Arc::new(FoundCoordinator), vec![]);
+        let mut lookup_succeeded = false;
+
+        let result = manager
+            .subscribe_with_lookup_status(
+                None,
+                &TrackNamespace::from_utf8_path("example.com"),
+                "video",
+                &mut lookup_succeeded,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(lookup_succeeded);
     }
 
     #[test]
@@ -162,6 +324,59 @@ mod tests {
             err.to_string().contains("no QUIC clients configured"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_connection_cleanup_removes_an_empty_slot() {
+        let remotes = Arc::new(Mutex::new(HashMap::new()));
+        let key = (Url::parse("https://relay.example.com/live").unwrap(), None);
+        let slot = Arc::new(Mutex::new(None));
+        remotes.lock().await.insert(key.clone(), slot.clone());
+
+        drop(EmptyRemoteSlotCleanup::new(
+            remotes.clone(),
+            key.clone(),
+            slot,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !remotes.lock().await.contains_key(&key) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled connection cleanup should remove its empty slot");
+    }
+
+    #[tokio::test]
+    async fn cancelled_subscribe_cleanup_removes_an_empty_track_slot() {
+        let tracks = Arc::new(Mutex::new(HashMap::new()));
+        let key = (
+            TrackNamespace::from_utf8_path("example.com"),
+            TrackName::from("video"),
+        );
+        let slot = Arc::new(Mutex::new(None));
+        tracks.lock().await.insert(key.clone(), slot.clone());
+
+        drop(EmptyTrackSlotCleanup::new(
+            tracks.clone(),
+            key.clone(),
+            slot,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !tracks.lock().await.contains_key(&key) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled subscribe cleanup should remove its empty slot");
     }
 
     fn cached_track() -> (TrackSlot, TrackInterest) {
@@ -297,6 +512,23 @@ impl RemoteManager {
         namespace: &TrackNamespace,
         track_name: impl Into<TrackName>,
     ) -> anyhow::Result<Option<(TrackReader, TrackInterestGuard)>> {
+        let mut coordinator_lookup_succeeded = false;
+        self.subscribe_with_lookup_status(
+            scope,
+            namespace,
+            track_name,
+            &mut coordinator_lookup_succeeded,
+        )
+        .await
+    }
+
+    pub(crate) async fn subscribe_with_lookup_status(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+        track_name: impl Into<TrackName>,
+        coordinator_lookup_succeeded: &mut bool,
+    ) -> anyhow::Result<Option<(TrackReader, TrackInterestGuard)>> {
         let track_name = track_name.into();
 
         // Coordinator::lookup_track is the ergonomic routing entry point: it
@@ -307,8 +539,14 @@ impl RemoteManager {
             .lookup_track(scope, namespace, &track_name.to_string())
             .await
         {
-            Ok(result) => result,
-            Err(CoordinatorError::NamespaceNotFound) => return Ok(None),
+            Ok(result) => {
+                *coordinator_lookup_succeeded = true;
+                result
+            }
+            Err(CoordinatorError::NamespaceNotFound) => {
+                *coordinator_lookup_succeeded = true;
+                return Ok(None);
+            }
             Err(err) => return Err(err.into()),
         };
 
@@ -425,6 +663,9 @@ impl RemoteManager {
                     .clone()
             };
 
+            let cleanup =
+                EmptyRemoteSlotCleanup::new(self.remotes.clone(), cache_key.clone(), slot.clone());
+
             let mut cached = slot.lock().await;
 
             let is_current_slot = {
@@ -433,12 +674,15 @@ impl RemoteManager {
             };
 
             if !is_current_slot {
+                cleanup.disarm();
                 continue;
             }
 
             if let Some(remote) = cached.as_ref() {
                 if remote.is_connected() {
-                    return Ok(remote.clone());
+                    let remote = remote.clone();
+                    cleanup.disarm();
+                    return Ok(remote);
                 }
 
                 tracing::info!(remote_url = %cache_key.0, "removing dead connection to remote relay");
@@ -467,11 +711,13 @@ impl RemoteManager {
                 Err(err) => {
                     drop(cached);
                     remove_empty_remote_slot(&self.remotes, &cache_key, &slot).await;
+                    cleanup.disarm();
                     return Err(err);
                 }
             };
 
             *cached = Some(remote.clone());
+            cleanup.disarm();
             return Ok(remote);
         }
     }
@@ -786,6 +1032,9 @@ impl Remote {
                     .clone()
             };
 
+            let cleanup =
+                EmptyTrackSlotCleanup::new(self.tracks.clone(), key.clone(), slot.clone());
+
             let mut cached = slot.lock().await;
 
             let is_current_slot = {
@@ -794,6 +1043,7 @@ impl Remote {
             };
 
             if !is_current_slot {
+                cleanup.disarm();
                 continue;
             }
 
@@ -801,7 +1051,9 @@ impl Remote {
                 if !entry.reader.is_closed() {
                     // Register interest while still holding the slot lock, which
                     // is the same lock idle eviction re-checks under.
-                    return Ok(Some((entry.reader.clone(), entry.interest.guard())));
+                    let result = Some((entry.reader.clone(), entry.interest.guard()));
+                    cleanup.disarm();
+                    return Ok(result);
                 }
 
                 tracing::debug!(remote_url = %self.url, namespace = %key.0, track = %key.1, "removing closed remote track from cache");
@@ -820,9 +1072,7 @@ impl Remote {
             let subscribe_result = tokio::select! {
                 result = subscriber.subscribe_open(writer) => result,
                 _ = cancel.cancelled() => {
-                    drop(cached);
-                    remove_empty_track_slot(&self.tracks, &key, &slot).await;
-                    anyhow::bail!("subscribe cancelled, remote connection to {} is closed", self.url);
+                    Err(moq_transport::serve::ServeError::Cancel)
                 }
             };
 
@@ -831,6 +1081,7 @@ impl Remote {
                 Err(err) => {
                     drop(cached);
                     remove_empty_track_slot(&self.tracks, &key, &slot).await;
+                    cleanup.disarm();
                     return Err(err.into());
                 }
             };
@@ -838,6 +1089,7 @@ impl Remote {
             if !self.is_connected() {
                 drop(cached);
                 remove_empty_track_slot(&self.tracks, &key, &slot).await;
+                cleanup.disarm();
                 anyhow::bail!("remote connection to {} is closed", self.url);
             }
 
@@ -851,6 +1103,7 @@ impl Remote {
                 reader: reader.clone(),
                 interest: interest.clone(),
             });
+            cleanup.disarm();
             drop(cached);
 
             let cleanup_key = key.clone();

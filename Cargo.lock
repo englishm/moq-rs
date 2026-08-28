@@ -1344,6 +1344,8 @@ dependencies = [
  "moq-api",
  "moq-native-ietf",
  "moq-transport",
+ "rcgen",
+ "rustls 0.23.31",
  "serde",
  "serde_json",
  "thiserror 2.0.17",

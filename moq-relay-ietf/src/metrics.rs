@@ -30,6 +30,8 @@
 //! | `moq_relay_subscribe_not_found_total` | - | Track not found after checking all sources |
 //! | `moq_relay_subscribe_route_errors_total` | - | Infrastructure failure when routing to remote |
 //! | `moq_relay_subscribe_upstream_errors_total` | - | Upstream subscription could not be established, so the downstream SUBSCRIBE was rejected |
+//! | `moq_relay_rendezvous_timeouts_total` | - | Rendezvous holds that ended with REQUEST_ERROR TIMEOUT |
+//! | `moq_relay_rendezvous_rejections_total` | - | Rendezvous requests rejected with EXCESSIVE_LOAD because relay or session capacity was full |
 //! | `moq_relay_upstream_errors_total` | `stage` | Upstream connection failures (stage: connect, session) |
 //! | `moq_relay_namespace_transition_timeouts_total` | - | Namespace pull streams reset after graceful transition timeout |
 //! | `moq_relay_cache_idle_evictions_total` | `source` | Unwatched cache entries evicted, releasing an upstream subscription (source: local, remote) |
@@ -43,6 +45,7 @@
 //! | `moq_relay_active_connections` | Current number of active client connections |
 //! | `moq_relay_active_publishers` | Current number of active publishers |
 //! | `moq_relay_active_subscriptions` | Current number of active subscriptions |
+//! | `moq_relay_active_rendezvous_holds` | Current SUBSCRIBE requests waiting for a publisher |
 //! | `moq_relay_active_tracks` | Current number of tracks being served |
 //! | `moq_relay_announced_namespaces` | Current number of namespaces registered via PUBLISH_NAMESPACE |
 //! | `moq_relay_upstream_connections` | Current number of upstream/origin connections |
@@ -51,7 +54,7 @@
 //!
 //! | Name | Labels | Description |
 //! |------|--------|-------------|
-//! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, route_error, upstream_error, downstream_left) |
+//! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, route_error, upstream_error, downstream_left, rendezvous_timeout, rendezvous_overloaded) |
 
 use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
 
@@ -114,6 +117,14 @@ pub fn describe_metrics() {
         "Upstream subscription could not be established, so the downstream SUBSCRIBE was rejected"
     );
     describe_counter!(
+        "moq_relay_rendezvous_timeouts_total",
+        "Rendezvous holds that ended with REQUEST_ERROR TIMEOUT"
+    );
+    describe_counter!(
+        "moq_relay_rendezvous_rejections_total",
+        "Rendezvous requests rejected with EXCESSIVE_LOAD because relay or session capacity was full"
+    );
+    describe_counter!(
         "moq_relay_upstream_errors_total",
         "Upstream connection failures by stage (connect, session)"
     );
@@ -148,6 +159,10 @@ pub fn describe_metrics() {
         "Current number of active subscriptions"
     );
     describe_gauge!(
+        "moq_relay_active_rendezvous_holds",
+        "Current SUBSCRIBE requests waiting for a publisher"
+    );
+    describe_gauge!(
         "moq_relay_active_tracks",
         "Current number of tracks being served"
     );
@@ -168,7 +183,7 @@ pub fn describe_metrics() {
     describe_histogram!(
         "moq_relay_subscribe_latency_seconds",
         Unit::Seconds,
-        "Time to resolve subscription by source (local, remote, not_found, route_error, upstream_error, downstream_left)"
+        "Time to resolve subscription by source (local, remote, not_found, route_error, upstream_error, downstream_left, rendezvous_timeout, rendezvous_overloaded)"
     );
 }
 
