@@ -6,6 +6,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.26](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.25...moq-relay-ietf-v0.7.26) - 2026-08-28
+
+### Added
+
+- *(moq-relay-ietf)* correlate relay sessions with a span, not per-site fields
+- *(moq-transport)* thread SessionId through Session, Publisher and Subscriber
+
+### Fixed
+
+- *(tracing)* harden session log context
+- *(tracing)* harden reason logs and share root spans
+- *(moq-relay-ietf)* harden session correlation spans
+- *(moq-transport)* preserve session constructor compatibility
+- serve a peer-forwarded PUBLISH_NAMESPACE for discovery only
+- resolve the upstream readiness gate when its sender is dropped
+
+### Other
+
+- *(moq-relay-ietf)* keep peer identity out of session spans
+
 ## [0.7.25](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.24...moq-relay-ietf-v0.7.25) - 2026-07-31
 
 ### Added
