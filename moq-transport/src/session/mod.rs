@@ -1534,13 +1534,16 @@ impl Session {
                     let stream = res?;
                     let subscriber = subscriber.clone().ok_or(SessionError::RoleViolation)?;
 
-                    tasks.push(async move {
-                        if let Err(err) = Subscriber::recv_stream(subscriber, stream).await {
-                            tracing::warn!("failed to serve stream: {}", err);
-                        };
-                    });
+                    tasks.push(Subscriber::recv_stream(subscriber, stream));
                 },
-                _ = tasks.next(), if !tasks.is_empty() => {},
+                result = tasks.next(), if !tasks.is_empty() => {
+                    if let Some(Err(err)) = result {
+                        if err.is_session_fatal() {
+                            return Err(err);
+                        }
+                        tracing::warn!("failed to serve stream: {}", err);
+                    }
+                },
             };
         }
     }
@@ -1564,21 +1567,10 @@ impl Session {
 /// Shared helpers for session-layer unit tests.
 #[cfg(test)]
 pub(crate) mod test_support {
-    /// Establish a real `web_transport::Session` over an in-process QUIC
-    /// loopback so tests can construct a `Publisher`/`Subscriber` and exercise
-    /// the real cleanup paths.
-    ///
-    /// Most tests never send anything over it — they only touch in-memory maps
-    /// and queues — but `Publisher` and `Subscriber` hold a concrete
-    /// `web_transport::Session`, so a live connection is the only honest way to
-    /// build one. The accepted server side is parked for the lifetime of the test
-    /// to keep the client session established.
-    pub(crate) async fn loopback_session() -> web_transport::Session {
+    pub(crate) async fn loopback_session_pair() -> (web_transport::Session, web_transport::Session)
+    {
         use web_transport::quinn::{ClientBuilder, ServerBuilder};
 
-        // Under `cargo test --workspace`, feature unification links both the
-        // `ring` and `aws-lc-rs` rustls providers, leaving no unambiguous
-        // process default. Install one explicitly (idempotent across tests).
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
@@ -1596,15 +1588,9 @@ pub(crate) mod test_support {
             .expect("build loopback server");
         let addr = server.local_addr().expect("server local addr");
 
-        tokio::spawn(async move {
-            if let Some(request) = server.accept().await {
-                // Hold the accepted server session open for the lifetime of the
-                // test so the client side stays established; the spawned task is
-                // cancelled at runtime shutdown when the test returns.
-                if let Ok(_session) = request.ok().await {
-                    std::future::pending::<()>().await;
-                }
-            }
+        let accept = tokio::spawn(async move {
+            let request = server.accept().await.expect("accept loopback request");
+            request.ok().await.expect("accept loopback session").into()
         });
 
         let client = ClientBuilder::new()
@@ -1613,13 +1599,32 @@ pub(crate) mod test_support {
             .expect("build loopback client");
         let url = url::Url::parse(&format!("https://127.0.0.1:{}/", addr.port()))
             .expect("parse loopback url");
-
-        // Fail fast rather than hang CI if the loopback handshake ever stalls.
-        tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(url))
+        let client = tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(url))
             .await
             .expect("loopback connect timed out")
             .expect("connect loopback session")
-            .into()
+            .into();
+        let server = accept.await.expect("join loopback accept task");
+
+        (client, server)
+    }
+
+    /// Establish a real `web_transport::Session` over an in-process QUIC
+    /// loopback so tests can construct a `Publisher`/`Subscriber` and exercise
+    /// the real cleanup paths.
+    ///
+    /// Most tests never send anything over it — they only touch in-memory maps
+    /// and queues — but `Publisher` and `Subscriber` hold a concrete
+    /// `web_transport::Session`, so a live connection is the only honest way to
+    /// build one. The accepted server side is parked for the lifetime of the test
+    /// to keep the client session established.
+    pub(crate) async fn loopback_session() -> web_transport::Session {
+        let (client, server) = loopback_session_pair().await;
+        tokio::spawn(async move {
+            let _server = server;
+            std::future::pending::<()>().await;
+        });
+        client
     }
 }
 
