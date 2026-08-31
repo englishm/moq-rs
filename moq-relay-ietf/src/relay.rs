@@ -411,26 +411,11 @@ impl Relay {
                                 None => SessionContext::public(scope),
                             };
 
-                            // The resolved interface decides whether a
-                            // PUBLISH_NAMESPACE on this session is treated as
-                            // ours or as proxied for a peer, and until now
-                            // nothing recorded it. Classification depends on
-                            // `local_ip` being populated, which is a platform
-                            // property rather than a configured one: if it is
-                            // absent, every peer relay silently classifies as a
-                            // public client and the proxied path is never taken.
-                            // That failure mode is invisible without this line —
-                            // the behaviour degrades to exactly what it was
-                            // before, with no error anywhere.
-                            //
-                            // Emitted for every accepted session so the
-                            // precondition is observable in production rather
-                            // than inferred, but only peer sessions are worth
-                            // info: they are rare and they are the ones whose
-                            // classification changes behaviour. Clients are the
-                            // bulk of the traffic and would drown it out, so
-                            // they stay at debug and remain available when a
-                            // misclassification is what is being investigated.
+                            // The resolved interface controls whether an inbound
+                            // PUBLISH_NAMESPACE is owned here or advertised only
+                            // for peer discovery. Internal sessions are rare and
+                            // logged at info; public client sessions stay at
+                            // debug to avoid a per-connection info log.
                             match context.interface {
                                 SessionInterface::Internal => tracing::info!(
                                     interface = ?context.interface,

@@ -8,7 +8,7 @@ use crate::coding::TrackNamespace;
 use crate::watch::State;
 use crate::{message, serve::ServeError};
 
-use super::{Publisher, Subscribed, TrackStatusRequested, CANCELLED_STREAM_CODE};
+use super::{Subscribed, TrackStatusRequested, CANCELLED_STREAM_CODE};
 
 /// Information about an outbound PUBLISH_NAMESPACE request.
 #[derive(Debug, Clone)]
@@ -52,7 +52,6 @@ impl Drop for PublishNamespaceState {
 /// Dropping the handle cancels the request stream unless the peer already closed it.
 #[must_use = "cancels PUBLISH_NAMESPACE on drop"]
 pub struct PublishNamespace {
-    publisher: Publisher,
     state: State<PublishNamespaceState>,
     cancel: Option<tokio::sync::oneshot::Sender<u32>>,
 
@@ -63,7 +62,6 @@ impl PublishNamespace {
     /// Create a PublishNamespace without sending on the control stream.
     /// The caller sends via a bidi request stream (draft-18).
     pub(super) fn new(
-        publisher: Publisher,
         request_id: u64,
         namespace: TrackNamespace,
     ) -> (
@@ -75,7 +73,7 @@ impl PublishNamespace {
             request_id,
             namespace: namespace.clone(),
         };
-        Self::from_parts(publisher, info, request_id)
+        Self::from_parts(info, request_id)
     }
 
     /// Return the wire message to send on the request stream.
@@ -88,7 +86,6 @@ impl PublishNamespace {
     }
 
     fn from_parts(
-        publisher: Publisher,
         info: PublishNamespaceInfo,
         request_id: u64,
     ) -> (
@@ -100,7 +97,6 @@ impl PublishNamespace {
         let (cancel, recv_cancel) = tokio::sync::oneshot::channel();
 
         let send = Self {
-            publisher,
             info,
             state: send,
             cancel: Some(cancel),
@@ -197,7 +193,6 @@ impl Drop for PublishNamespace {
             return;
         }
 
-        self.publisher.drop_publish_namespace(self.info.request_id);
         if let Some(cancel) = self.cancel.take() {
             let _ = cancel.send(CANCELLED_STREAM_CODE);
         }
@@ -234,7 +229,7 @@ impl PublishNamespaceRecv {
         Ok(())
     }
 
-    pub fn recv_error(self, err: ServeError) -> Result<(), ServeError> {
+    pub fn recv_error(&mut self, err: ServeError) -> Result<(), ServeError> {
         let state = self.state.lock();
         state.closed.clone()?;
 
@@ -265,26 +260,14 @@ impl PublishNamespaceRecv {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        coding::TrackNamespace,
-        session::{test_support::loopback_session, Publisher, RequestId},
-        watch::Queue,
-    };
+    use crate::coding::TrackNamespace;
 
     use super::PublishNamespace;
 
     #[tokio::test]
     async fn drop_cancels_request_stream() {
-        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
-        let publisher = Publisher::new(
-            Queue::default(),
-            loopback_session().await,
-            None,
-            RequestId::new(0, 1),
-            bidi_task_tx,
-        );
         let (publish, _recv, cancel) =
-            PublishNamespace::new(publisher, 6, TrackNamespace::from_utf8_path("test"));
+            PublishNamespace::new(6, TrackNamespace::from_utf8_path("test"));
 
         drop(publish);
 

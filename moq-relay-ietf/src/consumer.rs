@@ -8,16 +8,81 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     message::RequestErrorCode,
     serve::{ServeError, Tracks},
-    session::{PublishReceived, PublishedNamespace, SessionError, Subscriber},
+    session::{PublishReceived, PublishedNamespace, SessionError, Subscribe, Subscriber},
 };
 use tokio::sync::Semaphore;
 
 use crate::{
-    metrics::GaugeGuard, Coordinator, Locals, Producer, RemoteManager, SessionContext,
+    metrics::GaugeGuard, CacheLease, Coordinator, Locals, Producer, RemoteManager, SessionContext,
     SessionInterface, TrackRequest,
 };
 
 const MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION: usize = 1024;
+
+struct CacheSubscriptionCleanup {
+    subscribe: Option<Subscribe>,
+    lease: Option<CacheLease>,
+}
+
+impl CacheSubscriptionCleanup {
+    fn new(lease: CacheLease) -> Self {
+        Self {
+            subscribe: None,
+            lease: Some(lease),
+        }
+    }
+
+    fn attach(&mut self, subscribe: Subscribe) {
+        self.subscribe = Some(subscribe);
+    }
+
+    fn handles(&self) -> Result<(&Subscribe, &CacheLease), ServeError> {
+        match (self.subscribe.as_ref(), self.lease.as_ref()) {
+            (Some(subscribe), Some(lease)) => Ok((subscribe, lease)),
+            _ => Err(ServeError::Internal(
+                "cache subscription cleanup is missing ownership".to_string(),
+            )),
+        }
+    }
+
+    fn finish(mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let subscribe = self.subscribe.take();
+        let lease = self.lease.take()?;
+        Some(tokio::spawn(async move {
+            if let Some(subscribe) = subscribe {
+                subscribe.unsubscribe().await;
+            }
+            lease.finish_release();
+        }))
+    }
+}
+
+impl Drop for CacheSubscriptionCleanup {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let subscribe = self.subscribe.take();
+
+        if let Some(subscribe) = subscribe {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                std::mem::drop(runtime.spawn(async move {
+                    subscribe.unsubscribe().await;
+                    lease.finish_release();
+                }));
+                return;
+            }
+
+            tracing::warn!(
+                request_id = subscribe.id,
+                "could not wait for cache subscription teardown outside a Tokio runtime"
+            );
+            drop(subscribe);
+        }
+
+        lease.finish_release();
+    }
+}
 
 /// Consumer of tracks from a remote Publisher
 #[derive(Clone)]
@@ -111,17 +176,14 @@ impl Consumer {
     /// The peer that forwarded this is not the origin, it is relaying on the
     /// origin's behalf, so this relay must not present itself as a source. It
     /// registers the namespace the same way the SUBSCRIBE_NAMESPACE pull path
-    /// does — visible to `list_namespaces_matching`, absent from
-    /// `route_namespace` — so a downstream SUBSCRIBE misses locally and resolves
-    /// through the coordinator to whoever actually owns it.
+    /// does. The namespace is visible to discovery but absent from local routing,
+    /// so a downstream SUBSCRIBE resolves through the coordinator to its owner.
     ///
     /// Deliberately absent, each for its own reason:
     ///
     /// * **No coordinator registration.** Ownership is the origin's. Claiming it
-    ///   here races the origin for one key and loses, and the losing path
-    ///   unwinds the local registration it had already published — which
-    ///   downstream reads as the namespace being withdrawn milliseconds after
-    ///   it appeared, while the publisher is still live.
+    ///   here races the origin for one key and loses. The losing path then
+    ///   unwinds the local registration while the publisher is still live.
     ///
     /// * **No request queue.** With no local route nothing can queue against
     ///   this session, so there is no queue to strand and no need to drain one.
@@ -129,9 +191,8 @@ impl Consumer {
     /// * **No subscribe reaching this session.** That matters twice over: the
     ///   forwarding peer publishes a placeholder track container whose request
     ///   channel is closed at creation, and that publication takes priority
-    ///   over the peer's own unknown-subscribe fall-through — so a subscribe
-    ///   arriving there answers "does not exist" even though the peer holds a
-    ///   working route. And a dialed session has no `Producer` draining
+    ///   over the peer's own unknown-subscribe fall-through. A dialed session
+    ///   also has no `Producer` draining
     ///   `subscribed()` at all, so it could not be served even if the
     ///   placeholder were gone.
     ///
@@ -235,12 +296,9 @@ impl Consumer {
 
         // Forward the namespace upstream, if configured.
         if let Some(mut forward) = self.forward {
-            // Same advertise-only container as the peer fan-out below, and the
-            // same defect: dropping the request half here means the `--announce`
-            // upstream cannot route a subscribe back down this session either.
-            // Latent rather than fixed — no deployment sets `--announce` today,
-            // and giving it a real route is the same work as making dialed
-            // sessions serve subscribes, which is deliberately out of scope.
+            // This advertise-only container cannot route a subscribe back down
+            // the dialed session. Supporting that requires the dialed side to
+            // run a Producer, which is outside this forwarding path.
             let (_, _forward_request, forward_reader) =
                 Tracks::new(published_ns.namespace.clone()).produce();
             tasks.push(
@@ -294,15 +352,10 @@ impl Consumer {
             // The forwarding API uses the moq-transport Tracks helper as an
             // adapter for the outgoing publish_namespace call; it is not the
             // relay-local registry.
-            // Advertise-only container. Its writer and request halves are
-            // dropped here, which closes the request channel at creation, so
-            // the reader can carry the namespace outward but can never answer a
-            // subscribe. That is load-bearing and fragile: on the receiving
-            // peer this publication takes priority over the unknown-subscribe
-            // fall-through, so any subscribe routed back down this session gets
-            // "does not exist" rather than the peer's real route. Nothing must
-            // route a subscribe here — see `serve_proxied`, and the guard test
-            // `fanout_adapter_accepts_a_subscribe_it_can_never_serve`.
+            // The request half is dropped before this task runs, so this reader
+            // can advertise the namespace but cannot serve a subscription. The
+            // receiving relay must keep it out of local routing; see
+            // `serve_proxied`.
             let (_, _request, reader) = Tracks::new(published_ns.namespace.clone()).produce();
             tasks.push(
                 async move {
@@ -344,6 +397,7 @@ impl Consumer {
                     let mut subscriber = self.subscriber.clone();
 
                     tasks.push(async move {
+                        let mut cleanup = CacheSubscriptionCleanup::new(lease);
                         let info = writer.info.clone();
                         let namespace = info.namespace.to_utf8_path();
                         let track_name = info.name.clone();
@@ -353,16 +407,29 @@ impl Consumer {
                             "forwarding subscribe: {:?}", info
                         );
 
-                        // Hold the subscription explicitly rather than using
-                        // `subscribe()`, so it can be dropped — sending
-                        // UNSUBSCRIBE — once downstream interest goes away.
-                        //
-                        // `subscribe_open` resolves once the upstream publisher
-                        // answers, so its outcome is exactly what downstream
-                        // subscribers are waiting on to satisfy draft-16 §8.4.
-                        let subscribe = match subscriber.subscribe_open(writer).await {
+                        // Stop opening the upstream stream when all downstream
+                        // interest disappears. Once opening succeeds, cleanup
+                        // owns the stream through ordered teardown.
+                        let lease = cleanup.lease.as_ref().ok_or_else(|| {
+                            ServeError::Internal(
+                                "cache subscription cleanup is missing its lease".to_string(),
+                            )
+                        })?;
+                        let subscribe_result = tokio::select! {
+                            biased;
+                            result = subscriber.subscribe_start(writer) => Some(result),
+                            _ = lease.abandoned() => None,
+                        };
+                        let Some(subscribe_result) = subscribe_result else {
+                            tracing::debug!(
+                                namespace = %namespace,
+                                track = %track_name,
+                                "downstream left while opening upstream subscribe"
+                            );
+                            return Ok(());
+                        };
+                        let subscribe = match subscribe_result {
                             Ok(subscribe) => {
-                                upstream.established();
                                 subscribe
                             }
                             Err(err) => {
@@ -379,6 +446,39 @@ impl Consumer {
                                 return Ok(());
                             }
                         };
+                        cleanup.attach(subscribe);
+                        let (subscribe, lease) = cleanup.handles()?;
+
+                        let accepted = tokio::select! {
+                            result = subscribe.ok() => Some(result),
+                            _ = lease.abandoned() => None,
+                        };
+                        let Some(accepted) = accepted else {
+                            tracing::debug!(
+                                namespace = %namespace,
+                                track = %track_name,
+                                "downstream left before upstream accepted subscribe"
+                            );
+                            if let Some(task) = cleanup.finish() {
+                                let _ = task.await;
+                            }
+                            return Ok(());
+                        };
+                        if let Err(err) = accepted {
+                            tracing::warn!(
+                                namespace = %namespace,
+                                track = %track_name,
+                                error = %err,
+                                "failed forwarding subscribe: {:?}", info
+                            );
+                            upstream.failed(err);
+                            if let Some(task) = cleanup.finish() {
+                                let _ = task.await;
+                            }
+                            return Ok(());
+                        }
+                        upstream.established();
+                        let (subscribe, lease) = cleanup.handles()?;
 
                         tokio::select! {
                             res = subscribe.closed() => {
@@ -392,8 +492,8 @@ impl Consumer {
                                 }
                             }
                             // The cached track went unwatched long enough to be
-                            // evicted, so stop pulling it. Dropping `subscribe`
-                            // below sends UNSUBSCRIBE upstream.
+                            // evicted, so stop pulling it and complete ordered
+                            // request-stream teardown below.
                             _ = lease.released() => {
                                 tracing::info!(
                                     namespace = %namespace,
@@ -402,8 +502,9 @@ impl Consumer {
                                 );
                             }
                         }
-
-                        drop(subscribe);
+                        if let Some(task) = cleanup.finish() {
+                            let _ = task.await;
+                        }
 
                         Ok(())
                     }.boxed());
@@ -495,52 +596,45 @@ impl Consumer {
 
 #[cfg(test)]
 mod tests {
-    use futures::FutureExt;
-    use moq_transport::serve::Tracks;
+    use moq_transport::serve::FullTrackName;
+
+    use super::CacheSubscriptionCleanup;
+    use crate::{Locals, TrackRequest};
 
     fn ns(path: &str) -> moq_transport::coding::TrackNamespace {
         moq_transport::coding::TrackNamespace::try_from(path).expect("valid namespace")
     }
 
-    /// Pins the defect in the fan-out adapter so it stays visible.
-    ///
-    /// `serve()` builds this container to carry a namespace outward and drops
-    /// its writer and request halves immediately, which closes the request
-    /// channel before anything can use it. The container is therefore incapable
-    /// of answering a subscribe — and on the receiving peer it takes priority
-    /// over the unknown-subscribe fall-through, so a subscribe routed to it is
-    /// answered "does not exist" rather than being served from the peer's real
-    /// route.
-    ///
-    /// The fix keeps subscribes away from it rather than repairing it, which
-    /// makes this a property nothing enforces at the type level. If a future
-    /// change routes a subscribe onto a fan-out session, this test is the
-    /// warning that the destination is a dead end.
-    #[test]
-    fn fanout_adapter_accepts_a_subscribe_it_can_never_serve() {
+    #[tokio::test]
+    async fn cleanup_before_subscribe_start_removes_the_cache_generation() {
         let namespace = ns("room/123");
+        let mut locals = Locals::new();
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("register namespace source");
+        let local = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("request missing track");
+        let TrackRequest {
+            writer,
+            lease,
+            upstream,
+        } = requests.recv().await.expect("receive track request");
+        drop(local);
+        lease.abandoned().await;
 
-        // Note what it does NOT do: refuse. It accepts the subscribe and hands
-        // back a track, having pushed the matching writer onto a queue that has
-        // no consumer. The subscribe is answered, then never served.
-        let (_, _request, mut reader) = Tracks::new(namespace.clone()).produce();
-        assert!(
-            reader.subscribe(namespace.clone(), "video").is_some(),
-            "expected the advertise-only container to accept a subscribe it \
-             cannot serve; if it now refuses outright, the hazard has changed \
-             shape and the comments at both Tracks::produce call sites need \
-             revisiting"
-        );
+        let full_name = FullTrackName {
+            namespace,
+            name: "video".into(),
+        };
+        assert!(locals.retrieve_track(None, &full_name).is_some());
 
-        // With the request half alive the same container does serve, which is
-        // what makes dropping it the whole defect rather than an incidental
-        // detail. Keeping both cases in one test stops the assertion above from
-        // being read as "this container is simply broken".
-        let (_, mut request, mut wired) = Tracks::new(namespace.clone()).produce();
-        assert!(wired.subscribe(namespace, "video").is_some());
-        assert!(
-            request.next().now_or_never().flatten().is_some(),
-            "a wired container must deliver the writer to its requester"
-        );
+        drop(CacheSubscriptionCleanup::new(lease));
+
+        assert!(locals.retrieve_track(None, &full_name).is_none());
+        drop(writer);
+        drop(upstream);
     }
 }

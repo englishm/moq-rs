@@ -74,7 +74,8 @@ pub struct TrackRequest {
     /// Lease on the pull-through cache entry backing this request.
     ///
     /// The requester should hold the upstream subscription open until
-    /// [`CacheLease::released`] resolves, then drop it to send UNSUBSCRIBE.
+    /// [`CacheLease::released`] resolves, wait for upstream cancellation, then
+    /// call [`CacheLease::finish_release`].
     pub lease: CacheLease,
 
     /// Reports whether the upstream subscription was established.
@@ -103,7 +104,7 @@ enum UpstreamState {
 
 /// Readiness gate for the upstream subscription behind a cached track.
 ///
-/// Draft-16 §8.4 requires a relay to have an established upstream subscription
+/// Draft-18 Section 9.4 requires a relay to have an established upstream subscription
 /// before it sends SUBSCRIBE_OK for a downstream SUBSCRIBE. The pull-through
 /// cache reserves its entry synchronously but subscribes upstream asynchronously
 /// (the publishing session owns that side), so the entry exists before the
@@ -119,6 +120,11 @@ pub struct UpstreamReady {
 }
 
 impl UpstreamReady {
+    /// Whether the upstream publisher has not answered yet.
+    pub(crate) fn is_pending(&self) -> bool {
+        matches!(*self.state.borrow(), UpstreamState::Pending)
+    }
+
     /// Wait until the upstream subscription is established.
     ///
     /// Returns the upstream failure if it could not be established, so the caller
@@ -182,10 +188,8 @@ impl UpstreamReadyTx {
 /// Most ways this sender dies are not calls to [`UpstreamReadyTx::established`]
 /// or [`UpstreamReadyTx::failed`]: the owning session can return early, be torn
 /// down mid-handshake, or have its task dropped while parked on the upstream
-/// SUBSCRIBE. In every one of those cases the publisher really is gone, so
-/// failing the gate is the correct outcome and not merely a better log line —
-/// waiting subscribers must be released rather than left until the response
-/// timeout.
+/// SUBSCRIBE. In every one of those cases the publisher really is gone. Failing
+/// the gate releases waiting subscribers before the response timeout.
 ///
 /// Without this, the sender's disappearance was only observable as a closed
 /// channel, which surfaced downstream as an unattributable internal error with
@@ -208,7 +212,7 @@ impl Drop for UpstreamReadyTx {
         // `Uuid::new_v4` panics rather than degrading when the OS entropy
         // source is unavailable (seccomp-blocked `getrandom`, an exhausted fd
         // table with no `/dev/urandom`). A `Drop` must not make a fallible
-        // syscall — and this one especially must not, because it runs *during*
+        // syscall. This code can run during
         // unwinding: a panic here while another panic is in flight aborts the
         // process, turning one failed task into a dead relay.
         //
@@ -221,7 +225,7 @@ impl Drop for UpstreamReadyTx {
         //
         // Built out here rather than in the closure so the allocation stays off
         // the write lock, and so the closure cannot do anything but match and
-        // move — `send_if_modified` re-raises a panicking closure.
+        // move, because `send_if_modified` re-raises a panicking closure.
         let err = ServeError::Internal(
             "upstream publisher went away before the subscription was established".to_string(),
         );
@@ -248,15 +252,16 @@ pub struct CacheLease {
     scope_key: ScopeKey,
     full_name: FullTrackName,
     interest: TrackInterest,
+    finished: bool,
 }
 
 impl CacheLease {
-    /// Resolve once the cache entry has been evicted for lack of interest.
+    /// Resolve once the cache entry is ready for ordered upstream cancellation.
     ///
-    /// The caller should drop its upstream subscription when this returns, which
-    /// sends UNSUBSCRIBE. Eviction happens first so that a subscriber arriving
-    /// afterwards misses the cache and triggers a fresh upstream SUBSCRIBE,
-    /// rather than attaching to a reader that is about to stop being fed.
+    /// The entry remains as a closing generation until
+    /// [`finish_release`](Self::finish_release) is called after the peer has
+    /// ended the old request stream. Subscribers wait for that transition so a
+    /// replacement SUBSCRIBE cannot overtake the old UNSUBSCRIBE.
     ///
     /// Never resolves when the idle timeout is disabled, preserving the previous
     /// behaviour of holding the upstream subscription for the session's lifetime.
@@ -266,13 +271,40 @@ impl CacheLease {
             std::future::pending::<()>().await;
         }
 
+        self.release_after(timeout).await;
+    }
+
+    /// Release an upstream request as soon as every waiting subscriber leaves.
+    ///
+    /// A request that has not been accepted upstream has no warm state worth
+    /// retaining for the normal cache grace period.
+    pub(crate) async fn abandoned(&self) {
+        self.release_after(Duration::ZERO).await;
+    }
+
+    pub(crate) fn finish_release(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.locals
+            .remove_cache_generation(&self.scope_key, &self.full_name, &self.interest);
+        self.interest.mark_removed();
+    }
+
+    async fn release_after(&self, timeout: Duration) {
         loop {
             self.interest.idle_for(timeout).await;
 
-            if self
-                .locals
-                .evict_idle_cache_entry(&self.scope_key, &self.full_name, &self.interest)
-            {
+            if self.locals.mark_idle_cache_entry_closing(
+                &self.scope_key,
+                &self.full_name,
+                &self.interest,
+            ) {
                 return;
             }
 
@@ -284,6 +316,14 @@ impl CacheLease {
                 "cache eviction abandoned; downstream interest returned"
             );
         }
+    }
+}
+
+impl Drop for CacheLease {
+    fn drop(&mut self) {
+        // Requests can be abandoned while still buffered in the namespace
+        // queue, before a session takes responsibility for their teardown.
+        self.release();
     }
 }
 
@@ -330,8 +370,8 @@ pub struct LocalTrack {
     /// `None` for locally published tracks, which have no upstream subscription.
     pub interest: Option<TrackInterestGuard>,
 
-    /// Must resolve before the caller sends SUBSCRIBE_OK downstream (draft-16
-    /// §8.4).
+    /// Must resolve before the caller sends SUBSCRIBE_OK downstream (draft-18
+    /// Section 9.4).
     ///
     /// `None` for locally published tracks, which are already established.
     pub upstream: Option<UpstreamReady>,
@@ -473,6 +513,25 @@ impl Locals {
             .ok()
     }
 
+    #[cfg(test)]
+    pub(crate) fn available_rendezvous_holds(&self) -> usize {
+        self.rendezvous_hold_permits.available_permits()
+    }
+
+    #[cfg(test)]
+    fn contains_track_entry(&self, scope: Option<&str>, full_name: &FullTrackName) -> bool {
+        let scope_key = scope.unwrap_or(UNSCOPED);
+        self.tracks
+            .read()
+            .ok()
+            .and_then(|tracks| {
+                tracks
+                    .get(scope_key)
+                    .map(|bucket| bucket.contains_key(full_name))
+            })
+            .unwrap_or(false)
+    }
+
     pub(crate) fn rendezvous_overload_retry_interval(&self) -> u64 {
         let sequence = self
             .rendezvous_retry_sequence
@@ -561,10 +620,13 @@ impl Locals {
             return;
         };
         for key in keys {
-            if bucket
-                .get(key)
-                .is_some_and(|entry| entry.reader.is_closed())
-            {
+            if bucket.get(key).is_some_and(|entry| {
+                entry.reader.is_closed()
+                    && !entry
+                        .interest
+                        .as_ref()
+                        .is_some_and(TrackInterest::is_closing)
+            }) {
                 bucket.remove(key);
             }
         }
@@ -761,7 +823,7 @@ impl Locals {
         None
     }
 
-    /// Remove an unwatched pull-through cache entry.
+    /// Mark an unwatched pull-through cache entry as closing.
     ///
     /// Returns false, leaving the entry in place, if interest returned before the
     /// write lock was acquired, or if the entry has since been replaced by a
@@ -770,7 +832,7 @@ impl Locals {
     /// The idle check happens under the same lock that guards are created under,
     /// so a subscriber racing eviction either gets counted here (and eviction is
     /// abandoned) or misses the cache entirely and requests a fresh one.
-    fn evict_idle_cache_entry(
+    fn mark_idle_cache_entry_closing(
         &self,
         scope_key: &str,
         full_name: &FullTrackName,
@@ -796,6 +858,7 @@ impl Locals {
                     .is_some_and(|current| current.same_generation(interest));
 
                 if !ours {
+                    interest.mark_removed();
                     return true;
                 }
 
@@ -803,23 +866,23 @@ impl Locals {
                     return false;
                 }
 
-                bucket.remove(full_name);
+                interest.mark_closing();
+                metrics::counter!("moq_relay_cache_idle_evictions_total", "source" => "local")
+                    .increment(1);
             }
             // Already gone (e.g. pruned as closed), so the upstream subscription
             // is no longer serving anything.
-            None => return true,
-        }
-
-        if bucket.is_empty() {
-            tracks.remove(scope_key);
+            None => {
+                interest.mark_removed();
+                return true;
+            }
         }
 
         tracing::debug!(
             namespace = %full_name.namespace,
             track = %full_name.name,
-            "evicting idle cached track and releasing upstream subscription"
+            "closing idle cached track before releasing upstream subscription"
         );
-        metrics::counter!("moq_relay_cache_idle_evictions_total", "source" => "local").increment(1);
 
         true
     }
@@ -858,6 +921,14 @@ impl Locals {
         best_match
     }
 
+    pub(crate) fn has_namespace_route(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+    ) -> bool {
+        self.route_namespace(scope, namespace).is_some()
+    }
+
     /// Get an existing exact track or request it from a matching namespace source.
     ///
     /// This replaces the old `TracksReader::subscribe` relay registry behavior:
@@ -880,101 +951,123 @@ impl Locals {
         };
         let scope_key = scope.unwrap_or(UNSCOPED).to_string();
 
-        if let Some(hit) = self.retrieve_track_with_interest(&scope_key, &full_name) {
-            return Some(hit);
-        }
-
-        let source = self.route_namespace(scope, &namespace)?;
-
-        // Reserve the pull-through cache slot under a single lock so concurrent
-        // misses for the same track collapse onto one produced reader. The caller
-        // that finds no live entry claims the slot with a freshly produced track and
-        // owns requesting it from the source; concurrent callers share the reserved
-        // reader instead of racing to insert and failing with a spurious `None`.
-        let (writer, reader, interest, guard, upstream_tx, upstream) = {
-            let mut tracks = self.tracks.write().ok()?;
-            let bucket = tracks.entry(scope_key.clone()).or_default();
-
-            if let Some(entry) = bucket.get(&full_name) {
-                if !entry.reader.is_closed() {
-                    return Some(LocalTrack {
-                        largest_location: entry.reader.largest_location(),
-                        reader: entry.reader.clone(),
-                        interest: entry.interest.as_ref().map(TrackInterest::guard),
-                        upstream: entry.upstream.clone(),
-                    });
-                }
+        loop {
+            if let Some(hit) = self.retrieve_track_with_interest(scope, &full_name) {
+                return Some(hit);
             }
 
-            // Vacant slot (or a stale, closed reader): claim it with a fresh track.
-            let (writer, reader) = Track::new(namespace, track_name).produce();
-            let interest = TrackInterest::new();
+            let source = self.route_namespace(scope, &namespace)?;
 
-            // Take this caller's guard before the entry is visible to anyone
-            // else, so the entry can never be seen as idle while we are still
-            // setting up the upstream subscription.
-            let guard = interest.guard();
+            // Reserve the pull-through cache slot under a single lock so concurrent
+            // misses for the same track collapse onto one produced reader. The caller
+            // that finds no live entry claims the slot with a freshly produced track and
+            // owns requesting it from the source; concurrent callers share the reserved
+            // reader instead of racing to insert and failing with a spurious `None`.
+            let mut closing_generation = None;
+            let created = {
+                let mut tracks = self.tracks.write().ok()?;
+                let bucket = tracks.entry(scope_key.clone()).or_default();
 
-            // Published alongside the entry so that a subscriber arriving while
-            // the upstream handshake is still in flight shares this gate rather
-            // than being served a reader nothing has subscribed to yet.
-            let (upstream_tx, upstream_rx) = watch::channel(UpstreamState::Pending);
-            let upstream = UpstreamReady { state: upstream_rx };
+                if let Some(entry) = bucket.get(&full_name) {
+                    if let Some(closing) = entry
+                        .interest
+                        .as_ref()
+                        .filter(|interest| interest.is_closing())
+                        .cloned()
+                    {
+                        closing_generation = Some(closing);
+                    } else if !entry.reader.is_closed() {
+                        return Some(LocalTrack {
+                            largest_location: entry.reader.largest_location(),
+                            reader: entry.reader.clone(),
+                            interest: entry.interest.as_ref().map(TrackInterest::guard),
+                            upstream: entry.upstream.clone(),
+                        });
+                    }
+                }
 
-            bucket.insert(
-                full_name.clone(),
-                TrackEntry {
-                    reader: reader.clone(),
-                    source: TrackSource::Cache,
-                    interest: Some(interest.clone()),
-                    upstream: Some(upstream.clone()),
-                },
-            );
-            (
-                writer,
+                if closing_generation.is_some() {
+                    None
+                } else {
+                    // Vacant slot (or a stale, closed reader): claim it with a fresh track.
+                    let (writer, reader) =
+                        Track::new(namespace.clone(), track_name.clone()).produce();
+                    let interest = TrackInterest::new();
+
+                    // Take this caller's guard before the entry is visible to anyone
+                    // else, so the entry can never be seen as idle while we are still
+                    // setting up the upstream subscription.
+                    let guard = interest.guard();
+
+                    // Published alongside the entry so that a subscriber arriving while
+                    // the upstream handshake is still in flight shares this gate rather
+                    // than being served a reader nothing has subscribed to yet.
+                    let (upstream_tx, upstream_rx) = watch::channel(UpstreamState::Pending);
+                    let upstream = UpstreamReady { state: upstream_rx };
+
+                    bucket.insert(
+                        full_name.clone(),
+                        TrackEntry {
+                            reader: reader.clone(),
+                            source: TrackSource::Cache,
+                            interest: Some(interest.clone()),
+                            upstream: Some(upstream.clone()),
+                        },
+                    );
+                    Some((
+                        writer,
+                        reader,
+                        interest,
+                        guard,
+                        UpstreamReadyTx { state: upstream_tx },
+                        upstream,
+                    ))
+                }
+            };
+
+            if let Some(closing) = closing_generation {
+                closing.removed().await;
+                continue;
+            }
+            let (writer, reader, interest, guard, upstream_tx, upstream) = created?;
+
+            let lease = CacheLease {
+                locals: self.clone(),
+                scope_key: scope_key.clone(),
+                full_name: full_name.clone(),
+                interest: interest.clone(),
+                finished: false,
+            };
+            let cleanup = CacheGenerationCleanup {
+                locals: self.clone(),
+                scope_key: scope_key.clone(),
+                full_name: full_name.clone(),
+                interest: interest.clone(),
+                armed: true,
+            };
+
+            if source
+                .requests
+                .send(TrackRequest {
+                    writer,
+                    lease,
+                    upstream: upstream_tx,
+                })
+                .await
+                .is_err()
+            {
+                return None;
+            }
+
+            cleanup.disarm();
+
+            return Some(LocalTrack {
                 reader,
-                interest,
-                guard,
-                UpstreamReadyTx { state: upstream_tx },
-                upstream,
-            )
-        };
-
-        let lease = CacheLease {
-            locals: self.clone(),
-            scope_key: scope_key.clone(),
-            full_name: full_name.clone(),
-            interest: interest.clone(),
-        };
-        let cleanup = CacheGenerationCleanup {
-            locals: self.clone(),
-            scope_key: scope_key.clone(),
-            full_name: full_name.clone(),
-            interest: interest.clone(),
-            armed: true,
-        };
-
-        if source
-            .requests
-            .send(TrackRequest {
-                writer,
-                lease,
-                upstream: upstream_tx,
-            })
-            .await
-            .is_err()
-        {
-            return None;
+                largest_location: None,
+                interest: Some(guard),
+                upstream: Some(upstream),
+            });
         }
-
-        cleanup.disarm();
-
-        Some(LocalTrack {
-            reader,
-            largest_location: None,
-            interest: Some(guard),
-            upstream: Some(upstream),
-        })
     }
 
     /// Remove a cache entry if it is still the given generation, regardless of
@@ -1006,6 +1099,8 @@ impl Locals {
         if bucket.is_empty() {
             tracks.remove(scope_key);
         }
+
+        interest.mark_removed();
     }
 
     /// Cache lookup that also registers interest, under a single lock.
@@ -1013,16 +1108,23 @@ impl Locals {
     /// Interest must be registered while the lock is held: taking the guard after
     /// releasing it would leave a window where eviction sees an idle entry and
     /// removes the reader this caller is about to serve.
-    fn retrieve_track_with_interest(
+    pub(crate) fn retrieve_track_with_interest(
         &self,
-        scope_key: &str,
+        scope: Option<&str>,
         full_name: &FullTrackName,
     ) -> Option<LocalTrack> {
+        let scope_key = scope.unwrap_or(UNSCOPED);
         {
             let tracks = self.tracks.read().ok()?;
             let bucket = tracks.get(scope_key)?;
             match bucket.get(full_name) {
-                Some(entry) if !entry.reader.is_closed() => {
+                Some(entry)
+                    if !entry.reader.is_closed()
+                        && !entry
+                            .interest
+                            .as_ref()
+                            .is_some_and(TrackInterest::is_closing) =>
+                {
                     return Some(LocalTrack {
                         largest_location: entry.reader.largest_location(),
                         reader: entry.reader.clone(),
@@ -2045,8 +2147,8 @@ mod tests {
     /// drains its request queue, so the request is destroyed while still
     /// buffered in the channel rather than after being received.
     ///
-    /// This is `Consumer::serve` returning early — a failed coordinator
-    /// registration, or the session being torn down — after
+    /// This is `Consumer::serve` returning early after a failed coordinator
+    /// registration or session teardown, once
     /// `register_namespace` has already published the route source. Distinct
     /// from `abandoned_request_releases_waiting_subscribers`, which drops a
     /// request that was successfully received.
@@ -2054,6 +2156,7 @@ mod tests {
     async fn requests_stranded_in_the_queue_release_waiting_subscribers() {
         let mut locals = Locals::new();
         let namespace = ns("room/123");
+        let full_name = full(&namespace, "video");
         let (_registration, requests) = locals
             .register_namespace(None, namespace.clone())
             .await
@@ -2067,9 +2170,11 @@ mod tests {
             .expect("missing track should be requested")
             .upstream
             .expect("cached track should hand back a gate");
+        assert!(locals.contains_track_entry(None, &full_name));
 
         // The session aborts without ever calling `requests.recv()`.
         drop(requests);
+        assert!(!locals.contains_track_entry(None, &full_name));
 
         let err = tokio::time::timeout(Duration::from_secs(5), upstream.established())
             .await
@@ -2149,7 +2254,7 @@ mod tests {
     ///
     /// `watch::Sender::send` refuses to update once the last receiver drops,
     /// which would leave a successfully established subscription sitting on
-    /// `Pending` — indistinguishable from abandonment, and so reported as a
+    /// `Pending`. The `Drop` fallback would treat that state as abandonment and report a
     /// spurious failure by the `Drop` fallback.
     ///
     /// Driven against the sender directly: in the registry the cache entry
@@ -2169,7 +2274,7 @@ mod tests {
         );
     }
 
-    /// With the outcome recorded, `Drop` must leave it alone — otherwise the
+    /// With the outcome recorded, `Drop` must leave it alone. Otherwise the
     /// fallback would rewrite a success into a failure.
     #[test]
     fn drop_does_not_rewrite_an_outcome_recorded_without_receivers() {
@@ -2256,27 +2361,30 @@ mod tests {
         let request = requests.recv().await.expect("source should get a request");
         let key = full(&namespace, "video");
 
-        // While a subscriber is being served the entry must stay put.
-        let released = request.lease.released();
-        tokio::pin!(released);
-        tokio::select! {
-            _ = &mut released => panic!("evicted a track that still has a subscriber"),
-            _ = tokio::time::sleep(idle * 4) => {}
-        }
-        assert!(locals.retrieve_track(None, &key).is_some());
+        {
+            // While a subscriber is being served the entry must stay put.
+            let released = request.lease.released();
+            tokio::pin!(released);
+            tokio::select! {
+                _ = &mut released => panic!("evicted a track that still has a subscriber"),
+                _ = tokio::time::sleep(idle * 4) => {}
+            }
+            assert!(locals.retrieve_track(None, &key).is_some());
 
-        // Last subscriber leaves: the entry lingers for the grace period, then goes.
-        drop(guard);
-        tokio::select! {
-            _ = &mut released => panic!("evicted before the grace period elapsed"),
-            _ = tokio::time::sleep(idle / 2) => {}
-        }
-        assert!(
-            locals.retrieve_track(None, &key).is_some(),
-            "a warm cache entry should survive a brief gap between subscribers"
-        );
+            // Last subscriber leaves: the entry lingers for the grace period, then goes.
+            drop(guard);
+            tokio::select! {
+                _ = &mut released => panic!("evicted before the grace period elapsed"),
+                _ = tokio::time::sleep(idle / 2) => {}
+            }
+            assert!(
+                locals.retrieve_track(None, &key).is_some(),
+                "a warm cache entry should survive a brief gap between subscribers"
+            );
 
-        released.await;
+            released.await;
+        }
+        request.lease.finish_release();
         assert!(
             locals.retrieve_track(None, &key).is_none(),
             "idle entry should be evicted so the next subscriber re-requests upstream"
@@ -2301,41 +2409,44 @@ mod tests {
             .expect("missing track should be requested");
         let request = requests.recv().await.expect("source should get a request");
 
-        let released = request.lease.released();
-        tokio::pin!(released);
+        {
+            let released = request.lease.released();
+            tokio::pin!(released);
 
-        drop(
-            local
+            drop(
+                local
+                    .interest
+                    .expect("cached track should hand back a guard"),
+            );
+
+            tokio::select! {
+                _ = &mut released => panic!("evicted before the grace period elapsed"),
+                _ = tokio::time::sleep(idle / 2) => {}
+            }
+
+            // New subscriber inside the grace period: served from cache, no new request.
+            let guard = locals
+                .get_or_request_track(None, namespace.clone(), "video")
+                .await
+                .expect("warm entry should still be served")
                 .interest
-                .expect("cached track should hand back a guard"),
-        );
+                .expect("cached track should hand back a guard");
 
-        tokio::select! {
-            _ = &mut released => panic!("evicted before the grace period elapsed"),
-            _ = tokio::time::sleep(idle / 2) => {}
+            tokio::select! {
+                _ = &mut released => panic!("evicted while a subscriber was present"),
+                _ = tokio::time::sleep(idle * 4) => {}
+            }
+
+            assert!(
+                requests.try_recv().is_err(),
+                "reusing the warm entry must not trigger a second upstream SUBSCRIBE"
+            );
+
+            // And it still gets evicted once that subscriber leaves too.
+            drop(guard);
+            released.await;
         }
-
-        // New subscriber inside the grace period: served from cache, no new request.
-        let guard = locals
-            .get_or_request_track(None, namespace.clone(), "video")
-            .await
-            .expect("warm entry should still be served")
-            .interest
-            .expect("cached track should hand back a guard");
-
-        tokio::select! {
-            _ = &mut released => panic!("evicted while a subscriber was present"),
-            _ = tokio::time::sleep(idle * 4) => {}
-        }
-
-        assert!(
-            requests.try_recv().is_err(),
-            "reusing the warm entry must not trigger a second upstream SUBSCRIBE"
-        );
-
-        // And it still gets evicted once that subscriber leaves too.
-        drop(guard);
-        released.await;
+        request.lease.finish_release();
         assert!(locals
             .retrieve_track(None, &full(&namespace, "video"))
             .is_none());
@@ -2364,6 +2475,7 @@ mod tests {
 
         let request = requests.recv().await.expect("source should get a request");
         request.lease.released().await;
+        request.lease.finish_release();
 
         assert!(
             locals
@@ -2371,6 +2483,32 @@ mod tests {
                 .is_none(),
             "an abandoned request must not leave a permanently leased entry"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_request_is_released_without_cache_grace() {
+        let idle = Duration::from_secs(30);
+        let mut locals = Locals::with_cache_idle_timeout(idle);
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let local = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("missing track should be requested");
+        let request = requests.recv().await.expect("source should get a request");
+        drop(local);
+
+        tokio::time::timeout(Duration::from_secs(1), request.lease.abandoned())
+            .await
+            .expect("pending request retained the cache grace period");
+        request.lease.finish_release();
+        assert!(locals
+            .retrieve_track(None, &full(&namespace, "video"))
+            .is_none());
     }
 
     /// A zero timeout preserves the old behaviour: the upstream subscription is
@@ -2444,6 +2582,7 @@ mod tests {
         // entry look busy.
         let _ = &stale_guard;
         second_request.lease.released().await;
+        second_request.lease.finish_release();
 
         assert!(
             locals.retrieve_track(None, &key).is_none(),

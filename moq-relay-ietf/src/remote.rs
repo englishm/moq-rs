@@ -10,7 +10,7 @@ use std::time::Duration;
 use moq_native_ietf::quic;
 use moq_transport::coding::{KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix};
 use moq_transport::message::SubscribeOptions;
-use moq_transport::serve::{Track, TrackReader, TracksReader};
+use moq_transport::serve::{ServeError, Track, TrackReader, TracksReader};
 use moq_transport::session::{Publisher, SessionConfig, SubscribeNamespace};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -70,6 +70,8 @@ impl Drop for EmptyRemoteSlotCleanup {
             std::mem::drop(runtime.spawn(async move {
                 remove_empty_remote_slot(&remotes, &key, &slot).await;
             }));
+        } else {
+            tracing::warn!(remote_url = %key.0, "could not clean up an empty remote slot outside a Tokio runtime");
         }
     }
 }
@@ -113,6 +115,8 @@ impl Drop for EmptyTrackSlotCleanup {
             std::mem::drop(runtime.spawn(async move {
                 remove_empty_track_slot(&tracks, &key, &slot).await;
             }));
+        } else {
+            tracing::warn!(namespace = %key.0, track = %key.1, "could not clean up an empty remote track slot outside a Tokio runtime");
         }
     }
 }
@@ -125,6 +129,12 @@ struct CachedTrack {
     /// Interest in this cached reader. When it goes idle for the configured
     /// grace period the upstream subscription to the peer relay is released.
     interest: TrackInterest,
+}
+
+#[derive(Debug)]
+pub(crate) enum RemoteSubscribeError {
+    Peer(ServeError),
+    Route(anyhow::Error),
 }
 
 /// Manages connections to remote relays.
@@ -251,7 +261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_coordinator_lookup_survives_later_connection_error() {
+    async fn connection_error_is_not_a_conclusive_lookup() {
         let manager = RemoteManager::new(Arc::new(FoundCoordinator), vec![]);
         let mut lookup_succeeded = false;
 
@@ -264,8 +274,8 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_err());
-        assert!(lookup_succeeded);
+        assert!(matches!(result, Err(RemoteSubscribeError::Route(_))));
+        assert!(!lookup_succeeded);
     }
 
     #[test]
@@ -395,18 +405,16 @@ mod tests {
 
     const GRACE: Duration = Duration::from_secs(30);
 
-    /// The slot must be cleared before the caller drops its peer subscription, so
-    /// a later subscriber re-subscribes instead of attaching to a dying reader.
+    /// The generation remains visible but unusable until the caller finishes the
+    /// peer request stream, preventing a replacement from overtaking teardown.
     #[tokio::test(start_paused = true)]
-    async fn evict_when_idle_clears_the_slot_once_unwatched() {
+    async fn evict_when_idle_marks_the_slot_closing_once_unwatched() {
         let (slot, interest) = cached_track();
 
         evict_when_idle(&slot, &interest, GRACE).await;
 
-        assert!(
-            slot.lock().await.is_none(),
-            "slot must be cleared before the subscription is released"
-        );
+        assert!(slot.lock().await.is_some());
+        assert!(interest.is_closing());
     }
 
     #[tokio::test(start_paused = true)]
@@ -425,7 +433,8 @@ mod tests {
 
         drop(guard);
         evict.await;
-        assert!(slot.lock().await.is_none());
+        assert!(slot.lock().await.is_some());
+        assert!(interest.is_closing());
     }
 
     /// A replacement generation owns the slot now, so this subscription is stale:
@@ -490,6 +499,29 @@ impl RemoteManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn insert_test_remote(
+        &self,
+        url: Url,
+        publisher: Publisher,
+        subscriber: moq_transport::session::Subscriber,
+    ) {
+        let remote = Remote {
+            context: Remote::context_for_endpoint(url.clone(), None),
+            url: url.clone(),
+            subscriber,
+            publisher,
+            tracks: Arc::new(Mutex::new(HashMap::new())),
+            connected: Arc::new(AtomicBool::new(true)),
+            cancel: CancellationToken::new(),
+            cache_idle_timeout: self.cache_idle_timeout,
+        };
+        self.remotes
+            .lock()
+            .await
+            .insert((url, None), Arc::new(Mutex::new(Some(remote))));
+    }
+
     /// Override how long an unwatched cross-relay cache entry is retained before
     /// its upstream subscription is released.
     ///
@@ -520,6 +552,10 @@ impl RemoteManager {
             &mut coordinator_lookup_succeeded,
         )
         .await
+        .map_err(|err| match err {
+            RemoteSubscribeError::Peer(err) => anyhow::Error::new(err),
+            RemoteSubscribeError::Route(err) => err,
+        })
     }
 
     pub(crate) async fn subscribe_with_lookup_status(
@@ -528,7 +564,7 @@ impl RemoteManager {
         namespace: &TrackNamespace,
         track_name: impl Into<TrackName>,
         coordinator_lookup_succeeded: &mut bool,
-    ) -> anyhow::Result<Option<(TrackReader, TrackInterestGuard)>> {
+    ) -> Result<Option<(TrackReader, TrackInterestGuard)>, RemoteSubscribeError> {
         let track_name = track_name.into();
 
         // Coordinator::lookup_track is the ergonomic routing entry point: it
@@ -539,15 +575,12 @@ impl RemoteManager {
             .lookup_track(scope, namespace, &track_name.to_string())
             .await
         {
-            Ok(result) => {
-                *coordinator_lookup_succeeded = true;
-                result
-            }
+            Ok(result) => result,
             Err(CoordinatorError::NamespaceNotFound) => {
                 *coordinator_lookup_succeeded = true;
                 return Ok(None);
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(RemoteSubscribeError::Route(err.into())),
         };
 
         let url = origin.url();
@@ -560,17 +593,25 @@ impl RemoteManager {
             Ok(remote) => remote,
             Err(err) => {
                 tracing::error!(remote_url = %url, error = %err, "failed to connect to remote relay: {}", err);
-                return Err(err);
+                return Err(RemoteSubscribeError::Route(err));
             }
         };
 
         match remote.subscribe(namespace.clone(), track_name).await {
-            Ok(reader) => Ok(reader),
-            Err(err) => {
+            Ok(reader) => {
+                *coordinator_lookup_succeeded = true;
+                Ok(reader)
+            }
+            Err(RemoteSubscribeError::Peer(err)) => {
+                *coordinator_lookup_succeeded = true;
+                tracing::debug!(remote_url = %url, error = %err, "remote relay rejected SUBSCRIBE");
+                Err(RemoteSubscribeError::Peer(err))
+            }
+            Err(RemoteSubscribeError::Route(err)) => {
                 tracing::warn!(remote_url = %url, error = %err, "remote subscribe failed, removing from cache");
                 self.remove_if_same_remote(&cache_key, &remote).await;
 
-                Err(err)
+                Err(RemoteSubscribeError::Route(err))
             }
         }
     }
@@ -645,13 +686,6 @@ impl RemoteManager {
         cache_key: RemoteCacheKey,
         client: Option<&quic::Client>,
     ) -> anyhow::Result<Remote> {
-        let client = match client {
-            Some(client) => client,
-            None => self.clients.first().ok_or_else(|| {
-                anyhow::anyhow!("no QUIC clients configured for remote connections")
-            })?,
-        };
-
         loop {
             // The manager lock only protects the map. The per-key slot lock protects
             // that key's connection state, so unrelated remotes can connect in parallel.
@@ -691,6 +725,13 @@ impl RemoteManager {
             if let Some(remote) = cached.take() {
                 remote.shutdown().await;
             }
+
+            let client = match client {
+                Some(client) => client,
+                None => self.clients.first().ok_or_else(|| {
+                    anyhow::anyhow!("no QUIC clients configured for remote connections")
+                })?,
+            };
 
             tracing::info!(remote_url = %cache_key.0, "connecting to remote relay");
             let remote = match Remote::connect(
@@ -779,10 +820,9 @@ async fn remove_empty_remote_slot(
 
 /// Clear a cached cross-relay track once it has been unwatched for `timeout`.
 ///
-/// Resolving means the caller should drop its subscription to the peer relay. The
-/// slot is cleared *before* returning, while the lock is still held, so a
-/// subscriber arriving afterwards misses the cache and re-subscribes instead of
-/// attaching to a reader whose upstream subscription is being torn down.
+/// Resolving means the caller should end its subscription to the peer relay. The
+/// slot remains in a closing state until that teardown completes, so a replacement
+/// SUBSCRIBE cannot overtake the old UNSUBSCRIBE.
 ///
 /// The idle re-check happens under the slot lock, which is also where interest
 /// guards are created, so a subscriber racing eviction is either counted here
@@ -799,7 +839,7 @@ async fn evict_when_idle(slot: &TrackSlot, interest: &TrackInterest, timeout: Du
     loop {
         interest.idle_for(timeout).await;
 
-        let mut cached = slot.lock().await;
+        let cached = slot.lock().await;
 
         // A different generation now owns the slot; it has its own idle timer, so
         // this subscription is no longer serving anything and must not clear it.
@@ -813,7 +853,7 @@ async fn evict_when_idle(slot: &TrackSlot, interest: &TrackInterest, timeout: Du
         }
 
         if interest.is_idle() {
-            cached.take();
+            interest.mark_closing();
             return;
         }
 
@@ -1016,12 +1056,15 @@ impl Remote {
         &self,
         namespace: TrackNamespace,
         track_name: TrackName,
-    ) -> anyhow::Result<Option<(TrackReader, TrackInterestGuard)>> {
+    ) -> Result<Option<(TrackReader, TrackInterestGuard)>, RemoteSubscribeError> {
         let key = (namespace.clone(), track_name.clone());
 
         loop {
             if !self.is_connected() {
-                anyhow::bail!("remote connection to {} is closed", self.url);
+                return Err(RemoteSubscribeError::Route(anyhow::anyhow!(
+                    "remote connection to {} is closed",
+                    self.url
+                )));
             }
 
             let slot = {
@@ -1044,6 +1087,16 @@ impl Remote {
 
             if !is_current_slot {
                 cleanup.disarm();
+                continue;
+            }
+
+            let closing = cached
+                .as_ref()
+                .and_then(|entry| entry.interest.is_closing().then(|| entry.interest.clone()));
+            if let Some(closing) = closing {
+                cleanup.disarm();
+                drop(cached);
+                closing.removed().await;
                 continue;
             }
 
@@ -1070,7 +1123,7 @@ impl Remote {
 
             let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
             let subscribe_result = tokio::select! {
-                result = subscriber.subscribe_open(writer) => result,
+                result = subscriber.subscribe_start(writer) => result,
                 _ = cancel.cancelled() => {
                     Err(moq_transport::serve::ServeError::Cancel)
                 }
@@ -1082,15 +1135,30 @@ impl Remote {
                     drop(cached);
                     remove_empty_track_slot(&self.tracks, &key, &slot).await;
                     cleanup.disarm();
-                    return Err(err.into());
+                    return Err(RemoteSubscribeError::Route(err.into()));
                 }
             };
+
+            if let Err(err) = subscribe.ok().await {
+                let peer_rejected = subscribe.peer_rejected();
+                drop(cached);
+                remove_empty_track_slot(&self.tracks, &key, &slot).await;
+                cleanup.disarm();
+                return if peer_rejected {
+                    Err(RemoteSubscribeError::Peer(err))
+                } else {
+                    Err(RemoteSubscribeError::Route(err.into()))
+                };
+            }
 
             if !self.is_connected() {
                 drop(cached);
                 remove_empty_track_slot(&self.tracks, &key, &slot).await;
                 cleanup.disarm();
-                anyhow::bail!("remote connection to {} is closed", self.url);
+                return Err(RemoteSubscribeError::Route(anyhow::anyhow!(
+                    "remote connection to {} is closed",
+                    self.url
+                )));
             }
 
             let interest = TrackInterest::new();
@@ -1126,18 +1194,15 @@ impl Remote {
                         tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription cancelled");
                     }
                     // Nobody downstream is watching this cross-relay track any
-                    // more, so stop pulling it from the peer relay. The slot is
-                    // already cleared by the time this resolves, so a later
-                    // subscriber re-subscribes rather than attaching to a reader
-                    // that is about to go silent.
+                    // more, so stop pulling it from the peer relay. The slot stays
+                    // closing until the request stream has been torn down.
                     _ = evict_when_idle(&cleanup_slot, &interest, idle_timeout) => {
                         tracing::info!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "releasing idle remote track subscription");
                         metrics::counter!("moq_relay_cache_idle_evictions_total", "source" => "remote").increment(1);
                     }
                 }
 
-                // Sends UNSUBSCRIBE to the peer relay if it is still open.
-                drop(subscribe);
+                subscribe.unsubscribe().await;
 
                 if let Some(tracks) = tracks.upgrade() {
                     let mut cached = cleanup_slot.lock().await;
@@ -1149,6 +1214,7 @@ impl Remote {
 
                     remove_empty_track_slot(&tracks, &cleanup_key, &cleanup_slot).await;
                 }
+                interest.mark_removed();
             });
 
             return Ok(Some((reader, guard)));

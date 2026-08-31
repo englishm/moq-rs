@@ -31,6 +31,7 @@ pub enum DataStreamResetCode {
     UnknownObjectStatus = 0x6,
     /// The request's authorization token expired.
     ExpiredAuthToken = 0x7,
+    // 0x8 is unassigned in the draft-18 registry.
     /// The endpoint is overloaded.
     ExcessiveLoad = 0x9,
     /// The track was detected to be malformed.

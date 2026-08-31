@@ -460,6 +460,8 @@ impl Subscribed {
         }
 
         if let Err(err) = &result {
+            // The forwarding error remains authoritative if a concurrent
+            // request cancellation already closed the shared state.
             let _ = self.forwarder.close(err.clone().into(), 0);
         }
         let terminal = self.finish().await;
@@ -477,6 +479,8 @@ impl Subscribed {
     ) -> Result<(), SessionError> {
         let res = self.serve_inner(track, deadline, largest_location).await;
         if let Err(err) = &res {
+            // The forwarding error remains authoritative if a concurrent
+            // request cancellation already closed the shared state.
             let _ = self.forwarder.close(err.clone().into(), 0);
         }
         let terminal = self.finish().await;
@@ -697,7 +701,12 @@ impl ObjectForwarder {
                     Ok(None) => done = Some(Ok(())),
                     Err(err) => done = Some(Err(err)),
                 },
-                res = self.closed(), if done.is_none() || !tasks.is_empty() => return res.map_err(Into::into),
+                res = self.closed(), if done.is_none() || !tasks.is_empty() => {
+                    // Returning drops active subgroup futures. Their
+                    // SubgroupStream guards reset any stream that has not
+                    // reached FIN, including one blocked on a partial object.
+                    return res.map_err(SessionError::from);
+                },
                 res = tasks.next(), if !tasks.is_empty() => {
                     // Remaining subgroups still get their chance to send; the
                     // first local failure is reported once they settle.
@@ -707,8 +716,8 @@ impl ObjectForwarder {
                         }
                     }
                 },
-                // Reached only once both the subgroup source and `closed()` are
-                // disabled, which requires `done` to be set.
+                // Reached once the subgroup source has ended and every active
+                // subgroup task has settled.
                 else => {
                     // The track's own outcome is the authoritative one; a
                     // per-subgroup fault is only reported when the track itself
@@ -814,7 +823,21 @@ impl ObjectForwarder {
                 DataStreamResetCode::Cancelled
             }
             SessionError::Serve(ServeError::Size) => DataStreamResetCode::MalformedTrack,
-            SessionError::Serve(ServeError::Closed(_)) => DataStreamResetCode::SessionClosed,
+            SessionError::Serve(ServeError::Closed(code)) => match *code {
+                code if code == message::PublishDoneCode::GoingAway as u64 => {
+                    DataStreamResetCode::GoingAway
+                }
+                code if code == message::PublishDoneCode::TooFarBehind as u64 => {
+                    DataStreamResetCode::TooFarBehind
+                }
+                code if code == message::PublishDoneCode::ExcessiveLoad as u64 => {
+                    DataStreamResetCode::ExcessiveLoad
+                }
+                code if code == message::PublishDoneCode::MalformedTrack as u64 => {
+                    DataStreamResetCode::MalformedTrack
+                }
+                _ => DataStreamResetCode::InternalError,
+            },
             _ => DataStreamResetCode::InternalError,
         }
     }
@@ -1024,6 +1047,7 @@ impl ObjectForwarder {
         header: data::SubgroupHeader,
         mut subgroup_reader: serve::SubgroupReader,
         state: State<ObjectForwarderState>,
+        stream_count: StreamCount,
         delivery_filter: DeliveryFilter,
     ) -> (
         bytes::BytesMut,
@@ -1038,6 +1062,7 @@ impl ObjectForwarder {
             };
 
         let mut output = SubgroupOutput::buffer();
+        stream_count.opened();
         let state_status = state.lock().closed.clone();
         let res = if state_status.is_ok() {
             Self::serve_subgroup_objects(
@@ -2068,6 +2093,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_subgroup_stream_resets_the_peer() {
+        let (client, server) = crate::session::test_support::loopback_session_pair().await;
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let received = tokio::spawn(async move {
+            let mut stream = server.accept_uni().await.expect("accept subgroup stream");
+            let _ = accepted_tx.send(());
+            loop {
+                match stream.read(1024).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("unfinished subgroup ended with FIN"),
+                    Err(error) => return error,
+                }
+            }
+        });
+
+        let send = client.open_uni().await.expect("open subgroup stream");
+        let mut stream = SubgroupStream::new(Writer::new(send));
+        stream.writer.write(b"partial").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), accepted_rx)
+            .await
+            .expect("peer did not accept subgroup stream")
+            .expect("subgroup accept task ended");
+        drop(stream);
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), received)
+            .await
+            .expect("peer did not receive subgroup reset")
+            .expect("join subgroup receiver");
+        assert!(matches!(
+            error,
+            web_transport::Error::Read(web_transport::quinn::ReadError::Reset(code))
+                if code == DataStreamResetCode::Cancelled as u32
+        ));
+    }
+
+    #[tokio::test]
     async fn deadline_prevents_subscribe_ok() {
         let (subscribed, _recv, _outgoing, _responses) = test_subscribed().await;
         let (_writer, reader) = serve::Track::new(
@@ -2403,18 +2464,20 @@ mod tests {
 
         let (subgroup, header) = subgroup_with_one_object().await;
         let state = State::<ObjectForwarderState>::default();
+        let stream_count = StreamCount::default();
 
         let (buffer, res, termination) = ObjectForwarder::serve_subgroup_to_parts(
             header.clone(),
             subgroup,
             state.clone(),
+            stream_count.clone(),
             all_objects(),
         )
         .await;
 
         res.expect("serving a complete subgroup should succeed");
         assert_eq!(termination, Some(SubgroupTermination::Fin));
-        assert_eq!(state.lock().stream_count, 1);
+        assert_eq!(stream_count.get(), 1);
 
         let mut buffer = buffer.freeze();
         let header_type = data::StreamHeaderType::decode(&mut buffer).unwrap();
@@ -2433,11 +2496,13 @@ mod tests {
     async fn filtered_subgroup_does_not_open_stream() {
         let (subgroup, header) = subgroup_with_one_object().await;
         let state = State::<ObjectForwarderState>::default();
+        let stream_count = StreamCount::default();
 
         let (buffer, res, termination) = ObjectForwarder::serve_subgroup_to_parts(
             header,
             subgroup,
             state.clone(),
+            stream_count.clone(),
             DeliveryFilter {
                 forward: false,
                 start_location: None,
@@ -2449,7 +2514,7 @@ mod tests {
         res.expect("filtering a subgroup should succeed");
         assert!(buffer.is_empty());
         assert_eq!(termination, None);
-        assert_eq!(state.lock().stream_count, 0);
+        assert_eq!(stream_count.get(), 0);
     }
 
     #[tokio::test]
@@ -2495,6 +2560,7 @@ mod tests {
             header.clone(),
             subgroup,
             state,
+            StreamCount::default(),
             all_objects(),
         );
         tokio::pin!(fut);
@@ -2545,6 +2611,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_cancellation_stops_a_partial_object_after_source_closes() {
+        use bytes::Bytes;
+
+        use crate::coding::TrackNamespace;
+
+        let (mut subscribed, mut recv, _outgoing, _responses) = test_subscribed().await;
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(serve::Subgroup {
+                group_id: 1,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        let mut object_writer = subgroup_writer.create(5, None).unwrap();
+        object_writer.write(Bytes::from_static(b"hel")).unwrap();
+
+        let stream_count = subscribed.forwarder.stream_count_handle();
+        let serve = subscribed.forwarder.serve(track_reader, all_objects());
+        tokio::pin!(serve);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if stream_count.get() == 1 {
+                    break;
+                }
+                tokio::select! {
+                    result = &mut serve => panic!("serve ended before opening a stream: {result:?}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        })
+        .await
+        .expect("subgroup stream did not open");
+
+        // The source can end while its latest subgroup still has an incomplete
+        // object. Cancellation must continue to interrupt that subgroup.
+        drop(subgroups_writer);
+        recv.recv_unsubscribe().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut serve)
+            .await
+            .expect("UNSUBSCRIBE did not stop the partial object");
+        assert!(matches!(
+            result,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+
+        drop(object_writer);
+        drop(subgroup_writer);
+    }
+
+    #[tokio::test]
     async fn short_object_resets_subgroup_as_malformed() {
         use bytes::Bytes;
 
@@ -2583,6 +2703,7 @@ mod tests {
             header,
             subgroup,
             State::default(),
+            StreamCount::default(),
             all_objects(),
         )
         .await;
@@ -2638,8 +2759,16 @@ mod tests {
             DataStreamResetCode::MalformedTrack
         );
         assert_eq!(
-            ObjectForwarder::reset_code_for(&ServeError::Closed(0x2).into()),
-            DataStreamResetCode::SessionClosed
+            ObjectForwarder::reset_code_for(
+                &ServeError::Closed(message::PublishDoneCode::TooFarBehind as u64).into()
+            ),
+            DataStreamResetCode::TooFarBehind
+        );
+        assert_eq!(
+            ObjectForwarder::reset_code_for(
+                &ServeError::Closed(message::PublishDoneCode::TrackEnded as u64).into()
+            ),
+            DataStreamResetCode::InternalError
         );
         assert_eq!(
             ObjectForwarder::reset_code_for(&ServeError::internal_ctx("boom").into()),

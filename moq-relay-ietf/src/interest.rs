@@ -20,6 +20,7 @@
 //! name, an outstanding guard from the old entry decrements the old counter
 //! instead of making the new entry look busy.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +37,13 @@ struct InterestInner {
     /// Number of live guards. The count lives in the watch value so that
     /// mutations and change notifications cannot get out of step.
     count: watch::Sender<usize>,
+    lifecycle: AtomicU8,
+    removed: watch::Sender<bool>,
 }
+
+const ACTIVE: u8 = 0;
+const CLOSING: u8 = 1;
+const REMOVED: u8 = 2;
 
 impl Default for TrackInterest {
     fn default() -> Self {
@@ -47,8 +54,13 @@ impl Default for TrackInterest {
 impl TrackInterest {
     pub fn new() -> Self {
         let (count, _) = watch::channel(0);
+        let (removed, _) = watch::channel(false);
         Self {
-            inner: Arc::new(InterestInner { count }),
+            inner: Arc::new(InterestInner {
+                count,
+                lifecycle: AtomicU8::new(ACTIVE),
+                removed,
+            }),
         }
     }
 
@@ -78,6 +90,28 @@ impl TrackInterest {
     /// entry generation.
     pub fn same_generation(&self, other: &TrackInterest) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        self.inner.lifecycle.load(Ordering::Acquire) != ACTIVE
+    }
+
+    pub(crate) fn mark_closing(&self) {
+        self.inner.lifecycle.store(CLOSING, Ordering::Release);
+    }
+
+    pub(crate) fn mark_removed(&self) {
+        self.inner.lifecycle.store(REMOVED, Ordering::Release);
+        self.inner.removed.send_replace(true);
+    }
+
+    pub(crate) async fn removed(&self) {
+        let mut removed = self.inner.removed.subscribe();
+        while !*removed.borrow_and_update() {
+            if removed.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Resolve once the count has been continuously zero for `grace`.

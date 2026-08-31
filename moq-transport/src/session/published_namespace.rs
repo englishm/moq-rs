@@ -19,6 +19,7 @@ use super::{
     PublishNamespaceInfo, Reader, Session, SessionError, Subscriber, Writer, CANCELLED_STREAM_CODE,
 };
 
+// Immediate cancellation can queue after REQUEST_OK before the stream task runs.
 const RESPONSE_QUEUE_CAPACITY: usize = 2;
 
 enum StreamAction {
@@ -296,6 +297,7 @@ mod tests {
             None,
             RequestId::new(0, 1),
             bidi_task_tx,
+            Default::default(),
         );
         PublishedNamespace::new(subscriber, 6, TrackNamespace::from_utf8_path("test"))
     }
@@ -337,6 +339,7 @@ mod tests {
             None,
             RequestId::new(0, 1),
             bidi_task_tx,
+            Default::default(),
         );
         let (mut published, recv) =
             PublishedNamespace::new(subscriber, 0, TrackNamespace::from_utf8_path("test"));
@@ -385,6 +388,7 @@ mod tests {
             None,
             RequestId::new(0, 1),
             bidi_task_tx,
+            Default::default(),
         );
         let (mut published, recv) =
             PublishedNamespace::new(subscriber, 0, TrackNamespace::from_utf8_path("test"));
@@ -428,6 +432,7 @@ mod tests {
             None,
             RequestId::new(0, 1),
             bidi_task_tx,
+            Default::default(),
         );
         let (mut published, recv) =
             PublishedNamespace::new(subscriber, 0, TrackNamespace::from_utf8_path("test"));

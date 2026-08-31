@@ -41,6 +41,7 @@ pub use track_status_requested::*;
 use reader::*;
 use writer::*;
 
+use bytes::Buf;
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
@@ -53,7 +54,7 @@ use crate::mlog;
 use crate::watch::Queue;
 use crate::{message, setup};
 
-pub(super) const CANCELLED_STREAM_CODE: u32 = 0x1;
+pub(super) const CANCELLED_STREAM_CODE: u32 = crate::data::DataStreamResetCode::Cancelled as u32;
 use std::path::PathBuf;
 
 pub(crate) struct BidiResponse {
@@ -1595,6 +1596,10 @@ impl Session {
                 )))
             }
         }?;
+
+        if buf.has_remaining() {
+            return Err(DecodeError::InvalidLength(0, buf.remaining()).into());
+        }
 
         if !msg.parameter_scopes_valid() {
             return Err(DecodeError::InvalidParameter.into());
