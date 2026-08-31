@@ -256,6 +256,8 @@ pub(crate) struct PublishReceivedRecv {
     /// Objects without going through the application.
     writer: Option<TrackWriterMode>,
 
+    pub(super) default_publisher_priority: u8,
+
     /// PUBLISH_DONE Stream Count accounting (§10.11).
     drain: StreamDrain<u64>,
 }
@@ -272,6 +274,7 @@ impl PublishReceivedRecv {
         name: TrackName,
         initial_forward: bool,
         largest_location: Option<Location>,
+        default_publisher_priority: u8,
         writer: serve::TrackWriter,
         reader: TrackReader,
     ) -> (PublishReceived, PublishReceivedRecv) {
@@ -291,6 +294,7 @@ impl PublishReceivedRecv {
         let recv = Self {
             state: transport_state,
             writer: Some(writer.into()),
+            default_publisher_priority,
             drain: StreamDrain::default(),
         };
 
@@ -319,11 +323,23 @@ impl PublishReceivedRecv {
             }
         };
 
-        let subgroup_writer = match subgroups.create(serve::Subgroup {
-            group_id: header.group_id,
-            subgroup_id: header.subgroup_id.unwrap_or(0),
-            priority: header.publisher_priority,
-        }) {
+        let priority = if header.header_type.uses_default_priority() {
+            self.default_publisher_priority
+        } else {
+            header.publisher_priority
+        };
+        let subgroup_writer = match subgroups.create_with_metadata(
+            serve::Subgroup {
+                group_id: header.group_id,
+                subgroup_id: header.subgroup_id.unwrap_or(0),
+                priority,
+            },
+            serve::SubgroupStreamMetadata {
+                has_properties: header.header_type.has_properties(),
+                end_of_group: header.header_type.end_of_group(),
+                first_object: header.header_type.begins_with_first_object(),
+            },
+        ) {
             Ok(writer) => writer,
             Err(err) => {
                 // Put the writer back: one rejected subgroup must not strand
@@ -522,6 +538,7 @@ mod tests {
         let subscriber = crate::session::Subscriber::new(
             outgoing.clone(),
             loopback_session().await,
+            crate::session::Transport::WebTransport,
             None,
             RequestId::new(0, 1),
             bidi_task_tx,
@@ -536,6 +553,7 @@ mod tests {
             "0.mp4".into(),
             true,
             None,
+            128,
             writer,
             reader,
         );

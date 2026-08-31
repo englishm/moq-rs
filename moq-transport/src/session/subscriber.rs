@@ -185,6 +185,8 @@ pub struct Subscriber {
     /// WebTransport session, used to open bidi streams for requests (draft-18).
     webtransport: web_transport::Session,
 
+    transport: super::Transport,
+
     /// Shared with Publisher so all requests within a session use unique IDs.
     /// When we need a new Request Id for sending a request, we can get it from here.
     /// The manager is shared with the Publisher, so the session uses unique request ids
@@ -201,10 +203,45 @@ pub struct Subscriber {
     bidi_task_tx: super::BidiTaskSender,
 }
 
+#[derive(Default)]
+struct ReceivedSubgroup {
+    writer: Option<serve::SubgroupWriter>,
+    complete: bool,
+}
+
+impl ReceivedSubgroup {
+    fn is_none(&self) -> bool {
+        self.writer.is_none()
+    }
+
+    fn set(&mut self, writer: serve::SubgroupWriter) {
+        self.writer = Some(writer);
+    }
+
+    fn as_mut(&mut self) -> Option<&mut serve::SubgroupWriter> {
+        self.writer.as_mut()
+    }
+
+    fn finish(&mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for ReceivedSubgroup {
+    fn drop(&mut self) {
+        if !self.complete {
+            if let Some(writer) = self.writer.take() {
+                let _ = writer.close(ServeError::internal_ctx("subgroup receive failed"));
+            }
+        }
+    }
+}
+
 impl Subscriber {
     pub(super) fn new(
         outgoing: Queue<Message>,
         webtransport: web_transport::Session,
+        transport: super::Transport,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         bidi_task_tx: super::BidiTaskSender,
@@ -216,6 +253,7 @@ impl Subscriber {
             subscribe_namespaces: Default::default(),
             outgoing,
             webtransport,
+            transport,
             request_id,
             mlog,
             track_alias_map: Default::default(),
@@ -651,6 +689,12 @@ impl Subscriber {
             .map_err(|_| SessionError::Internal)?
             .get_mut(&msg.id)
         {
+            let default_publisher_priority = msg
+                .track_extensions
+                .default_publisher_priority()
+                .map_err(SessionError::Decode)?
+                .unwrap_or(data::DEFAULT_PUBLISHER_PRIORITY);
+
             // Track Aliases are session-scoped (§10.1), so the alias in
             // SUBSCRIBE_OK must not already be bound by another SUBSCRIBE or an
             // inbound PUBLISH.
@@ -669,7 +713,7 @@ impl Subscriber {
             self.track_alias_notify.notify_waiters();
 
             // Notify the subscribe of the successful subscription
-            subscribe.ok(msg.track_alias)?;
+            subscribe.ok(msg.track_alias, default_publisher_priority)?;
         }
 
         Ok(())
@@ -1090,10 +1134,17 @@ impl Subscriber {
     /// This establishes a publisher-initiated subscription: the peer offers a
     /// track and this endpoint becomes its subscriber.
     fn recv_publish(&mut self, msg: &message::Publish) -> Result<(), SessionError> {
-        // First-cut policy: reject non-empty TrackExtensions. They are not
-        // carried through TrackReader/TrackWriter yet, so accepting them would
-        // silently drop relay-visible metadata (§8.6).
-        if !msg.track_extensions.is_empty() {
+        let default_publisher_priority = msg
+            .track_extensions
+            .default_publisher_priority()
+            .map_err(SessionError::Decode)?
+            .unwrap_or(data::DEFAULT_PUBLISHER_PRIORITY);
+        // DEFAULT_PUBLISHER_PRIORITY is consumed by subgroup decoding. Keep
+        // rejecting properties the serve model cannot preserve yet.
+        if !msg
+            .track_extensions
+            .contains_only(&[message::extension_type::DEFAULT_PUBLISHER_PRIORITY])
+        {
             self.send_request_error(
                 "publish",
                 message::RequestError {
@@ -1181,6 +1232,7 @@ impl Subscriber {
             msg.track_name.clone(),
             initial_forward,
             largest_location,
+            default_publisher_priority,
             writer,
             reader,
         );
@@ -1436,8 +1488,26 @@ impl Subscriber {
         tracing::trace!("[SUBSCRIBER] recv_stream: new stream received, decoding header");
         let mut reader = Reader::new(stream);
 
-        // Decode the stream header
-        let stream_header: data::StreamHeader = reader.decode().await?;
+        // A complete malformed stream header is a session error. Stop this
+        // stream explicitly before closing the session so dropping the receive
+        // handle cannot emit an unrelated code 0.
+        let stream_header: data::StreamHeader = match reader.decode().await {
+            Ok(header) => header,
+            Err(err) => {
+                if err.is_session_fatal() {
+                    let code = u32::try_from(err.code()).unwrap_or(0x1);
+                    if self.transport == super::Transport::WebTransport {
+                        reader.stop(code);
+                    } else {
+                        // The transport dependency maps stream codes through
+                        // HTTP/3 even for raw sessions. Close raw QUIC directly
+                        // before dropping the receive stream instead.
+                        self.webtransport.close(code, "session protocol error");
+                    }
+                }
+                return Err(err);
+            }
+        };
         tracing::trace!(
             "[SUBSCRIBER] recv_stream: decoded stream header type={:?}",
             stream_header.header_type
@@ -1590,7 +1660,7 @@ impl Subscriber {
 
         let mut object_count = 0;
         let mut previous_object_id: Option<u64> = None;
-        let mut subgroup_writer: Option<serve::SubgroupWriter> = None;
+        let mut subgroup = ReceivedSubgroup::default();
         while !reader.done().await? {
             tracing::trace!(
                 "[SUBSCRIBER] recv_subgroup: reading object #{} (has_ext_headers={})",
@@ -1689,12 +1759,12 @@ impl Subscriber {
                 ));
             }
 
-            if subgroup_writer.is_none() {
+            if subgroup.is_none() {
                 if stream_header_type.uses_first_object_id_as_subgroup_id() {
                     subgroup_header.subgroup_id = Some(current_object_id);
                 }
 
-                subgroup_writer = Some(self.open_subgroup_writer(origin, &subgroup_header)?);
+                subgroup.set(self.open_subgroup_writer(origin, &subgroup_header)?);
             }
 
             // Log subgroup object parsed/received
@@ -1734,7 +1804,7 @@ impl Subscriber {
             // Pass the absolute Object ID and extension headers through to the serve layer.
             // TODO SLG - object status is still being ignored.
 
-            let subgroup_writer = subgroup_writer.as_mut().ok_or(SessionError::Internal)?;
+            let subgroup_writer = subgroup.as_mut().ok_or(SessionError::Internal)?;
             let mut object_writer = subgroup_writer.create_with_id(
                 current_object_id,
                 remaining_bytes,
@@ -1778,6 +1848,7 @@ impl Subscriber {
             );
             object_count += 1;
         }
+        subgroup.finish();
 
         tracing::trace!(
             "[SUBSCRIBER] recv_subgroup: completed subgroup (group_id={}, subgroup_id={}, {} objects received)",
@@ -1907,7 +1978,14 @@ mod tests {
     fn test_subscriber(session: web_transport::Session) -> Subscriber {
         let outgoing = Queue::default().split().0;
         let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
-        Subscriber::new(outgoing, session, None, RequestId::new(0, 1), bidi_task_tx)
+        Subscriber::new(
+            outgoing,
+            session,
+            super::super::Transport::WebTransport,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        )
     }
 
     /// Like `test_subscriber`, but keeps the background-task receiver alive.
@@ -1923,7 +2001,14 @@ mod tests {
         let outgoing = Queue::default().split().0;
         let (bidi_task_tx, bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
         (
-            Subscriber::new(outgoing, session, None, RequestId::new(0, 1), bidi_task_tx),
+            Subscriber::new(
+                outgoing,
+                session,
+                super::super::Transport::WebTransport,
+                None,
+                RequestId::new(0, 1),
+                bidi_task_tx,
+            ),
             bidi_task_rx,
         )
     }
@@ -1940,6 +2025,16 @@ mod tests {
         request_id: u64,
         track_alias: u64,
     ) -> Subscribe {
+        register_test_subscribe_with_priority(subscriber, track, request_id, track_alias, 128)
+    }
+
+    fn register_test_subscribe_with_priority(
+        subscriber: &Subscriber,
+        track: serve::TrackWriter,
+        request_id: u64,
+        track_alias: u64,
+        default_publisher_priority: u8,
+    ) -> Subscribe {
         let (subscribe, mut recv, _message) = Subscribe::new(
             subscriber.clone(),
             request_id,
@@ -1947,7 +2042,7 @@ mod tests {
             KeyValuePairs::default(),
         )
         .unwrap();
-        recv.ok(track_alias).unwrap();
+        recv.ok(track_alias, default_publisher_priority).unwrap();
         subscriber
             .subscribes
             .lock()
@@ -2020,6 +2115,184 @@ mod tests {
             assert_eq!(object.object_id, expected_object_id);
             assert_eq!(object.read_all().await.unwrap().as_ref(), &[0]);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relays_moxygen_type_78_without_misreading_the_first_object() {
+        let (receiver_session, peer_session) = loopback_session_pair().await;
+        let subscriber = test_subscriber(receiver_session.clone());
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), "type-78").produce();
+        let subscribe =
+            register_test_subscribe_with_priority(&subscriber, track_writer, 0, 42, 200);
+
+        let send = async {
+            let stream = peer_session.open_uni().await.unwrap();
+            let mut writer = Writer::new(stream);
+            // Literal moxygen test-1 wire image: type 0x78, alias 42, group 0,
+            // then Object 0 with a one-byte payload. Subgroup ID and priority
+            // are both omitted by the header type.
+            writer
+                .write(&[0x78, 0x2a, 0x00, 0x00, 0x01, b'x'])
+                .await
+                .unwrap();
+            writer.finish().unwrap();
+        };
+        let receive = async {
+            let stream = receiver_session.accept_uni().await.unwrap();
+            Subscriber::recv_stream(subscriber, stream).await.unwrap();
+        };
+        tokio::join!(send, receive);
+        drop(subscribe);
+
+        let (publisher_session, downstream_session) = loopback_session_pair().await;
+        let outgoing = Queue::default().split().0;
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = super::super::Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (mut forwarder, _recv) = super::super::ObjectForwarder::new(publisher, 84, None);
+        let forward = forwarder.serve(
+            track_reader,
+            super::super::DeliveryFilter {
+                forward: true,
+                start_location: None,
+                end_group_id: None,
+            },
+        );
+        let verify = async move {
+            let stream = downstream_session.accept_uni().await.unwrap();
+            let mut reader = Reader::new(stream);
+            let stream_header: data::StreamHeader = reader.decode().await.unwrap();
+            let header = stream_header.subgroup_header.unwrap();
+            assert_eq!(header.track_alias, 84);
+            assert_eq!(header.subgroup_id, Some(0));
+            assert_eq!(header.publisher_priority, 200);
+            assert!(header.header_type.end_of_group());
+            assert!(header.header_type.begins_with_first_object());
+            assert!(!header.header_type.has_properties());
+
+            let object: data::SubgroupObject = reader.decode().await.unwrap();
+            assert_eq!(object.object_id_delta, 0);
+            assert_eq!(
+                reader
+                    .read_chunk(object.payload_length)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                b"x"[..]
+            );
+            assert!(reader.done().await.unwrap());
+        };
+        let (forward_result, ()) = tokio::join!(forward, verify);
+        forward_result.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receives_first_object_subgroup_id_mode_with_properties() {
+        let (receiver_session, peer_session) = loopback_session_pair().await;
+        let subscriber = test_subscriber(receiver_session.clone());
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), "type-53").produce();
+        let subscribe = register_test_subscribe(&subscriber, track_writer, 0, 42);
+
+        let send = async {
+            let stream = peer_session.open_uni().await.unwrap();
+            let mut writer = Writer::new(stream);
+            // Type 0x53: PROPERTIES + subgroup ID from first Object +
+            // FIRST_OBJECT, with explicit priority 200. Object 7 carries
+            // integer property 2=9 and a one-byte payload.
+            writer
+                .write(&[0x53, 0x2a, 0x00, 200, 0x07, 0x02, 0x02, 0x09, 0x01, b'x'])
+                .await
+                .unwrap();
+            writer.finish().unwrap();
+        };
+        let receive = async {
+            let stream = receiver_session.accept_uni().await.unwrap();
+            Subscriber::recv_stream(subscriber, stream).await.unwrap();
+        };
+        tokio::join!(send, receive);
+        drop(subscribe);
+
+        let serve::TrackReaderMode::Subgroups(mut subgroups) = track_reader.mode().await.unwrap()
+        else {
+            panic!("expected subgroup delivery");
+        };
+        let mut subgroup = subgroups.next().await.unwrap().unwrap();
+        assert_eq!(subgroup.subgroup_id, 7);
+        assert_eq!(subgroup.priority, 200);
+        assert!(subgroup.metadata().has_properties);
+        assert!(subgroup.metadata().first_object);
+        let mut object = subgroup.next().await.unwrap().unwrap();
+        assert_eq!(object.object_id, 7);
+        assert!(object.extension_headers.has(2));
+        assert_eq!(object.read_all().await.unwrap().as_ref(), b"x");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_ok_records_default_publisher_priority() {
+        let mut subscriber = test_subscriber(loopback_session().await);
+        let (subscribe, recv, _message) = Subscribe::new(
+            subscriber.clone(),
+            0,
+            test_track("priority"),
+            KeyValuePairs::default(),
+        )
+        .unwrap();
+        subscriber.subscribes.lock().unwrap().insert(0, recv);
+        let mut track_extensions = message::TrackExtensions::default();
+        track_extensions.set_default_publisher_priority(200);
+
+        subscriber
+            .recv_subscribe_ok(&message::SubscribeOk {
+                id: 0,
+                track_alias: 42,
+                params: KeyValuePairs::default(),
+                track_extensions,
+            })
+            .unwrap();
+
+        assert_eq!(
+            subscriber
+                .subscribes
+                .lock()
+                .unwrap()
+                .get(&0)
+                .unwrap()
+                .default_publisher_priority,
+            200
+        );
+        drop(subscribe);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_subgroup_type_stops_stream_with_protocol_violation() {
+        let (receiver_session, peer_session) = loopback_session_pair().await;
+        let subscriber = test_subscriber(receiver_session.clone());
+
+        let send = async {
+            let mut stream = peer_session.open_uni().await.unwrap();
+            stream.write(&[0x16]).await.unwrap();
+            stream.closed().await.unwrap()
+        };
+        let receive = async {
+            let stream = receiver_session.accept_uni().await.unwrap();
+            Subscriber::recv_stream(subscriber, stream)
+                .await
+                .unwrap_err()
+        };
+        let (stop_code, err) = tokio::join!(send, receive);
+
+        assert_eq!(stop_code, Some(0x3));
+        assert!(matches!(
+            err,
+            SessionError::Decode(crate::coding::DecodeError::InvalidHeaderType)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2115,7 +2388,7 @@ mod tests {
         // still alive, so the recv state accepts the mutation. Then drop the
         // handle — its Drop runs against the still-empty map (a no-op) — and
         // drive remove_subscribe directly via the registered recv state.
-        recv.ok(track_alias).unwrap();
+        recv.ok(track_alias, 128).unwrap();
         drop(subscribe);
         subscriber
             .subscribes
@@ -2179,6 +2452,59 @@ mod tests {
         let publish = subscriber.publish_received().await.expect("queued PUBLISH");
         assert_eq!(publish.track_alias(), 7);
         assert_eq!(publish.name(), &TrackName::from("video"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recv_publish_accepts_default_publisher_priority() {
+        let mut subscriber = test_subscriber(loopback_session().await);
+        let mut track_extensions = message::TrackExtensions::default();
+        track_extensions.set_default_publisher_priority(200);
+
+        subscriber
+            .recv_publish(&message::Publish {
+                id: 1,
+                track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+                track_name: "video".into(),
+                track_alias: 7,
+                params: Default::default(),
+                track_extensions,
+            })
+            .unwrap();
+
+        assert_eq!(
+            subscriber
+                .publishes_received
+                .lock()
+                .unwrap()
+                .get(&1)
+                .unwrap()
+                .default_publisher_priority,
+            200
+        );
+
+        let mut publish = subscriber.publish_received().await.unwrap();
+        let track_reader = publish.take_reader().unwrap();
+        let subgroup_writer = subscriber
+            .publishes_received
+            .lock()
+            .unwrap()
+            .get_mut(&1)
+            .unwrap()
+            .subgroup(data::SubgroupHeader {
+                header_type: data::StreamHeaderType::SubgroupIdDefaultPriorityFirstObject,
+                track_alias: 7,
+                group_id: 0,
+                subgroup_id: Some(0),
+                publisher_priority: 128,
+            })
+            .unwrap();
+        drop(subgroup_writer);
+
+        let serve::TrackReaderMode::Subgroups(mut subgroups) = track_reader.mode().await.unwrap()
+        else {
+            panic!("expected subgroup delivery");
+        };
+        assert_eq!(subgroups.next().await.unwrap().unwrap().priority, 200);
     }
 
     /// A second PUBLISH for a track we already subscribe to is rejected as a

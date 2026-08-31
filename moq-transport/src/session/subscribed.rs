@@ -102,6 +102,52 @@ pub(super) struct ObjectForwarder {
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 }
 
+struct ResetOnDropWriter {
+    writer: Writer,
+    closed: bool,
+}
+
+impl ResetOnDropWriter {
+    fn new(writer: Writer) -> Self {
+        Self {
+            writer,
+            closed: false,
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), SessionError> {
+        self.closed = true;
+        self.writer.finish()
+    }
+
+    fn reset(&mut self, code: u32) {
+        self.writer.reset(code);
+        self.closed = true;
+    }
+}
+
+impl std::ops::Deref for ResetOnDropWriter {
+    type Target = Writer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.writer
+    }
+}
+
+impl std::ops::DerefMut for ResetOnDropWriter {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.writer
+    }
+}
+
+impl Drop for ResetOnDropWriter {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.writer.reset(0);
+        }
+    }
+}
+
 impl ObjectForwarder {
     pub(super) fn new(
         publisher: Publisher,
@@ -443,21 +489,14 @@ impl ObjectForwarder {
             tokio::select! {
                 res = subgroups.next(), if done.is_none() => match res {
                     Ok(Some(subgroup)) => {
-                        let header = data::SubgroupHeader {
-                            header_type: data::StreamHeaderType::SubgroupIdExt,  // SubGroupId = Yes, Extensions = Yes, ContainsEndOfGroup = No
-                            track_alias: self.track_alias,
-                            group_id: subgroup.group_id,
-                            subgroup_id: Some(subgroup.subgroup_id),
-                            publisher_priority: subgroup.priority,
-                        };
-
                         let publisher = self.publisher.clone();
                         let state = self.state.clone();
                         let info = subgroup.info.clone();
                         let mlog = self.mlog.clone();
+                        let track_alias = self.track_alias;
 
                         tasks.push(async move {
-                            let res = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await;
+                            let res = Self::serve_subgroup(track_alias, subgroup, publisher, state, mlog, delivery_filter).await;
                             if let Err(err) = &res {
                                 if Subscribed::is_expected_serve_shutdown(err) {
                                     tracing::debug!(subgroup_info = ?info, error = %err, "stopped serving subgroup");
@@ -471,7 +510,7 @@ impl ObjectForwarder {
                     Ok(None) => done = Some(Ok(())),
                     Err(err) => done = Some(Err(err)),
                 },
-                res = self.closed(), if done.is_none() => done = Some(res),
+                res = self.closed(), if done.is_none() || !tasks.is_empty() => return res.map_err(Into::into),
                 res = tasks.next(), if !tasks.is_empty() => {
                     // Remaining subgroups still get their chance to send; the
                     // first local failure is reported once they settle.
@@ -499,7 +538,7 @@ impl ObjectForwarder {
     }
 
     async fn serve_subgroup(
-        header: data::SubgroupHeader,
+        track_alias: u64,
         mut subgroup_reader: serve::SubgroupReader,
         mut publisher: Publisher,
         state: State<ObjectForwarderState>,
@@ -513,32 +552,62 @@ impl ObjectForwarder {
             subgroup_reader.priority
         );
 
-        let mut writer: Option<Writer> = None;
+        let mut writer: Option<ResetOnDropWriter> = None;
         let mut object_count = 0;
         let mut previous_object_id = None;
-        while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
+        let mut filtered_prefix = false;
+        let metadata = subgroup_reader.metadata();
+        loop {
+            let mut subgroup_object_reader = match subgroup_reader.next().await {
+                Ok(Some(object)) => object,
+                Ok(None) => break,
+                Err(err) => {
+                    if let Some(writer) = writer.as_mut() {
+                        writer.reset(0);
+                    }
+                    return Err(err.into());
+                }
+            };
             if !delivery_filter.allows(subgroup_reader.group_id, subgroup_object_reader.object_id) {
                 tracing::trace!(
                     "[PUBLISHER] serve_subgroup: filtered object group_id={}, object_id={}",
                     subgroup_reader.group_id,
                     subgroup_object_reader.object_id
                 );
+                filtered_prefix = true;
                 continue;
             }
 
             if writer.is_none() {
+                let header = data::SubgroupHeader {
+                    header_type: data::StreamHeaderType::subgroup(
+                        data::SubgroupIdMode::Explicit,
+                        metadata.has_properties,
+                        metadata.end_of_group,
+                        false,
+                        metadata.first_object && !filtered_prefix,
+                    ),
+                    track_alias,
+                    group_id: subgroup_reader.group_id,
+                    subgroup_id: Some(subgroup_reader.subgroup_id),
+                    publisher_priority: subgroup_reader.priority,
+                };
                 let mut send_stream = publisher.open_uni().await?;
                 tracing::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
 
-                state
-                    .lock_mut()
-                    .ok_or(ServeError::Done)?
-                    .record_stream_opened();
-
                 // TODO figure out u32 vs u64 priority
                 send_stream.set_priority(subgroup_reader.priority as i32);
+                let mut new_writer = ResetOnDropWriter::new(Writer::new(send_stream));
 
-                let mut new_writer = Writer::new(send_stream);
+                {
+                    let locked = state.lock();
+                    let closed = locked.closed.clone();
+                    locked
+                        .into_mut()
+                        .ok_or(ServeError::Done)?
+                        .record_stream_opened();
+                    closed?;
+                }
 
                 tracing::trace!(
                     "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
@@ -570,44 +639,75 @@ impl ObjectForwarder {
                 subgroup_object_reader.object_id,
             )
             .map_err(|err| SessionError::Serve(ServeError::internal_ctx(err.to_string())))?;
-            let subgroup_object = data::SubgroupObjectExt {
-                object_id_delta,
-                extension_headers: subgroup_object_reader.extension_headers.clone(), // Pass through extension headers
-                payload_length: subgroup_object_reader.size,
-                status: if subgroup_object_reader.size == 0 {
-                    // Only set status if payload length is zero
-                    Some(subgroup_object_reader.status)
-                } else {
-                    None
-                },
+            let status = if subgroup_object_reader.size == 0 {
+                Some(subgroup_object_reader.status)
+            } else {
+                None
             };
 
             tracing::trace!(
                 "[PUBLISHER] serve_subgroup: sending object #{} - object_id={}, object_id_delta={}, payload_length={}, status={:?}, extension_headers={:?}",
                 object_count + 1,
                 subgroup_object_reader.object_id,
-                subgroup_object.object_id_delta,
-                subgroup_object.payload_length,
-                subgroup_object.status,
-                subgroup_object.extension_headers
+                object_id_delta,
+                subgroup_object_reader.size,
+                status,
+                subgroup_object_reader.extension_headers
             );
 
-            writer.encode(&subgroup_object).await?;
+            if metadata.has_properties {
+                let subgroup_object = data::SubgroupObjectExt {
+                    object_id_delta,
+                    extension_headers: subgroup_object_reader.extension_headers.clone(),
+                    payload_length: subgroup_object_reader.size,
+                    status,
+                };
+                writer.encode(&subgroup_object).await?;
 
-            // Log subgroup object created/sent
-            if let Some(ref mlog) = mlog {
-                if let Ok(mut mlog_guard) = mlog.lock() {
-                    let time = mlog_guard.elapsed_ms();
-                    let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
-                    let event = mlog::subgroup_object_ext_created(
-                        time,
-                        stream_id,
-                        subgroup_reader.group_id,
-                        subgroup_reader.subgroup_id,
-                        subgroup_object_reader.object_id,
-                        &subgroup_object,
-                    );
-                    let _ = mlog_guard.add_event(event);
+                if let Some(ref mlog) = mlog {
+                    if let Ok(mut mlog_guard) = mlog.lock() {
+                        let time = mlog_guard.elapsed_ms();
+                        let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
+                        let event = mlog::subgroup_object_ext_created(
+                            time,
+                            stream_id,
+                            subgroup_reader.group_id,
+                            subgroup_reader.subgroup_id,
+                            subgroup_object_reader.object_id,
+                            &subgroup_object,
+                        );
+                        let _ = mlog_guard.add_event(event);
+                    }
+                }
+            } else {
+                if !subgroup_object_reader.extension_headers.is_empty() {
+                    writer.reset(0);
+                    return Err(ServeError::internal_ctx(
+                        "subgroup Object has properties without the PROPERTIES header bit",
+                    )
+                    .into());
+                }
+                let subgroup_object = data::SubgroupObject {
+                    object_id_delta,
+                    payload_length: subgroup_object_reader.size,
+                    status,
+                };
+                writer.encode(&subgroup_object).await?;
+
+                if let Some(ref mlog) = mlog {
+                    if let Ok(mut mlog_guard) = mlog.lock() {
+                        let time = mlog_guard.elapsed_ms();
+                        let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
+                        let event = mlog::subgroup_object_created(
+                            time,
+                            stream_id,
+                            subgroup_reader.group_id,
+                            subgroup_reader.subgroup_id,
+                            subgroup_object_reader.object_id,
+                            &subgroup_object,
+                        );
+                        let _ = mlog_guard.add_event(event);
+                    }
                 }
             }
 
@@ -621,7 +721,15 @@ impl ObjectForwarder {
 
             let mut chunks_sent = 0;
             let mut bytes_sent = 0;
-            while let Some(chunk) = subgroup_object_reader.read().await? {
+            loop {
+                let chunk = match subgroup_object_reader.read().await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(err) => {
+                        writer.reset(0);
+                        return Err(err.into());
+                    }
+                };
                 tracing::trace!(
                     "[PUBLISHER] serve_subgroup: sending payload chunk #{} for object #{} ({} bytes)",
                     chunks_sent + 1,
@@ -648,6 +756,10 @@ impl ObjectForwarder {
             subgroup_reader.subgroup_id,
             object_count
         );
+
+        if let Some(writer) = writer.as_mut() {
+            writer.finish()?;
+        }
 
         Ok(())
     }
@@ -827,18 +939,20 @@ mod tests {
         }
         .produce();
         for object_id in [0, 1, 5, 6, 9] {
-            let mut object = source.create_with_id(object_id, 1, None).unwrap();
+            let extension_headers = if object_id == 5 {
+                let mut headers = data::ExtensionHeaders::new();
+                headers.set_intvalue(2, 9);
+                Some(headers)
+            } else {
+                None
+            };
+            let mut object = source
+                .create_with_id(object_id, 1, extension_headers)
+                .unwrap();
             object.write(Bytes::from(vec![object_id as u8])).unwrap();
         }
         drop(source);
 
-        let header = data::SubgroupHeader {
-            header_type: data::StreamHeaderType::SubgroupIdExt,
-            track_alias: 42,
-            group_id: 0,
-            subgroup_id: Some(0),
-            publisher_priority: 128,
-        };
         let filter = DeliveryFilter {
             forward: true,
             start_location: Some(Location::new(0, 5)),
@@ -849,11 +963,16 @@ mod tests {
             let stream = peer_session.accept_uni().await.unwrap();
             let mut reader = Reader::new(stream);
             let stream_header: data::StreamHeader = reader.decode().await.unwrap();
-            assert_eq!(stream_header.subgroup_header.unwrap().track_alias, 42);
+            let header = stream_header.subgroup_header.unwrap();
+            assert_eq!(header.track_alias, 42);
+            assert!(header.header_type.has_properties());
 
             let mut received = Vec::new();
             for expected_payload in [5, 6, 9] {
                 let object: data::SubgroupObjectExt = reader.decode().await.unwrap();
+                if expected_payload == 5 {
+                    assert!(object.extension_headers.has(2));
+                }
                 let payload = reader
                     .read_chunk(object.payload_length)
                     .await
@@ -865,7 +984,7 @@ mod tests {
             received
         };
         let send = ObjectForwarder::serve_subgroup(
-            header,
+            42,
             source_reader,
             forwarder.publisher.clone(),
             forwarder.state.clone(),
@@ -876,6 +995,429 @@ mod tests {
         let (send_result, received_deltas) = tokio::join!(send, receive);
         send_result.unwrap();
         assert_eq!(received_deltas, [5, 0, 2]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwards_subgroup_semantics_and_clears_first_object_after_filtering() {
+        for (start_location, expected_first_object) in
+            [(None, true), (Some(Location::new(0, 5)), false)]
+        {
+            let (publisher_session, peer_session) = loopback_session_pair().await;
+            let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+            let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+            let publisher = Publisher::new(
+                outgoing,
+                publisher_session,
+                None,
+                crate::session::RequestId::new(0, 1),
+                bidi_task_tx,
+            );
+            let (forwarder, _recv) = ObjectForwarder::new(publisher, 42, None);
+
+            let track = Arc::new(serve::Track::new(
+                crate::coding::TrackNamespace::from_utf8_path("test"),
+                "track",
+            ));
+            let (mut source, source_reader) = serve::SubgroupInfo {
+                track,
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 200,
+            }
+            .produce_with_metadata(serve::SubgroupStreamMetadata {
+                has_properties: false,
+                end_of_group: true,
+                first_object: true,
+            });
+            for object_id in [0, 5] {
+                let mut object = source.create_with_id(object_id, 1, None).unwrap();
+                object.write(Bytes::from(vec![object_id as u8])).unwrap();
+            }
+            drop(source);
+
+            let filter = DeliveryFilter {
+                forward: true,
+                start_location,
+                end_group_id: None,
+            };
+            let receive = async move {
+                let stream = peer_session.accept_uni().await.unwrap();
+                let mut reader = Reader::new(stream);
+                let stream_header: data::StreamHeader = reader.decode().await.unwrap();
+                let header = stream_header.subgroup_header.unwrap();
+                assert_eq!(
+                    header.header_type.subgroup_id_mode(),
+                    Some(data::SubgroupIdMode::Explicit)
+                );
+                assert!(!header.header_type.has_properties());
+                assert!(header.header_type.end_of_group());
+                assert_eq!(
+                    header.header_type.begins_with_first_object(),
+                    expected_first_object
+                );
+                assert!(!header.header_type.uses_default_priority());
+                assert_eq!(header.publisher_priority, 200);
+
+                let expected_ids: &[u64] = if expected_first_object { &[0, 5] } else { &[5] };
+                let mut previous = None;
+                for expected_id in expected_ids {
+                    let object: data::SubgroupObject = reader.decode().await.unwrap();
+                    let actual_id =
+                        data::decode_object_id_delta(&mut previous, object.object_id_delta)
+                            .unwrap();
+                    assert_eq!(actual_id, *expected_id);
+                    assert_eq!(
+                        reader
+                            .read_chunk(object.payload_length)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .as_ref(),
+                        &[*expected_id as u8]
+                    );
+                }
+                assert!(reader.done().await.unwrap());
+            };
+            let send = ObjectForwarder::serve_subgroup(
+                42,
+                source_reader,
+                forwarder.publisher.clone(),
+                forwarder.state.clone(),
+                None,
+                filter,
+            );
+
+            let (send_result, ()) = tokio::join!(send, receive);
+            send_result.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eog_subgroup_source_error_resets_downstream_instead_of_finishing() {
+        let (publisher_session, peer_session) = loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (forwarder, _recv) = ObjectForwarder::new(publisher, 42, None);
+        let track = Arc::new(serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        ));
+        let (mut source, source_reader) = serve::SubgroupInfo {
+            track,
+            group_id: 0,
+            subgroup_id: 0,
+            priority: 200,
+        }
+        .produce_with_metadata(serve::SubgroupStreamMetadata {
+            has_properties: false,
+            end_of_group: true,
+            first_object: true,
+        });
+        let mut object = source.create_with_id(0, 1, None).unwrap();
+        object.write(Bytes::from_static(b"x")).unwrap();
+        drop(object);
+        let (object_received, wait_for_object) = tokio::sync::oneshot::channel();
+
+        let receive = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            let stream = peer_session.accept_uni().await.unwrap();
+            let mut reader = Reader::new(stream);
+            let header: data::StreamHeader = reader.decode().await.unwrap();
+            assert!(header.header_type.end_of_group());
+            let object: data::SubgroupObject = reader.decode().await.unwrap();
+            assert_eq!(
+                reader
+                    .read_chunk(object.payload_length)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                b"x"[..]
+            );
+            object_received.send(()).unwrap();
+            assert!(matches!(
+                reader.done().await,
+                Err(SessionError::WebTransport(web_transport::Error::Read(
+                    web_transport::quinn::ReadError::Reset(0)
+                )))
+            ));
+        });
+        let close_source = async move {
+            wait_for_object.await.unwrap();
+            source.close(ServeError::internal_ctx("upstream reset"))
+        };
+        let send = ObjectForwarder::serve_subgroup(
+            42,
+            source_reader,
+            forwarder.publisher.clone(),
+            forwarder.state.clone(),
+            None,
+            DeliveryFilter {
+                forward: true,
+                start_location: None,
+                end_group_id: None,
+            },
+        );
+
+        let (send_result, receive_result, close_result) = tokio::join!(send, receive, close_source);
+        close_result.unwrap();
+        assert!(
+            receive_result.is_ok(),
+            "receive failed: {receive_result:?}; send result: {send_result:?}"
+        );
+        assert!(send_result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsubscribe_cancels_active_subgroup_and_resets_downstream() {
+        let (publisher_session, peer_session) = loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (mut forwarder, mut forwarder_recv) = ObjectForwarder::new(publisher, 42, None);
+
+        let (track_writer, track_reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        )
+        .produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(serve::Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 128,
+            })
+            .unwrap();
+        let mut object = subgroup_writer.create_with_id(0, 1, None).unwrap();
+        object.write(Bytes::from_static(b"x")).unwrap();
+        drop(object);
+        let serve::TrackReaderMode::Subgroups(subgroups_reader) =
+            track_reader.mode().await.unwrap()
+        else {
+            panic!("expected subgroup delivery");
+        };
+        let (object_received, cancel_after_object) = tokio::sync::oneshot::channel();
+
+        let serve = forwarder.serve_subgroups(
+            subgroups_reader,
+            DeliveryFilter {
+                forward: true,
+                start_location: None,
+                end_group_id: None,
+            },
+        );
+        let receive = async move {
+            let stream = peer_session.accept_uni().await.unwrap();
+            let mut reader = Reader::new(stream);
+            let header: data::StreamHeader = reader.decode().await.unwrap();
+            assert!(header.header_type.begins_with_first_object());
+            let object: data::SubgroupObjectExt = reader.decode().await.unwrap();
+            assert_eq!(
+                reader
+                    .read_chunk(object.payload_length)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                b"x"[..]
+            );
+            object_received.send(()).unwrap();
+            assert!(matches!(
+                reader.done().await,
+                Err(SessionError::WebTransport(web_transport::Error::Read(
+                    web_transport::quinn::ReadError::Reset(0)
+                )))
+            ));
+        };
+        let cancel = async move {
+            cancel_after_object.await.unwrap();
+            forwarder_recv.recv_unsubscribe()
+        };
+
+        let (serve_result, (), cancel_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(serve, receive, cancel)
+            })
+            .await
+            .unwrap();
+        cancel_result.unwrap();
+        assert!(matches!(
+            serve_result,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+        drop(subgroup_writer);
+        drop(subgroups_writer);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_track_error_drains_active_subgroup_before_returning() {
+        let (publisher_session, peer_session) = loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (mut forwarder, _forwarder_recv) = ObjectForwarder::new(publisher, 42, None);
+
+        let (track_writer, track_reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        )
+        .produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(serve::Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 128,
+            })
+            .unwrap();
+        let mut object = subgroup_writer.create_with_id(0, 1, None).unwrap();
+        object.write(Bytes::from_static(b"x")).unwrap();
+        drop(object);
+        let serve::TrackReaderMode::Subgroups(subgroups_reader) =
+            track_reader.mode().await.unwrap()
+        else {
+            panic!("expected subgroup delivery");
+        };
+        let (object_received, close_after_object) = tokio::sync::oneshot::channel();
+
+        let serve = forwarder.serve_subgroups(
+            subgroups_reader,
+            DeliveryFilter {
+                forward: true,
+                start_location: None,
+                end_group_id: None,
+            },
+        );
+        let receive = async move {
+            let stream = peer_session.accept_uni().await.unwrap();
+            let mut reader = Reader::new(stream);
+            let _: data::StreamHeader = reader.decode().await.unwrap();
+            let object: data::SubgroupObjectExt = reader.decode().await.unwrap();
+            assert_eq!(
+                reader
+                    .read_chunk(object.payload_length)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                b"x"[..]
+            );
+            object_received.send(()).unwrap();
+            assert!(reader.done().await.unwrap());
+        };
+        let close_source = async move {
+            close_after_object.await.unwrap();
+            subgroups_writer.close(ServeError::Closed(0x42)).unwrap();
+            drop(subgroup_writer);
+        };
+
+        let (serve_result, (), ()) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(serve, receive, close_source)
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            serve_result,
+            Err(SessionError::Serve(ServeError::Closed(0x42)))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_request_owner_overrides_source_drain_and_resets_subgroup() {
+        let (publisher_session, peer_session) = loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (mut forwarder, forwarder_recv) = ObjectForwarder::new(publisher, 42, None);
+        let (track_writer, track_reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        )
+        .produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(serve::Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 128,
+            })
+            .unwrap();
+        let mut object = subgroup_writer.create_with_id(0, 1, None).unwrap();
+        object.write(Bytes::from_static(b"x")).unwrap();
+        drop(object);
+        let serve::TrackReaderMode::Subgroups(subgroups_reader) =
+            track_reader.mode().await.unwrap()
+        else {
+            panic!("expected subgroup delivery");
+        };
+        let (object_received, cancel_after_object) = tokio::sync::oneshot::channel();
+
+        let serve = forwarder.serve_subgroups(
+            subgroups_reader,
+            DeliveryFilter {
+                forward: true,
+                start_location: None,
+                end_group_id: None,
+            },
+        );
+        let receive = async move {
+            let stream = peer_session.accept_uni().await.unwrap();
+            let mut reader = Reader::new(stream);
+            let _: data::StreamHeader = reader.decode().await.unwrap();
+            let object: data::SubgroupObjectExt = reader.decode().await.unwrap();
+            assert_eq!(
+                reader
+                    .read_chunk(object.payload_length)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                b"x"[..]
+            );
+            object_received.send(()).unwrap();
+            assert!(matches!(
+                reader.done().await,
+                Err(SessionError::WebTransport(web_transport::Error::Read(
+                    web_transport::quinn::ReadError::Reset(0)
+                )))
+            ));
+        };
+        let cancel = async move {
+            cancel_after_object.await.unwrap();
+            subgroups_writer.close(ServeError::Closed(0x42)).unwrap();
+            drop(forwarder_recv);
+        };
+
+        let (serve_result, (), ()) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(serve, receive, cancel)
+            })
+            .await
+            .unwrap();
+        serve_result.unwrap();
+        drop(subgroup_writer);
     }
 
     #[tokio::test]

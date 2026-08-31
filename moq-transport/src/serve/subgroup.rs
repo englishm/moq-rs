@@ -103,13 +103,21 @@ impl SubgroupsWriter {
 
     /// Create a new subgroup with the given parameters, inserting it into the track.
     pub fn create(&mut self, subgroup: Subgroup) -> Result<SubgroupWriter, ServeError> {
+        self.create_with_metadata(subgroup, SubgroupStreamMetadata::default())
+    }
+
+    pub(crate) fn create_with_metadata(
+        &mut self,
+        subgroup: Subgroup,
+        metadata: SubgroupStreamMetadata,
+    ) -> Result<SubgroupWriter, ServeError> {
         let subgroup = SubgroupInfo {
             track: self.info.clone(),
             group_id: subgroup.group_id,
             subgroup_id: subgroup.subgroup_id,
             priority: subgroup.priority,
         };
-        let (writer, reader) = subgroup.produce();
+        let (writer, reader) = subgroup.produce_with_metadata(metadata);
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
 
@@ -252,7 +260,14 @@ pub struct SubgroupInfo {
 
 impl SubgroupInfo {
     pub fn produce(self) -> (SubgroupWriter, SubgroupReader) {
-        let (writer, reader) = State::default().split();
+        self.produce_with_metadata(SubgroupStreamMetadata::default())
+    }
+
+    pub(crate) fn produce_with_metadata(
+        self,
+        metadata: SubgroupStreamMetadata,
+    ) -> (SubgroupWriter, SubgroupReader) {
+        let (writer, reader) = State::new(SubgroupState::new(metadata)).split();
         let info = Arc::new(self);
 
         let writer = SubgroupWriter::new(writer, info.clone());
@@ -270,18 +285,42 @@ impl Deref for SubgroupInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct SubgroupStreamMetadata {
+    pub has_properties: bool,
+    pub end_of_group: bool,
+    pub first_object: bool,
+}
+
+impl Default for SubgroupStreamMetadata {
+    fn default() -> Self {
+        Self {
+            // Existing application-created subgroups have always used the
+            // properties-capable wire grammar.
+            has_properties: true,
+            end_of_group: false,
+            // A locally created stream begins with the first Object published
+            // in its subgroup. Relay receive paths supply explicit metadata.
+            first_object: true,
+        }
+    }
+}
+
 struct SubgroupState {
     // The data that has been received thus far.
     objects: Vec<SubgroupObjectReader>,
+
+    metadata: SubgroupStreamMetadata,
 
     // Set when the writer or all readers are dropped.
     closed: Result<(), ServeError>,
 }
 
-impl Default for SubgroupState {
-    fn default() -> Self {
+impl SubgroupState {
+    fn new(metadata: SubgroupStreamMetadata) -> Self {
         Self {
             objects: Vec::new(),
+            metadata,
             closed: Ok(()),
         }
     }
@@ -408,6 +447,10 @@ impl SubgroupReader {
     pub fn latest(&self) -> Option<u64> {
         let state = self.state.lock();
         state.objects.last().map(|o| o.object_id)
+    }
+
+    pub(crate) fn metadata(&self) -> SubgroupStreamMetadata {
+        self.state.lock().metadata
     }
 
     pub async fn read_next(&mut self) -> Result<Option<Bytes>, ServeError> {
@@ -661,6 +704,12 @@ mod tests {
             priority: 128,
         }
         .produce()
+    }
+
+    #[test]
+    fn locally_created_subgroup_begins_with_first_object() {
+        let (_writer, reader) = subgroup();
+        assert!(reader.metadata().first_object);
     }
 
     #[tokio::test]

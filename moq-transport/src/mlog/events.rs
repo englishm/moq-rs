@@ -549,9 +549,14 @@ pub fn go_away_created(time: f64, stream_id: u64, msg: &message::GoAway) -> Even
 fn subgroup_header_to_json(header: &data::SubgroupHeader) -> JsonValue {
     let mut json = json!({
         "header_type": format!("{:?}", header.header_type),
+        "header_type_value": header.header_type.value(),
         "track_alias": header.track_alias,
         "group_id": header.group_id,
         "publisher_priority": header.publisher_priority,
+        "has_properties": header.header_type.has_properties(),
+        "end_of_group": header.header_type.end_of_group(),
+        "default_priority": header.header_type.uses_default_priority(),
+        "first_object": header.header_type.begins_with_first_object(),
     });
 
     if let Some(subgroup_id) = header.subgroup_id {
@@ -806,7 +811,10 @@ pub fn loglevel_event(time: f64, level: LogLevel, message: String) -> Event {
 mod tests {
     use super::*;
     use crate::coding::{KeyValuePairs, TrackNamespacePrefix};
-    use crate::message::{SubscribeNamespace, SubscribeOptions};
+    use crate::{
+        data::{StreamHeaderType, SubgroupHeader, SubgroupIdMode},
+        message::{SubscribeNamespace, SubscribeOptions},
+    };
 
     #[test]
     fn subscribe_namespace_event_includes_prefix_and_options() {
@@ -830,5 +838,34 @@ mod tests {
             "/example.com/meeting"
         );
         assert_eq!(data.message["subscribe_options"], "Both");
+    }
+
+    #[test]
+    fn subgroup_header_event_preserves_legacy_name_and_exposes_modifiers() {
+        let legacy = subgroup_header_to_json(&SubgroupHeader {
+            header_type: StreamHeaderType::SubgroupIdExt,
+            track_alias: 1,
+            group_id: 2,
+            subgroup_id: Some(3),
+            publisher_priority: 4,
+        });
+        assert_eq!(legacy["header_type"], "SubgroupIdExt");
+        assert_eq!(legacy["header_type_value"], 0x15);
+
+        let modified = subgroup_header_to_json(&SubgroupHeader {
+            header_type: StreamHeaderType::subgroup(SubgroupIdMode::Zero, false, true, true, true),
+            track_alias: 1,
+            group_id: 2,
+            subgroup_id: None,
+            publisher_priority: 200,
+        });
+        assert_eq!(
+            modified["header_type"],
+            "SubgroupZeroIdEndOfGroupDefaultPriorityFirstObject"
+        );
+        assert_eq!(modified["header_type_value"], 0x78);
+        assert_eq!(modified["end_of_group"], true);
+        assert_eq!(modified["default_priority"], true);
+        assert_eq!(modified["first_object"], true);
     }
 }

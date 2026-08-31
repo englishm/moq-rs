@@ -94,6 +94,12 @@ impl TrackExtensions {
         self.0.is_empty()
     }
 
+    pub(crate) fn contains_only(&self, supported_types: &[u64]) -> bool {
+        self.0
+            .iter()
+            .all(|extension| supported_types.contains(&extension.key))
+    }
+
     pub fn delivery_timeout(&self) -> Result<Option<u64>, DecodeError> {
         get_kvp_int(&self.0, extension_type::DELIVERY_TIMEOUT)
     }
@@ -501,5 +507,17 @@ mod tests {
             extensions.set_default_publisher_group_order(GroupOrder::Publisher),
             Err(EncodeError::InvalidValue)
         ));
+    }
+
+    #[test]
+    fn track_extensions_contains_only_supported_types() {
+        let mut extensions = TrackExtensions::default();
+        let supported = [extension_type::DEFAULT_PUBLISHER_PRIORITY];
+
+        assert!(extensions.contains_only(&supported));
+        extensions.set_default_publisher_priority(30);
+        assert!(extensions.contains_only(&supported));
+        extensions.set_delivery_timeout(10);
+        assert!(!extensions.contains_only(&supported));
     }
 }

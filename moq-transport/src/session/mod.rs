@@ -495,6 +495,7 @@ impl Session {
         let subscriber = Some(Subscriber::new(
             outgoing.0,
             webtransport.clone(),
+            transport,
             mlog_shared.clone(),
             request_id.clone(),
             bidi_task_tx,
@@ -726,6 +727,7 @@ impl Session {
     /// inbound control messages, receiving and processing new inbound uni-directional QUIC streams,
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
+        let close_session = self.webtransport.clone();
         let mut bidi_task_rx = self.bidi_task_rx;
         let mut reader_tasks: FuturesUnordered<BidiReaderFuture> = FuturesUnordered::new();
 
@@ -768,6 +770,15 @@ impl Session {
         // in-flight reader future, cancelling them — no task abort needed since
         // nothing was ever spawned onto the runtime.
         drop(reader_tasks);
+
+        if let Err(err) = &result {
+            if err.is_session_fatal() {
+                close_session.close(
+                    u32::try_from(err.code()).unwrap_or(0x1),
+                    "session protocol error",
+                );
+            }
+        }
 
         result
     }
@@ -1609,6 +1620,80 @@ pub(crate) mod test_support {
         (client, server)
     }
 
+    pub(crate) async fn loopback_raw_session_pair(
+    ) -> (web_transport::Session, web_transport::Session) {
+        use std::sync::Arc;
+        use web_transport::quinn::quinn;
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed certificate");
+        let cert_der = cert.cert.der().clone();
+        let key = cert
+            .key_pair
+            .serialize_der()
+            .try_into()
+            .expect("serialize private key");
+
+        let mut server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key)
+            .expect("configure raw QUIC server certificate");
+        server_crypto.alpn_protocols = vec![b"moqt-18".to_vec()];
+        let server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+            .expect("configure raw QUIC server crypto");
+        let server = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(server_crypto)),
+            "127.0.0.1:0".parse().expect("server addr"),
+        )
+        .expect("build raw QUIC server");
+        let addr = server.local_addr().expect("raw QUIC server addr");
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).expect("trust raw QUIC server cert");
+        let mut client_crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"moqt-18".to_vec()];
+        let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+            .expect("configure raw QUIC client crypto");
+        let mut client =
+            quinn::Endpoint::client("127.0.0.1:0".parse().expect("raw QUIC client addr"))
+                .expect("build raw QUIC client");
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(client_crypto)));
+
+        let accept = tokio::spawn(async move {
+            server
+                .accept()
+                .await
+                .expect("accept raw QUIC connection")
+                .await
+                .expect("establish raw QUIC server connection")
+        });
+        let client = client
+            .connect(addr, "localhost")
+            .expect("start raw QUIC connection")
+            .await
+            .expect("establish raw QUIC client connection");
+        let server = accept.await.expect("join raw QUIC accept task");
+        let url = url::Url::parse(&format!("moqt://localhost:{}/", addr.port()))
+            .expect("parse raw QUIC URL");
+
+        let client = web_transport::quinn::Session::raw(
+            client,
+            url.clone(),
+            web_transport::quinn::proto::ConnectResponse::default(),
+        )
+        .into();
+        let server = web_transport::quinn::Session::raw(
+            server,
+            url,
+            web_transport::quinn::proto::ConnectResponse::default(),
+        )
+        .into();
+        (client, server)
+    }
+
     /// Establish a real `web_transport::Session` over an in-process QUIC
     /// loopback so tests can construct a `Publisher`/`Subscriber` and exercise
     /// the real cleanup paths.
@@ -1862,5 +1947,74 @@ mod tests {
             !bytes.contains(&88),
             "Request ID must not appear in bidi encoding"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_uni_header_closes_session_with_protocol_violation() {
+        let (client_transport, server_transport) = test_support::loopback_session_pair().await;
+        let client_peer = client_transport.clone();
+        let client_close = client_transport.clone();
+        let (client, server) = tokio::join!(
+            Session::connect(client_transport, None, Transport::WebTransport),
+            Session::accept(server_transport, None, Transport::WebTransport),
+        );
+        let (client_session, _client_publisher, _client_subscriber) = client.unwrap();
+        let (server_session, _server_publisher, _server_subscriber) = server.unwrap();
+
+        let send_invalid = async move {
+            let mut stream = client_peer.open_uni().await.unwrap();
+            stream.write(&[0x16]).await.unwrap();
+            client_close.closed().await
+        };
+        let (run_result, close_error) = tokio::join!(server_session.run(), send_invalid);
+
+        assert!(matches!(
+            run_result,
+            Err(SessionError::Decode(
+                crate::coding::DecodeError::InvalidHeaderType
+            ))
+        ));
+        assert!(matches!(
+            close_error,
+            web_transport::Error::Session(web_transport::quinn::SessionError::WebTransportError(
+                web_transport::quinn::WebTransportError::Closed(0x3, _)
+            ))
+        ));
+        drop(client_session);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_raw_quic_uni_header_closes_with_protocol_violation() {
+        let (client_transport, server_transport) = test_support::loopback_raw_session_pair().await;
+        let client_peer = client_transport.clone();
+        let client_close = client_transport.clone();
+        let (client, server) = tokio::join!(
+            Session::connect(client_transport, None, Transport::RawQuic),
+            Session::accept(server_transport, None, Transport::RawQuic),
+        );
+        let (client_session, _client_publisher, _client_subscriber) = client.unwrap();
+        let (server_session, _server_publisher, _server_subscriber) = server.unwrap();
+
+        let send_invalid = async move {
+            let mut stream = client_peer.open_uni().await.unwrap();
+            stream.write(&[0x16]).await.unwrap();
+            client_close.closed().await
+        };
+        let (run_result, close_error) = tokio::join!(server_session.run(), send_invalid);
+
+        assert!(matches!(
+            run_result,
+            Err(SessionError::Decode(
+                crate::coding::DecodeError::InvalidHeaderType
+            ))
+        ));
+        let web_transport::Error::Session(web_transport::quinn::SessionError::ConnectionError(
+            web_transport::quinn::quinn::ConnectionError::ApplicationClosed(close),
+        )) = close_error
+        else {
+            panic!("expected raw QUIC application close, got {close_error:?}");
+        };
+        assert_eq!(close.error_code.into_inner(), 0x3);
+        drop(client_session);
     }
 }

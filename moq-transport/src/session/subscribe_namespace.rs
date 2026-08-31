@@ -439,6 +439,7 @@ mod tests {
         Subscriber::new(
             Queue::default(),
             loopback_session().await,
+            crate::session::Transport::WebTransport,
             None,
             RequestId::new(0, 1),
             bidi_task_tx,
