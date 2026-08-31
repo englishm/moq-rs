@@ -508,6 +508,7 @@ mod tests {
             None,
             crate::session::RequestId::new(0, 1),
             bidi_task_tx,
+            Default::default(),
         );
         let (writer, reader) =
             crate::serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();

@@ -15,15 +15,15 @@ use std::ops;
 
 use crate::{
     coding::{Location, ReasonPhrase, TrackName, TrackNamespace},
-    message::{self, Message},
+    message,
     serve::{ServeError, TrackReader},
     watch::State,
 };
 
-use super::{DeliveryFilter, ObjectForwarder, Publisher, SessionError};
-
-/// Sink for messages this endpoint writes on its own PUBLISH request stream.
-pub(crate) type RequestStreamSink = tokio::sync::mpsc::UnboundedSender<Message>;
+use super::{
+    BidiResponse, DeliveryError, DeliveryFilter, ObjectForwarder, Publisher, RequestStreamSink,
+    SessionError, StreamCount,
+};
 
 #[derive(Debug, Clone)]
 pub struct PublishedInfo {
@@ -41,12 +41,6 @@ pub(crate) struct PublishedState {
     forward: bool,
     unsubscribed: bool,
     closed: Result<(), ServeError>,
-    /// Subgroup streams opened while serving, recorded when the forwarder
-    /// finishes so `Drop` can report it. Draft-18 requires PUBLISH_DONE to carry
-    /// the exact count, because the subscriber uses it to know how many streams
-    /// may still arrive; reporting 0 tells it to discard state immediately and
-    /// drop objects that were legitimately sent.
-    stream_count: u64,
 }
 
 impl PublishedState {
@@ -56,23 +50,23 @@ impl PublishedState {
             forward,
             unsubscribed: false,
             closed: Ok(()),
-            stream_count: 0,
         }
     }
 }
 
 /// Outbound PUBLISH created by [`Publisher::publish`].
 ///
-/// Dropping without calling [`serve`](Self::serve) sends PUBLISH_DONE with a
-/// generic terminal status. Calling `serve` runs the shared object forwarder;
-/// dropping after the data-plane loop has stopped sends PUBLISH_DONE from this
-/// handle.
+/// Calling [`serve`](Self::serve) runs the shared object forwarder and waits
+/// until PUBLISH_DONE and the request-stream FIN have been committed. Dropping
+/// before that normal terminal path starts makes one guarded best-effort send.
 #[must_use = "serve or drop to send PUBLISH_DONE"]
 pub struct Published {
     publisher: Publisher,
     stream: RequestStreamSink,
     state: State<PublishedState>,
     track: Option<TrackReader>,
+    stream_count: StreamCount,
+    terminal_started: bool,
 
     pub info: PublishedInfo,
 }
@@ -90,6 +84,8 @@ impl Published {
             stream,
             state,
             track: Some(track),
+            stream_count: StreamCount::default(),
+            terminal_started: false,
             info,
         }
     }
@@ -137,10 +133,10 @@ impl Published {
     pub async fn serve(mut self) -> Result<(), SessionError> {
         let res = self.serve_inner().await;
         if let Err(err) = &res {
-            self.close_state(err.clone().into())?;
+            let _ = self.close_state(err.clone().into());
         }
-
-        res
+        let terminal = self.finish().await;
+        res.and(terminal)
     }
 
     async fn serve_inner(&mut self) -> Result<(), SessionError> {
@@ -162,6 +158,7 @@ impl Published {
         let track = self.track.take().ok_or(SessionError::Internal)?;
         let (mut forwarder, recv) =
             ObjectForwarder::new(self.publisher.clone(), self.info.track_alias, None);
+        self.stream_count = forwarder.stream_count_handle();
         self.publisher
             .register_published_subscription(self.info.id, recv)?;
 
@@ -178,25 +175,36 @@ impl Published {
             res => res,
         };
 
-        // Record the count before the forwarder goes out of scope; `Drop` needs
-        // it for PUBLISH_DONE and has no other way to reach it.
-        self.record_stream_count(forwarder.stream_count());
-
         result
     }
 
-    /// Store the number of subgroup streams opened, for PUBLISH_DONE on drop.
-    fn record_stream_count(&self, stream_count: u64) {
-        let Ok(state) = self.state.try_lock() else {
-            tracing::error!(
-                request_id = self.info.id,
-                "published state lock poisoned; PUBLISH_DONE will under-report stream count"
-            );
-            return;
+    async fn finish(&mut self) -> Result<(), SessionError> {
+        let (err, stream_count) = {
+            let state = self.state.lock();
+            let Some(err) = publish_done_error_on_drop(&state) else {
+                return Ok(());
+            };
+            (err, self.stream_count.get())
         };
-        if let Some(mut state) = state.into_mut() {
-            state.stream_count = stream_count;
-        }
+
+        self.terminal_started = true;
+        let (response, receipt) = BidiResponse::with_completion(
+            message::PublishDone {
+                id: self.info.id,
+                status_code: publish_done_code(&err),
+                stream_count,
+                reason: ReasonPhrase("publish ended".to_string()),
+            }
+            .into(),
+        );
+        self.stream
+            .send(response)
+            .map_err(|_| DeliveryError::Cancelled.into_session_error())?;
+        let result = receipt
+            .await
+            .map_err(|_| DeliveryError::Cancelled.into_session_error())?
+            .map_err(DeliveryError::into_session_error);
+        result
     }
 
     pub fn close(self, err: ServeError) -> Result<(), ServeError> {
@@ -227,6 +235,10 @@ impl ops::Deref for Published {
 
 impl Drop for Published {
     fn drop(&mut self) {
+        if self.terminal_started {
+            return;
+        }
+
         let state = match self.state.try_lock() {
             Ok(state) => state,
             Err(_) => {
@@ -240,14 +252,12 @@ impl Drop for Published {
         let Some(err) = publish_done_error_on_drop(&state) else {
             return;
         };
-        let stream_count = state.stream_count;
+        let stream_count = self.stream_count.get();
         drop(state);
-
-        self.publisher.drop_published(self.info.id);
 
         if self
             .stream
-            .send(
+            .send(BidiResponse::new(
                 message::PublishDone {
                     id: self.info.id,
                     status_code: publish_done_code(&err),
@@ -255,7 +265,7 @@ impl Drop for Published {
                     reason: ReasonPhrase("publish ended".to_string()),
                 }
                 .into(),
-            )
+            ))
             .is_err()
         {
             tracing::debug!(

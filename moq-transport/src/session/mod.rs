@@ -25,7 +25,7 @@ pub(crate) use name_registry::NameRegistry;
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
 pub(crate) use publish_received::PublishReceivedRecv;
-pub(crate) use published::{split_published_state, PublishedRecv, RequestStreamSink};
+pub(crate) use published::{split_published_state, PublishedRecv};
 pub use published::{Published, PublishedInfo};
 pub use published_namespace::*;
 pub use publisher::*;
@@ -54,11 +54,115 @@ use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
 
+pub(crate) struct BidiResponse {
+    message: Message,
+    completion: Option<tokio::sync::oneshot::Sender<Result<(), DeliveryError>>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum DeliveryError {
+    Cancelled,
+    Failed,
+}
+
+impl DeliveryError {
+    fn from_session_error(err: &SessionError) -> Self {
+        if err.is_stream_error() {
+            Self::Cancelled
+        } else {
+            Self::Failed
+        }
+    }
+
+    pub(crate) fn into_session_error(self) -> SessionError {
+        match self {
+            Self::Cancelled => SessionError::Serve(crate::serve::ServeError::Cancel),
+            Self::Failed => SessionError::Internal,
+        }
+    }
+}
+
+impl BidiResponse {
+    pub(crate) fn new(message: Message) -> Self {
+        Self {
+            message,
+            completion: None,
+        }
+    }
+
+    pub(crate) fn with_completion(
+        message: Message,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Receiver<Result<(), DeliveryError>>,
+    ) {
+        let (completion, receipt) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                message,
+                completion: Some(completion),
+            },
+            receipt,
+        )
+    }
+
+    fn complete(&mut self, result: Result<(), DeliveryError>) {
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(result);
+        }
+    }
+}
+
+pub(crate) type RequestStreamSink = tokio::sync::mpsc::UnboundedSender<BidiResponse>;
+
 /// Registry mapping bidi-request IDs to a channel for forwarding responses.
 /// When `run_send` pops a response message from the outgoing queue, it checks
 /// this map: if the response's target request ID has a registered sender, the
 /// response is forwarded to the bidi handler task that owns the Writer.
-type BidiResponseMap = Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Message>>>>;
+pub(crate) type BidiResponseMap = Arc<Mutex<HashMap<u64, RequestStreamSink>>>;
+
+#[derive(Clone, Copy)]
+enum BidiRequestKind {
+    Subscribe,
+    Publish,
+    Other,
+}
+
+#[derive(Clone, Copy)]
+enum FollowupEnd {
+    PublishDone,
+    OtherTerminal,
+    Cancelled,
+}
+
+struct BidiRequestCleanup {
+    id: u64,
+    kind: BidiRequestKind,
+    publisher: Option<Publisher>,
+    subscriber: Option<Subscriber>,
+    responses: BidiResponseMap,
+}
+
+impl Drop for BidiRequestCleanup {
+    fn drop(&mut self) {
+        if let Ok(mut responses) = self.responses.lock() {
+            responses.remove(&self.id);
+        }
+        match self.kind {
+            BidiRequestKind::Subscribe => {
+                if let Some(publisher) = &self.publisher {
+                    publisher.cancel_subscribe(self.id);
+                }
+            }
+            BidiRequestKind::Publish => {
+                if let Some(subscriber) = &self.subscriber {
+                    subscriber.abort_publish_received(self.id);
+                }
+            }
+            BidiRequestKind::Other => {}
+        }
+    }
+}
 
 /// A bidi response reader future handed from Publisher/Subscriber to
 /// `Session::run`. Boxed so the publisher and subscriber reader loops can
@@ -492,6 +596,10 @@ impl Session {
             request_id.clone(),
             bidi_task_tx.clone(),
         ));
+        let bidi_response_map = publisher
+            .as_ref()
+            .map(|publisher| publisher.bidi_response_map.clone())
+            .unwrap_or_default();
         let subscriber = Some(Subscriber::new(
             outgoing.0,
             webtransport.clone(),
@@ -499,6 +607,7 @@ impl Session {
             mlog_shared.clone(),
             request_id.clone(),
             bidi_task_tx,
+            bidi_response_map.clone(),
         ));
 
         let session = Self {
@@ -513,7 +622,7 @@ impl Session {
             transport,
             connection_path,
             bidi_task_rx,
-            bidi_response_map: Arc::new(Mutex::new(HashMap::new())),
+            bidi_response_map,
         };
 
         (session, publisher, subscriber)
@@ -833,7 +942,7 @@ impl Session {
                     .get(&target_id)
                     .cloned();
                 if let Some(tx) = tx_opt {
-                    if tx.send(msg).is_err() {
+                    if tx.send(BidiResponse::new(msg)).is_err() {
                         tracing::warn!(target_id, "bidi response channel closed, dropping message");
                     }
                 } else {
@@ -940,7 +1049,7 @@ impl Session {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         let mut reader = Reader::new(recv_stream);
-        let mut writer = Writer::new(send_stream);
+        let writer = Writer::new(send_stream);
 
         // Read the first (request) message from the bidi stream. Bound this so a
         // peer that opens a bidi stream but never sends a complete request
@@ -984,12 +1093,18 @@ impl Session {
                 .recv_subscribe_namespace(msg)?;
             return recv.run(writer, reader, mlog).await;
         }
+        let mut writer = ResetOnDropWriter::new(writer);
 
         // Classify the request. One-shot request/response flows are bounded in
         // the response phase below; long-lived flows (SUBSCRIBE, PUBLISH,
         // PUBLISH_NAMESPACE, FETCH) may legitimately stay open until an explicit
         // terminal message and are therefore not bounded.
         let bounded_response = matches!(&msg, Message::TrackStatus(_) | Message::RequestUpdate(_));
+        let request_kind = match &msg {
+            Message::Subscribe(_) => BidiRequestKind::Subscribe,
+            Message::Publish(_) => BidiRequestKind::Publish,
+            _ => BidiRequestKind::Other,
+        };
 
         let req_id = msg.sequenced_request_id();
 
@@ -997,7 +1112,7 @@ impl Session {
         let mut rx = if let Some(id) = req_id {
             request_id.validate_incoming(id)?;
 
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BidiResponse>();
             bidi_response_map
                 .lock()
                 .map_err(|_| SessionError::Internal)?
@@ -1006,6 +1121,13 @@ impl Session {
         } else {
             None
         };
+        let _cleanup = req_id.map(|id| BidiRequestCleanup {
+            id,
+            kind: request_kind,
+            publisher: publisher.as_ref().cloned(),
+            subscriber: subscriber.as_ref().cloned(),
+            responses: bidi_response_map.clone(),
+        });
 
         // Dispatch to the appropriate role handler (same as run_recv).
         // Capture the result so cleanup runs unconditionally on error.
@@ -1039,53 +1161,100 @@ impl Session {
 
         // Wait for responses only if dispatch succeeded; otherwise the
         // handlers didn't register anything to respond to.
+        let mut writer_closed = false;
         if dispatch_result.is_ok() {
             if let Some(id) = req_id {
                 if let Some(ref mut rx) = rx {
-                    let pump = async {
-                        while let Some(response) = rx.recv().await {
-                            // One-shot requests (TRACK_STATUS, REQUEST_UPDATE) get
-                            // exactly one reply, so REQUEST_OK ends them just as
-                            // REQUEST_ERROR does. Draft-18 requires the stream be
-                            // FINned after TRACK_STATUS_OK or REQUEST_ERROR
-                            // (§10.14). Treating only the error as terminal held the
-                            // handler slot until BIDI_REQUEST_TIMEOUT, so 128 cheap
-                            // TRACK_STATUS requests could occupy every slot for 30s
-                            // even when the application answered immediately.
-                            let is_terminal = matches!(
-                                response,
-                                Message::RequestError(_)
-                                    | Message::PublishDone(_)
-                                    | Message::PublishNamespaceDone(_)
-                                    | Message::Unsubscribe(_)
-                            ) || (bounded_response
-                                && matches!(response, Message::RequestOk(_)));
-                            if let Err(e) = Self::encode_bidi_response(&mut writer, &response).await
-                            {
-                                tracing::warn!(error = %e, "failed to write bidi response");
-                                break;
-                            }
-                            if is_terminal {
-                                // Give Quinn's connection driver a scheduling
-                                // opportunity to transmit the STREAM data before
-                                // the Writer is dropped (which sends FIN).
-                                tokio::time::sleep(std::time::Duration::ZERO).await;
-                                break;
-                            }
-                        }
-                    };
-
                     let follow_ups =
                         Self::read_request_follow_ups(&mut reader, id, publisher, subscriber);
+                    tokio::pin!(follow_ups);
 
-                    // Whichever side finishes first ends the request, so the
-                    // other is cancelled. `follow_ups` is not cancellation-safe
-                    // (a partly-read frame is lost), which is fine only because
-                    // neither `reader` nor `writer` is used again afterwards.
-                    let both = async {
-                        tokio::select! {
-                            () = pump => Ok(()),
-                            res = follow_ups => res,
+                    // Keep a selected response write indivisible with respect
+                    // to peer follow-ups. Cancelling a partially written frame
+                    // and then FINning would make the peer decode truncated data.
+                    let responses = async {
+                        let mut deferred_publish_done = false;
+                        let mut publish_response_sent = false;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                outgoing = rx.recv() => {
+                                    let Some(mut response) = outgoing else {
+                                        return Ok(false);
+                                    };
+                                    // One-shot requests (TRACK_STATUS, REQUEST_UPDATE) get
+                                    // exactly one reply, so REQUEST_OK ends them just as
+                                    // REQUEST_ERROR does.
+                                    let is_terminal = matches!(
+                                        response.message,
+                                        Message::RequestError(_)
+                                            | Message::PublishDone(_)
+                                            | Message::PublishNamespaceDone(_)
+                                            | Message::Unsubscribe(_)
+                                    ) || (bounded_response
+                                        && matches!(response.message, Message::RequestOk(_)));
+                                    if let Err(err) = Self::encode_bidi_response(
+                                        &mut writer,
+                                        &response.message,
+                                    )
+                                    .await
+                                    {
+                                        response.complete(Err(DeliveryError::from_session_error(&err)));
+                                        tracing::warn!(error = %err, "failed to write bidi response");
+                                        writer.reset(0);
+                                        return Ok(true);
+                                    }
+                                    if is_terminal {
+                                        let finish = writer.finish();
+                                        response.complete(
+                                            finish
+                                                .as_ref()
+                                                .map(|_| ())
+                                                .map_err(DeliveryError::from_session_error),
+                                        );
+                                        if let Err(err) = finish {
+                                            tracing::debug!(error = %err, "failed to FIN bidi response stream");
+                                        }
+                                        return Ok(true);
+                                    }
+                                    if matches!(request_kind, BidiRequestKind::Publish)
+                                        && matches!(response.message, Message::RequestOk(_))
+                                    {
+                                        publish_response_sent = true;
+                                    }
+                                    response.complete(Ok(()));
+                                    if deferred_publish_done {
+                                        return Ok(false);
+                                    }
+                                }
+                                res = &mut follow_ups, if !deferred_publish_done => {
+                                    match res {
+                                        Ok(FollowupEnd::PublishDone)
+                                            if matches!(request_kind, BidiRequestKind::Publish) =>
+                                        {
+                                            // PUBLISH always receives REQUEST_OK or REQUEST_ERROR,
+                                            // even when the publisher sent an early PUBLISH_DONE.
+                                            if publish_response_sent {
+                                                return Ok(false);
+                                            }
+                                            deferred_publish_done = true;
+                                        }
+                                        Ok(FollowupEnd::PublishDone | FollowupEnd::OtherTerminal | FollowupEnd::Cancelled) => {
+                                            return Ok(false);
+                                        }
+                                        Err(err) => return Err(err),
+                                    }
+                                }
+                                stopped = writer.closed() => {
+                                    match stopped {
+                                        Ok(_) => {
+                                            writer.reset(0);
+                                            return Ok(true);
+                                        }
+                                        Err(err) => return Err(err),
+                                    }
+                                }
+                            }
                         }
                     };
 
@@ -1095,39 +1264,33 @@ impl Session {
                     // A protocol violation seen while reading follow-ups has to
                     // reach the caller, which closes the session. Timing out is
                     // not a violation: the slot is reclaimed and the session lives.
-                    dispatch_result = if bounded_response {
-                        match tokio::time::timeout(Self::BIDI_REQUEST_TIMEOUT, both).await {
+                    let request_result = if bounded_response {
+                        match tokio::time::timeout(Self::BIDI_REQUEST_TIMEOUT, responses).await {
                             Ok(res) => res,
                             Err(_) => {
                                 tracing::debug!(
                                     ?req_id,
                                     "one-shot bidi request timed out awaiting response; reclaiming slot"
                                 );
-                                Ok(())
+                                writer.reset(0);
+                                Ok(true)
                             }
                         }
                     } else {
-                        both.await
+                        responses.await
                     };
+                    match request_result {
+                        Ok(closed) => writer_closed = closed,
+                        Err(err) => dispatch_result = Err(err),
+                    }
                 }
             }
         }
 
-        // The request stream is over. Release everything keyed by this request
-        // ID — a stream that dies without a terminal message would otherwise
-        // leak its state (and leave the application blocked on `closed()`) for
-        // the life of the session. Runs on both success and error paths.
-        if let Some(id) = req_id {
-            if let Some(subscriber) = subscriber.as_ref() {
-                subscriber.abort_publish_received(id);
-            }
-            if let Ok(mut map) = bidi_response_map.lock() {
-                map.remove(&id);
-            }
-        }
-
         // Explicitly finish the stream and yield for Quinn to flush.
-        let _ = writer.finish();
+        if !writer_closed {
+            let _ = writer.finish();
+        }
         tokio::task::yield_now().await;
 
         dispatch_result
@@ -1155,7 +1318,7 @@ impl Session {
         request_id: u64,
         publisher: &mut Option<Publisher>,
         subscriber: &mut Option<Subscriber>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<FollowupEnd, SessionError> {
         loop {
             let msg = match Self::decode_bidi_response(reader, request_id).await {
                 Ok(msg) => msg,
@@ -1164,7 +1327,7 @@ impl Session {
                 // let a peer pin one slot per reset stream.
                 Err(err) if err.is_stream_error() => {
                     tracing::debug!(request_id, error = %err, "request stream reset by peer");
-                    return Ok(());
+                    return Ok(FollowupEnd::Cancelled);
                 }
                 // A clean FIN of the requester's send half is different: it only
                 // means no more requests are coming on this stream, not that the
@@ -1173,20 +1336,20 @@ impl Session {
                 // keeps the response side alive.
                 Err(err) if err.is_stream_ended() => {
                     tracing::trace!(request_id, error = %err, "request stream send half finished");
-                    std::future::pending::<()>().await;
-                    return Ok(());
+                    return std::future::pending::<Result<FollowupEnd, SessionError>>().await;
                 }
                 // Draft-18 requires closing the session on an unknown message
                 // type, so an undecodable frame is not something to skip past.
                 Err(err) => return Err(err),
             };
 
-            let terminal = matches!(
-                msg,
-                Message::PublishDone(_)
-                    | Message::PublishNamespaceDone(_)
-                    | Message::Unsubscribe(_)
-            );
+            let terminal = match &msg {
+                Message::PublishDone(_) => Some(FollowupEnd::PublishDone),
+                Message::PublishNamespaceDone(_) | Message::Unsubscribe(_) => {
+                    Some(FollowupEnd::OtherTerminal)
+                }
+                _ => None,
+            };
 
             let dispatched = match TryInto::<message::Publisher>::try_into(msg) {
                 Ok(msg) => subscriber
@@ -1215,8 +1378,8 @@ impl Session {
                 return Err(err);
             }
 
-            if terminal {
-                return Ok(());
+            if let Some(terminal) = terminal {
+                return Ok(terminal);
             }
         }
     }
@@ -1716,6 +1879,521 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn open_inbound_subscribe() -> (
+        web_transport::Session,
+        Publisher,
+        Subscribed,
+        Writer,
+        Reader,
+        tokio::task::JoinHandle<Result<(), SessionError>>,
+    ) {
+        let (requester, responder) = test_support::loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request_ids = RequestId::new(1, 0);
+        let mut publisher = Publisher::new(
+            outgoing,
+            responder.clone(),
+            None,
+            request_ids.clone(),
+            bidi_task_tx,
+        );
+        let responses = publisher.bidi_response_map.clone();
+        let (send_stream, recv_stream) = requester.open_bi().await.unwrap();
+        let mut request_writer = Writer::new(send_stream);
+        request_writer
+            .encode(&Message::Subscribe(message::Subscribe {
+                id: 0,
+                track_namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
+                track_name: "track".into(),
+                params: KeyValuePairs::default(),
+            }))
+            .await
+            .unwrap();
+        let response_reader = Reader::new(recv_stream);
+        let (response_stream, request_stream) = responder.accept_bi().await.unwrap();
+        let handler_publisher = publisher.clone();
+        let handler = tokio::spawn(async move {
+            let mut publisher = Some(handler_publisher);
+            let mut subscriber = None;
+            Session::handle_bidi_request(
+                response_stream,
+                request_stream,
+                &mut publisher,
+                &mut subscriber,
+                &request_ids,
+                &responses,
+                None,
+            )
+            .await
+        });
+        let subscribed =
+            tokio::time::timeout(std::time::Duration::from_secs(2), publisher.subscribed())
+                .await
+                .unwrap()
+                .unwrap();
+        (
+            requester,
+            publisher,
+            subscribed,
+            request_writer,
+            response_reader,
+            handler,
+        )
+    }
+
+    fn create_subgroup(
+        subgroups: &mut crate::serve::SubgroupsWriter,
+        group_id: u64,
+    ) -> crate::serve::SubgroupWriter {
+        let mut subgroup = subgroups
+            .create(crate::serve::Subgroup {
+                group_id,
+                subgroup_id: 0,
+                priority: 128,
+            })
+            .unwrap();
+        subgroup.write(bytes::Bytes::from_static(b"x")).unwrap();
+        subgroup
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_subscribe_orders_ok_before_done_and_fins_with_exact_stream_count() {
+        for expected_stream_count in [0, 2] {
+            let (
+                requester,
+                _publisher,
+                subscribed,
+                mut request_writer,
+                mut response_reader,
+                handler,
+            ) = open_inbound_subscribe().await;
+            request_writer.finish().unwrap();
+            let (writer, reader) = crate::serve::Track::new(
+                crate::coding::TrackNamespace::from_utf8_path("test"),
+                "track",
+            )
+            .produce();
+            let mut subgroups = writer.subgroups().unwrap();
+            let serve = tokio::spawn(subscribed.serve(reader));
+
+            assert!(matches!(
+                Session::decode_bidi_response(&mut response_reader, 0)
+                    .await
+                    .unwrap(),
+                Message::SubscribeOk(_)
+            ));
+            for group_id in 0..expected_stream_count {
+                drop(create_subgroup(&mut subgroups, group_id));
+                let stream = requester.accept_uni().await.unwrap();
+                let mut reader = Reader::new(stream);
+                let _: crate::data::StreamHeader = reader.decode().await.unwrap();
+                let object: crate::data::SubgroupObjectExt = reader.decode().await.unwrap();
+                assert_eq!(
+                    reader
+                        .read_chunk(object.payload_length)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    b"x"[..]
+                );
+                assert!(reader.done().await.unwrap());
+            }
+            drop(subgroups);
+
+            let Message::PublishDone(done) = Session::decode_bidi_response(&mut response_reader, 0)
+                .await
+                .unwrap()
+            else {
+                panic!("expected PUBLISH_DONE after SUBSCRIBE_OK");
+            };
+            assert_eq!(done.stream_count, expected_stream_count);
+            assert!(response_reader.done().await.unwrap());
+            serve.await.unwrap().unwrap();
+            handler.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_subscribe_source_failure_sends_done_before_returning_error() {
+        let (_requester, _publisher, subscribed, mut request_writer, mut response_reader, handler) =
+            open_inbound_subscribe().await;
+        request_writer.finish().unwrap();
+        let (writer, reader) = crate::serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        )
+        .produce();
+        let subgroups = writer.subgroups().unwrap();
+        let serve = tokio::spawn(subscribed.serve(reader));
+        assert!(matches!(
+            Session::decode_bidi_response(&mut response_reader, 0)
+                .await
+                .unwrap(),
+            Message::SubscribeOk(_)
+        ));
+        subgroups
+            .close(crate::serve::ServeError::Closed(0x42))
+            .unwrap();
+
+        let Message::PublishDone(done) = Session::decode_bidi_response(&mut response_reader, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("expected PUBLISH_DONE for source failure");
+        };
+        assert_eq!(done.status_code, 0x42);
+        assert_eq!(done.stream_count, 0);
+        assert!(response_reader.done().await.unwrap());
+        assert!(matches!(
+            serve.await.unwrap(),
+            Err(SessionError::Serve(crate::serve::ServeError::Closed(0x42)))
+        ));
+        handler.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_subscribe_peer_stop_cancels_and_resets_incomplete_subgroup() {
+        let (requester, _publisher, subscribed, _request_writer, mut response_reader, handler) =
+            open_inbound_subscribe().await;
+        let (writer, reader) = crate::serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        )
+        .produce();
+        let mut subgroups = writer.subgroups().unwrap();
+        let serve = tokio::spawn(subscribed.serve(reader));
+        assert!(matches!(
+            Session::decode_bidi_response(&mut response_reader, 0)
+                .await
+                .unwrap(),
+            Message::SubscribeOk(_)
+        ));
+        let subgroup = create_subgroup(&mut subgroups, 0);
+        let stream = requester.accept_uni().await.unwrap();
+        let mut data_reader = Reader::new(stream);
+        let _: crate::data::StreamHeader = data_reader.decode().await.unwrap();
+        let object: crate::data::SubgroupObjectExt = data_reader.decode().await.unwrap();
+        assert_eq!(
+            data_reader
+                .read_chunk(object.payload_length)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"x"[..]
+        );
+
+        response_reader.stop(0);
+        assert!(matches!(
+            serve.await.unwrap(),
+            Err(SessionError::Serve(crate::serve::ServeError::Cancel))
+        ));
+        assert!(matches!(
+            data_reader.done().await,
+            Err(SessionError::WebTransport(web_transport::Error::Read(
+                web_transport::quinn::ReadError::Reset(0)
+            )))
+        ));
+        handler.await.unwrap().unwrap();
+        drop(subgroup);
+        drop(subgroups);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_inbound_driver_cancels_active_subscribe() {
+        let (requester, _publisher, subscribed, _request_writer, mut response_reader, handler) =
+            open_inbound_subscribe().await;
+        let (writer, reader) = crate::serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        )
+        .produce();
+        let mut subgroups = writer.subgroups().unwrap();
+        let serve = tokio::spawn(subscribed.serve(reader));
+        assert!(matches!(
+            Session::decode_bidi_response(&mut response_reader, 0)
+                .await
+                .unwrap(),
+            Message::SubscribeOk(_)
+        ));
+        let subgroup = create_subgroup(&mut subgroups, 0);
+        let stream = requester.accept_uni().await.unwrap();
+        let mut data_reader = Reader::new(stream);
+        let _: crate::data::StreamHeader = data_reader.decode().await.unwrap();
+        let object: crate::data::SubgroupObjectExt = data_reader.decode().await.unwrap();
+        let _ = data_reader
+            .read_chunk(object.payload_length)
+            .await
+            .unwrap()
+            .unwrap();
+
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            serve.await.unwrap(),
+            Err(SessionError::Serve(crate::serve::ServeError::Cancel))
+        ));
+        assert!(matches!(
+            data_reader.done().await,
+            Err(SessionError::WebTransport(web_transport::Error::Read(
+                web_transport::quinn::ReadError::Reset(0)
+            )))
+        ));
+        drop(subgroup);
+        drop(subgroups);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_publish_early_done_still_receives_mandatory_response() {
+        let (requester, responder) = test_support::loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request_ids = RequestId::new(1, 0);
+        let responses = BidiResponseMap::default();
+        let mut subscriber = Subscriber::new(
+            outgoing,
+            responder.clone(),
+            Transport::WebTransport,
+            None,
+            request_ids.clone(),
+            bidi_task_tx,
+            responses.clone(),
+        );
+        let (send_stream, recv_stream) = requester.open_bi().await.unwrap();
+        let mut request_writer = Writer::new(send_stream);
+        request_writer
+            .encode(&Message::Publish(message::Publish {
+                id: 0,
+                track_namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
+                track_name: "track".into(),
+                track_alias: 0,
+                params: KeyValuePairs::default(),
+                track_extensions: Default::default(),
+            }))
+            .await
+            .unwrap();
+        Session::encode_bidi_response(
+            &mut request_writer,
+            &Message::PublishDone(message::PublishDone {
+                id: 0,
+                status_code: message::PublishDoneCode::TrackEnded as u64,
+                stream_count: 0,
+                reason: Default::default(),
+            }),
+        )
+        .await
+        .unwrap();
+        request_writer.finish().unwrap();
+        let mut response_reader = Reader::new(recv_stream);
+        let (response_stream, request_stream) = responder.accept_bi().await.unwrap();
+        let handler_subscriber = subscriber.clone();
+        let handler = tokio::spawn(async move {
+            let mut publisher = None;
+            let mut subscriber = Some(handler_subscriber);
+            Session::handle_bidi_request(
+                response_stream,
+                request_stream,
+                &mut publisher,
+                &mut subscriber,
+                &request_ids,
+                &responses,
+                None,
+            )
+            .await
+        });
+
+        let mut publish = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            subscriber.publish_received(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        publish.accept(true).unwrap();
+        assert!(matches!(
+            Session::decode_bidi_response(&mut response_reader, 0)
+                .await
+                .unwrap(),
+            Message::RequestOk(_)
+        ));
+        assert!(response_reader.done().await.unwrap());
+        handler.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_publish_response_before_done_fins_and_cleans_up() {
+        let (requester, responder) = test_support::loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request_ids = RequestId::new(1, 0);
+        let responses = BidiResponseMap::default();
+        let mut subscriber = Subscriber::new(
+            outgoing,
+            responder.clone(),
+            Transport::WebTransport,
+            None,
+            request_ids.clone(),
+            bidi_task_tx,
+            responses.clone(),
+        );
+        let (send_stream, recv_stream) = requester.open_bi().await.unwrap();
+        let mut request_writer = Writer::new(send_stream);
+        request_writer
+            .encode(&Message::Publish(message::Publish {
+                id: 0,
+                track_namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
+                track_name: "track".into(),
+                track_alias: 0,
+                params: KeyValuePairs::default(),
+                track_extensions: Default::default(),
+            }))
+            .await
+            .unwrap();
+        let mut response_reader = Reader::new(recv_stream);
+        let (response_stream, request_stream) = responder.accept_bi().await.unwrap();
+        let handler_subscriber = subscriber.clone();
+        let handler_responses = responses.clone();
+        let handler = tokio::spawn(async move {
+            let mut publisher = None;
+            let mut subscriber = Some(handler_subscriber);
+            Session::handle_bidi_request(
+                response_stream,
+                request_stream,
+                &mut publisher,
+                &mut subscriber,
+                &request_ids,
+                &handler_responses,
+                None,
+            )
+            .await
+        });
+
+        let mut publish = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            subscriber.publish_received(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        publish.accept(true).unwrap();
+        assert!(matches!(
+            Session::decode_bidi_response(&mut response_reader, 0)
+                .await
+                .unwrap(),
+            Message::RequestOk(_)
+        ));
+        assert!(!handler.is_finished());
+
+        Session::encode_bidi_response(
+            &mut request_writer,
+            &Message::PublishDone(message::PublishDone {
+                id: 0,
+                status_code: message::PublishDoneCode::TrackEnded as u64,
+                stream_count: 0,
+                reason: Default::default(),
+            }),
+        )
+        .await
+        .unwrap();
+        request_writer.finish().unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), publish.closed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), response_reader.done())
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), handler)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(responses.lock().unwrap().is_empty());
+        assert!(
+            !subscriber.has_subscriber_name(&crate::serve::FullTrackName {
+                namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
+                name: "track".into(),
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_publish_rejection_uses_request_stream_fin_and_cleans_up() {
+        let (requester, responder) = test_support::loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request_ids = RequestId::new(1, 0);
+        let responses = BidiResponseMap::default();
+        let mut subscriber = Subscriber::new(
+            outgoing,
+            responder.clone(),
+            Transport::WebTransport,
+            None,
+            request_ids.clone(),
+            bidi_task_tx,
+            responses.clone(),
+        );
+        let (send_stream, recv_stream) = requester.open_bi().await.unwrap();
+        let mut request_writer = Writer::new(send_stream);
+        request_writer
+            .encode(&Message::Publish(message::Publish {
+                id: 0,
+                track_namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
+                track_name: "track".into(),
+                track_alias: 0,
+                params: KeyValuePairs::default(),
+                track_extensions: Default::default(),
+            }))
+            .await
+            .unwrap();
+        request_writer.finish().unwrap();
+        let mut response_reader = Reader::new(recv_stream);
+        let (response_stream, request_stream) = responder.accept_bi().await.unwrap();
+        let handler_subscriber = subscriber.clone();
+        let handler = tokio::spawn(async move {
+            let mut publisher = None;
+            let mut subscriber = Some(handler_subscriber);
+            Session::handle_bidi_request(
+                response_stream,
+                request_stream,
+                &mut publisher,
+                &mut subscriber,
+                &request_ids,
+                &responses,
+                None,
+            )
+            .await
+        });
+
+        drop(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                subscriber.publish_received(),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+        assert!(matches!(
+            Session::decode_bidi_response(&mut response_reader, 0)
+                .await
+                .unwrap(),
+            Message::RequestError(_)
+        ));
+        assert!(response_reader.done().await.unwrap());
+        handler.await.unwrap().unwrap();
+        assert!(
+            !subscriber.has_subscriber_name(&crate::serve::FullTrackName {
+                namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
+                name: "track".into(),
+            })
+        );
+    }
 
     // ========================================================================
     // normalize_connection_path

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::ops;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::stream::FuturesUnordered;
@@ -15,14 +16,16 @@ use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
 
-use super::{DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
+use super::{
+    DeliveryError, DeliveryFilter, Publisher, ResetOnDropWriter, SessionError, SubscribeInfo,
+    Writer,
+};
 
 // This file defines Publisher handling of inbound Subscriptions
 
 #[derive(Debug)]
 struct ObjectForwarderState {
     largest_location: Option<Location>,
-    stream_count: u64,
     retry_interval: u64,
     /// Set to true when UNSUBSCRIBE is received.  When true, Drop skips sending
     /// PUBLISH_DONE or REQUEST_ERROR because the subscriber already terminated.
@@ -31,10 +34,6 @@ struct ObjectForwarderState {
 }
 
 impl ObjectForwarderState {
-    fn record_stream_opened(&mut self) {
-        self.stream_count = self.stream_count.saturating_add(1);
-    }
-
     fn update_largest_location(&mut self, group_id: u64, object_id: u64) -> Result<(), ServeError> {
         let location = Location::new(group_id, object_id);
         self.largest_location = Some(
@@ -50,7 +49,6 @@ impl Default for ObjectForwarderState {
     fn default() -> Self {
         Self {
             largest_location: None,
-            stream_count: 0,
             retry_interval: 0,
             unsubscribed: false,
             closed: Ok(()),
@@ -65,9 +63,30 @@ pub struct Subscribed {
     /// Data-plane half, shared with outbound PUBLISH serving.
     forwarder: ObjectForwarder,
 
-    /// Tracks if SubscribeOk has been sent yet or not. Used to send
-    /// PUBLISH_DONE vs REQUEST_ERROR on drop.
+    /// Tracks whether SubscribeOk was enqueued, which selects PUBLISH_DONE instead
+    /// of REQUEST_ERROR for both normal and abnormal termination.
     ok: bool,
+
+    /// Set before awaiting the terminal receipt so cancellation cannot make
+    /// Drop enqueue a duplicate terminal message.
+    terminal_started: bool,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct StreamCount(Arc<AtomicU64>);
+
+impl StreamCount {
+    fn opened(&self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            });
+    }
+
+    pub(super) fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 /// Failure while serving a track under a pre-acceptance deadline.
@@ -99,52 +118,8 @@ pub(super) struct ObjectForwarder {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
-}
 
-struct ResetOnDropWriter {
-    writer: Writer,
-    closed: bool,
-}
-
-impl ResetOnDropWriter {
-    fn new(writer: Writer) -> Self {
-        Self {
-            writer,
-            closed: false,
-        }
-    }
-
-    fn finish(&mut self) -> Result<(), SessionError> {
-        self.closed = true;
-        self.writer.finish()
-    }
-
-    fn reset(&mut self, code: u32) {
-        self.writer.reset(code);
-        self.closed = true;
-    }
-}
-
-impl std::ops::Deref for ResetOnDropWriter {
-    type Target = Writer;
-
-    fn deref(&self) -> &Self::Target {
-        &self.writer
-    }
-}
-
-impl std::ops::DerefMut for ResetOnDropWriter {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.writer
-    }
-}
-
-impl Drop for ResetOnDropWriter {
-    fn drop(&mut self) {
-        if !self.closed {
-            self.writer.reset(0);
-        }
-    }
+    stream_count: StreamCount,
 }
 
 impl ObjectForwarder {
@@ -159,6 +134,7 @@ impl ObjectForwarder {
             state: send,
             track_alias,
             mlog,
+            stream_count: StreamCount::default(),
         };
         let recv = ObjectForwarderRecv { state: recv };
         (send, recv)
@@ -193,11 +169,8 @@ impl ObjectForwarder {
         Ok(())
     }
 
-    /// Subgroup streams opened so far. The PUBLISH path needs this separately
-    /// from [`Self::terminal_state`], because there the terminal message is sent
-    /// by `Published::drop` after the forwarder is gone.
-    pub(super) fn stream_count(&self) -> u64 {
-        self.state.lock().stream_count
+    pub(super) fn stream_count_handle(&self) -> StreamCount {
+        self.stream_count.clone()
     }
 
     /// Snapshot the fields a terminal message needs, without holding the lock
@@ -212,7 +185,7 @@ impl ObjectForwarder {
             .unwrap_or(ServeError::Done);
         (
             err,
-            state.stream_count,
+            self.stream_count.get(),
             state.retry_interval,
             state.unsubscribed,
         )
@@ -276,6 +249,7 @@ impl Subscribed {
             info,
             forwarder,
             ok: false,
+            terminal_started: false,
         };
 
         Ok((send, recv))
@@ -323,19 +297,23 @@ impl Subscribed {
         let deadline_expired =
             !self.ok && matches!(result, Err(SessionError::Serve(ServeError::Timeout)));
 
-        let Err(err) = result else {
-            return Ok(());
-        };
-
         if deadline_expired {
             // A simultaneous UNSUBSCRIBE may have closed the shared state first,
             // but the relay still needs the deadline result for its response and metric.
-            let _ = self.close(err.clone().into());
+            if let Err(err) = &result {
+                let _ = self.forwarder.close(err.clone().into(), 0);
+            }
             return Err(ServeWithDeadlineError::DeadlineExpired);
         }
 
-        self.close(err.clone().into()).map_err(SessionError::from)?;
-        Err(err.into())
+        if let Err(err) = &result {
+            let _ = self.forwarder.close(err.clone().into(), 0);
+        }
+        let terminal = self.finish().await;
+        match result {
+            Ok(()) => terminal.map_err(ServeWithDeadlineError::Session),
+            Err(err) => Err(ServeWithDeadlineError::Session(err)),
+        }
     }
 
     async fn serve_before(
@@ -346,10 +324,10 @@ impl Subscribed {
     ) -> Result<(), SessionError> {
         let res = self.serve_inner(track, deadline, largest_location).await;
         if let Err(err) = &res {
-            self.close(err.clone().into())?;
+            let _ = self.forwarder.close(err.clone().into(), 0);
         }
-
-        res
+        let terminal = self.finish().await;
+        res.and(terminal)
     }
 
     async fn serve_inner(
@@ -361,9 +339,8 @@ impl Subscribed {
         self.forwarder
             .prepare_subscribe_ok(largest_location, deadline)?;
 
-        // Send SubscribeOk using send_message_and_wait to ensure it is sent at least to the QUIC stack before
-        // we start serving the track.  If a subscriber gets the stream before SubscribeOk
-        // then they won't recognize the track_alias in the stream header.
+        // Wait until SUBSCRIBE_OK is encoded before serving. Otherwise a data
+        // stream or an immediate PUBLISH_DONE could overtake acceptance.
         let mut params = KeyValuePairs::default();
         if let Some(largest) = largest_location {
             params
@@ -371,17 +348,21 @@ impl Subscribed {
                 .map_err(|_| SessionError::Internal)?;
         }
 
-        self.forwarder
+        let acceptance = self
+            .forwarder
             .publisher
-            .send_message_and_wait(message::SubscribeOk {
+            .send_subscribe_ok(message::SubscribeOk {
                 id: self.info.id,
                 track_alias: self.info.id, // use subscription id as track alias
                 params,
                 track_extensions: Default::default(),
-            })
-            .await;
+            })?;
 
-        self.ok = true; // So we send SubscribeDone on drop
+        self.ok = true;
+        acceptance
+            .await
+            .map_err(|_| DeliveryError::Cancelled.into_session_error())?
+            .map_err(DeliveryError::into_session_error)?;
 
         let delivery_filter = self.info.delivery_filter(largest_location);
 
@@ -403,6 +384,27 @@ impl Subscribed {
     pub async fn closed(&self) -> Result<(), ServeError> {
         self.forwarder.closed().await
     }
+
+    async fn finish(&mut self) -> Result<(), SessionError> {
+        let (err, stream_count, _, unsubscribed) = self.forwarder.terminal_state();
+        if !self.ok || unsubscribed {
+            return Ok(());
+        }
+
+        self.terminal_started = true;
+        let result = self
+            .forwarder
+            .publisher
+            .send_publish_done_and_wait(message::PublishDone {
+                id: self.info.id,
+                status_code: Self::publish_done_code(&err),
+                stream_count,
+                reason: ReasonPhrase(err.to_string()),
+            })
+            .await;
+        self.forwarder.publisher.drop_subscribe(self.info.id);
+        result
+    }
 }
 
 impl ops::Deref for Subscribed {
@@ -417,8 +419,12 @@ impl Drop for Subscribed {
     fn drop(&mut self) {
         let (err, stream_count, retry_interval, unsubscribed) = self.forwarder.terminal_state();
 
-        // Subscriber already sent UNSUBSCRIBE — no terminal message needed.
+        // Normal completion owns an async receipt. Drop only handles abnormal
+        // cancellation before that terminal delivery starts.
         if unsubscribed {
+            return;
+        }
+        if self.terminal_started {
             return;
         }
 
@@ -521,9 +527,10 @@ impl ObjectForwarder {
                         let info = subgroup.info.clone();
                         let mlog = self.mlog.clone();
                         let track_alias = self.track_alias;
+                        let stream_count = self.stream_count.clone();
 
                         tasks.push(async move {
-                            let res = Self::serve_subgroup(track_alias, subgroup, publisher, state, mlog, delivery_filter).await;
+                            let res = Self::serve_subgroup(track_alias, subgroup, publisher, state, stream_count, mlog, delivery_filter).await;
                             if let Err(err) = &res {
                                 if Subscribed::is_expected_serve_shutdown(err) {
                                     tracing::debug!(subgroup_info = ?info, error = %err, "stopped serving subgroup");
@@ -569,6 +576,7 @@ impl ObjectForwarder {
         mut subgroup_reader: serve::SubgroupReader,
         mut publisher: Publisher,
         state: State<ObjectForwarderState>,
+        stream_count: StreamCount,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
     ) -> Result<(), SessionError> {
@@ -625,14 +633,11 @@ impl ObjectForwarder {
                 // TODO figure out u32 vs u64 priority
                 send_stream.set_priority(subgroup_reader.priority as i32);
                 let mut new_writer = ResetOnDropWriter::new(Writer::new(send_stream));
+                stream_count.opened();
 
                 {
                     let locked = state.lock();
                     let closed = locked.closed.clone();
-                    locked
-                        .into_mut()
-                        .ok_or(ServeError::Done)?
-                        .record_stream_opened();
                     closed?;
                 }
 
@@ -927,6 +932,7 @@ mod tests {
         Subscribed,
         ObjectForwarderRecv,
         crate::watch::Queue<message::Message>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::session::BidiResponse>,
     ) {
         let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
         let (outgoing, outgoing_recv) = crate::watch::Queue::default().split();
@@ -937,6 +943,12 @@ mod tests {
             crate::session::RequestId::new(0, 1),
             bidi_task_tx,
         );
+        let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
+        publisher
+            .bidi_response_map
+            .lock()
+            .unwrap()
+            .insert(0, response_tx);
         let (subscribed, recv) = Subscribed::new(
             publisher,
             message::Subscribe {
@@ -948,7 +960,15 @@ mod tests {
             None,
         )
         .unwrap();
-        (subscribed, recv, outgoing_recv)
+        (subscribed, recv, outgoing_recv, response_rx)
+    }
+
+    async fn accept_subscription(
+        responses: &mut tokio::sync::mpsc::UnboundedReceiver<crate::session::BidiResponse>,
+    ) {
+        let mut response = responses.recv().await.unwrap();
+        assert!(matches!(response.message, message::Message::SubscribeOk(_)));
+        response.complete(Ok(()));
     }
 
     async fn forward_datagram(
@@ -1016,6 +1036,28 @@ mod tests {
         }
     }
 
+    fn closed_subgroup_track(stream_count: u64) -> serve::TrackReader {
+        let (writer, reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        )
+        .produce();
+        let mut subgroups = writer.subgroups().unwrap();
+        for group_id in 0..stream_count {
+            let mut subgroup = subgroups
+                .create(serve::Subgroup {
+                    group_id,
+                    subgroup_id: 0,
+                    priority: 128,
+                })
+                .unwrap();
+            let mut object = subgroup.create_with_id(0, 1, None).unwrap();
+            object.write(Bytes::from_static(b"x")).unwrap();
+        }
+        drop(subgroups);
+        reader
+    }
+
     fn assert_payload_datagram((received, largest): (data::Datagram, Option<Location>)) {
         assert_eq!(
             received.datagram_type,
@@ -1071,7 +1113,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn subscription_filter_uses_pre_wait_track_position() {
         let (publisher_session, peer_session) = loopback_session_pair().await;
-        let (outgoing, mut outgoing_recv) = crate::watch::Queue::default().split();
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
         let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
         let publisher = Publisher::new(
             outgoing,
@@ -1080,6 +1122,12 @@ mod tests {
             crate::session::RequestId::new(0, 1),
             bidi_task_tx,
         );
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel();
+        publisher
+            .bidi_response_map
+            .lock()
+            .unwrap()
+            .insert(0, response_tx);
         let mut params = KeyValuePairs::default();
         params
             .set_subscription_filter(&message::SubscriptionFilter {
@@ -1110,10 +1158,16 @@ mod tests {
 
         let serve = subscribed.serve_with_largest_location(reader, None);
         let accept = async move {
+            accept_subscription(&mut response_rx).await;
+            let mut response = response_rx.recv().await.unwrap();
             assert!(matches!(
-                outgoing_recv.pop().await,
-                Some(message::Message::SubscribeOk(_))
+                response.message,
+                message::Message::PublishDone(message::PublishDone {
+                    stream_count: 0,
+                    ..
+                })
             ));
+            response.complete(Ok(()));
         };
         let receive = async move {
             tokio::time::timeout(
@@ -1306,6 +1360,7 @@ mod tests {
             source_reader,
             forwarder.publisher.clone(),
             forwarder.state.clone(),
+            forwarder.stream_count.clone(),
             None,
             filter,
         );
@@ -1401,6 +1456,7 @@ mod tests {
                 source_reader,
                 forwarder.publisher.clone(),
                 forwarder.state.clone(),
+                forwarder.stream_count.clone(),
                 None,
                 filter,
             );
@@ -1474,6 +1530,7 @@ mod tests {
             source_reader,
             forwarder.publisher.clone(),
             forwarder.state.clone(),
+            forwarder.stream_count.clone(),
             None,
             DeliveryFilter {
                 forward: true,
@@ -1740,7 +1797,7 @@ mod tests {
 
     #[tokio::test]
     async fn deadline_prevents_subscribe_ok() {
-        let (subscribed, _recv, _outgoing) = test_subscribed().await;
+        let (subscribed, _recv, _outgoing, _responses) = test_subscribed().await;
         let (_writer, reader) = serve::Track::new(
             crate::coding::TrackNamespace::from_utf8_path("test"),
             "track",
@@ -1757,7 +1814,7 @@ mod tests {
 
     #[tokio::test]
     async fn withdrawal_prevents_subscribe_ok() {
-        let (subscribed, mut recv, _outgoing) = test_subscribed().await;
+        let (subscribed, mut recv, _outgoing, _responses) = test_subscribed().await;
         recv.recv_unsubscribe().unwrap();
         let (_writer, reader) = serve::Track::new(
             crate::coding::TrackNamespace::from_utf8_path("test"),
@@ -1779,11 +1836,163 @@ mod tests {
         ));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_waits_for_terminal_receipt_with_exact_zero_and_two_stream_counts() {
+        for expected_stream_count in [0, 2] {
+            let (subscribed, _recv, _outgoing, mut responses) = test_subscribed().await;
+            let stream_count = subscribed.forwarder.stream_count_handle();
+            let (writer, reader) = serve::Track::new(
+                crate::coding::TrackNamespace::from_utf8_path("test"),
+                "track",
+            )
+            .produce();
+            let mut subgroups = writer.subgroups().unwrap();
+            let serve = tokio::spawn(subscribed.serve(reader));
+
+            accept_subscription(&mut responses).await;
+            for group_id in 0..expected_stream_count {
+                let mut subgroup = subgroups
+                    .create(serve::Subgroup {
+                        group_id,
+                        subgroup_id: 0,
+                        priority: 128,
+                    })
+                    .unwrap();
+                subgroup.write(Bytes::from_static(b"x")).unwrap();
+                drop(subgroup);
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while stream_count.get() != group_id + 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            drop(subgroups);
+            let mut response =
+                tokio::time::timeout(std::time::Duration::from_secs(2), responses.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let message::Message::PublishDone(done) = &response.message else {
+                panic!("expected PUBLISH_DONE, got {:?}", response.message);
+            };
+            assert_eq!(done.stream_count, expected_stream_count);
+            assert!(!serve.is_finished());
+
+            response.complete(Ok(()));
+            serve.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_driver_cancellation_fails_terminal_delivery() {
+        let (subscribed, _recv, mut outgoing, mut responses) = test_subscribed().await;
+        let serve = tokio::spawn(subscribed.serve(closed_subgroup_track(0)));
+
+        accept_subscription(&mut responses).await;
+        drop(responses);
+
+        assert!(matches!(
+            serve.await.unwrap(),
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+        if let Ok(Some(message)) =
+            tokio::time::timeout(std::time::Duration::from_millis(20), outgoing.pop()).await
+        {
+            panic!("unexpected terminal queue message: {message:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_subscribe_ok_enqueue_does_not_reject_accepted_request() {
+        let (subscribed, _recv, mut outgoing, mut responses) = test_subscribed().await;
+        let _publisher = subscribed.forwarder.publisher.clone();
+        let serve = tokio::spawn(subscribed.serve(closed_subgroup_track(0)));
+        let response = responses.recv().await.unwrap();
+        assert!(matches!(response.message, message::Message::SubscribeOk(_)));
+
+        serve.abort();
+        assert!(serve.await.unwrap_err().is_cancelled());
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), outgoing.pop())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(terminal, message::Message::PublishDone(_)));
+        drop(response);
+    }
+
+    #[tokio::test]
+    async fn source_failure_is_reported_after_publish_done_receipt() {
+        let (subscribed, _recv, _outgoing, mut responses) = test_subscribed().await;
+        let (writer, reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        )
+        .produce();
+        writer
+            .subgroups()
+            .unwrap()
+            .close(ServeError::Closed(0x42))
+            .unwrap();
+        let serve = tokio::spawn(subscribed.serve(reader));
+
+        accept_subscription(&mut responses).await;
+        let mut response = responses.recv().await.unwrap();
+        let message::Message::PublishDone(done) = &response.message else {
+            panic!("expected PUBLISH_DONE, got {:?}", response.message);
+        };
+        assert_eq!(done.status_code, 0x42);
+        assert_eq!(done.stream_count, 0);
+        assert!(!serve.is_finished());
+
+        response.complete(Ok(()));
+        assert!(matches!(
+            serve.await.unwrap(),
+            Err(SessionError::Serve(ServeError::Closed(0x42)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn peer_cancellation_suppresses_publish_done() {
+        let (subscribed, mut recv, _outgoing, mut responses) = test_subscribed().await;
+        let (writer, reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "track",
+        )
+        .produce();
+        let mut subgroups = writer.subgroups().unwrap();
+        let mut subgroup = subgroups
+            .create(serve::Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 128,
+            })
+            .unwrap();
+        subgroup.write(Bytes::from_static(b"x")).unwrap();
+        let serve = tokio::spawn(subscribed.serve(reader));
+
+        accept_subscription(&mut responses).await;
+        recv.recv_unsubscribe().unwrap();
+        assert!(matches!(
+            serve.await.unwrap(),
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), responses.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(subgroup);
+        drop(subgroups);
+    }
+
     /// A publisher-side timeout after SUBSCRIBE_OK is a track failure, not an
     /// expired rendezvous window.
     #[tokio::test]
     async fn accepted_track_timeout_is_not_a_deadline_expiration() {
-        let (subscribed, _recv, mut outgoing) = test_subscribed().await;
+        let (subscribed, _recv, _outgoing, mut responses) = test_subscribed().await;
         let (writer, reader) = serve::Track::new(
             crate::coding::TrackNamespace::from_utf8_path("test"),
             "track",
@@ -1795,11 +2004,11 @@ mod tests {
             tokio::time::Instant::now() + std::time::Duration::from_secs(1),
         );
         let close_after_accept = async move {
-            assert!(matches!(
-                outgoing.pop().await,
-                Some(message::Message::SubscribeOk(_))
-            ));
+            accept_subscription(&mut responses).await;
             writer.close(ServeError::Timeout).unwrap();
+            let mut response = responses.recv().await.unwrap();
+            assert!(matches!(response.message, message::Message::PublishDone(_)));
+            response.complete(Ok(()));
         };
 
         let (result, ()) = tokio::join!(serve, close_after_accept);
@@ -1811,7 +2020,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejection_preserves_retry_interval() {
-        let (subscribed, _recv, mut outgoing) = test_subscribed().await;
+        let (subscribed, _recv, mut outgoing, _responses) = test_subscribed().await;
         // The session retains a Publisher while individual requests come and go.
         let _publisher = subscribed.forwarder.publisher.clone();
         let retry_interval = 1_500;
@@ -1833,14 +2042,25 @@ mod tests {
 
     #[test]
     fn subscribed_state_counts_opened_streams() {
-        let mut state = ObjectForwarderState::default();
-        assert_eq!(state.stream_count, 0);
+        let stream_count = StreamCount::default();
+        assert_eq!(stream_count.get(), 0);
 
-        state.record_stream_opened();
-        assert_eq!(state.stream_count, 1);
+        stream_count.opened();
+        assert_eq!(stream_count.get(), 1);
 
-        state.record_stream_opened();
-        assert_eq!(state.stream_count, 2);
+        stream_count.opened();
+        assert_eq!(stream_count.get(), 2);
+    }
+
+    #[test]
+    fn stream_count_does_not_wrap() {
+        let stream_count = StreamCount(Arc::new(AtomicU64::new(u64::MAX - 1)));
+
+        stream_count.opened();
+        assert_eq!(stream_count.get(), u64::MAX);
+
+        stream_count.opened();
+        assert_eq!(stream_count.get(), u64::MAX);
     }
 
     #[test]
