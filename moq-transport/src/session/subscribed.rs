@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
-use crate::coding::{Encode, KeyValuePairs, Location, ReasonPhrase};
+use crate::coding::{Encode, EncodeError, KeyValuePairs, Location, ReasonPhrase};
 use crate::message::RequestErrorCode;
 use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
@@ -36,12 +36,11 @@ impl ObjectForwarderState {
     }
 
     fn update_largest_location(&mut self, group_id: u64, object_id: u64) -> Result<(), ServeError> {
-        if let Some(current_largest_location) = self.largest_location {
-            let update_largest_location = Location::new(group_id, object_id);
-            if update_largest_location > current_largest_location {
-                self.largest_location = Some(update_largest_location);
-            }
-        }
+        let location = Location::new(group_id, object_id);
+        self.largest_location = Some(
+            self.largest_location
+                .map_or(location, |largest| largest.max(location)),
+        );
 
         Ok(())
     }
@@ -283,16 +282,44 @@ impl Subscribed {
     }
 
     pub async fn serve(self, track: serve::TrackReader) -> Result<(), SessionError> {
-        self.serve_before(track, None).await
+        let largest_location = track.largest_location();
+        self.serve_with_largest_location(track, largest_location)
+            .await
+    }
+
+    /// Serve using the track position captured when the subscription resolved.
+    ///
+    /// Relays can wait for an upstream subscription after resolving a local
+    /// track. Objects arriving during that wait are part of this subscription,
+    /// not cached history against which its filter should be evaluated again.
+    pub async fn serve_with_largest_location(
+        self,
+        track: serve::TrackReader,
+        largest_location: Option<Location>,
+    ) -> Result<(), SessionError> {
+        self.serve_before(track, None, largest_location).await
     }
 
     /// Serve a track only if acceptance is committed before `deadline`.
     pub async fn serve_with_deadline(
-        mut self,
+        self,
         track: serve::TrackReader,
         deadline: tokio::time::Instant,
     ) -> Result<(), ServeWithDeadlineError> {
-        let result = self.serve_inner(track, Some(deadline)).await;
+        let largest_location = track.largest_location();
+        self.serve_with_deadline_and_largest_location(track, deadline, largest_location)
+            .await
+    }
+
+    pub async fn serve_with_deadline_and_largest_location(
+        mut self,
+        track: serve::TrackReader,
+        deadline: tokio::time::Instant,
+        largest_location: Option<Location>,
+    ) -> Result<(), ServeWithDeadlineError> {
+        let result = self
+            .serve_inner(track, Some(deadline), largest_location)
+            .await;
         let deadline_expired =
             !self.ok && matches!(result, Err(SessionError::Serve(ServeError::Timeout)));
 
@@ -315,8 +342,9 @@ impl Subscribed {
         mut self,
         track: serve::TrackReader,
         deadline: Option<tokio::time::Instant>,
+        largest_location: Option<Location>,
     ) -> Result<(), SessionError> {
-        let res = self.serve_inner(track, deadline).await;
+        let res = self.serve_inner(track, deadline, largest_location).await;
         if let Err(err) = &res {
             self.close(err.clone().into())?;
         }
@@ -328,9 +356,8 @@ impl Subscribed {
         &mut self,
         track: serve::TrackReader,
         deadline: Option<tokio::time::Instant>,
+        largest_location: Option<Location>,
     ) -> Result<(), SessionError> {
-        // Update largest location before sending SubscribeOk
-        let largest_location = track.largest_location();
         self.forwarder
             .prepare_subscribe_ok(largest_location, deadline)?;
 
@@ -782,12 +809,20 @@ impl ObjectForwarder {
                 continue;
             }
 
-            // Determine datagram type based on extension headers presence
             let has_extension_headers = !datagram.extension_headers.is_empty();
-            let datagram_type = if has_extension_headers {
-                data::DatagramType::ObjectIdPayloadExt
-            } else {
-                data::DatagramType::ObjectIdPayload
+            if datagram.status != data::ObjectStatus::NormalObject && !datagram.payload.is_empty() {
+                return Err(EncodeError::InvalidValue.into());
+            }
+            let has_status =
+                datagram.status != data::ObjectStatus::NormalObject || datagram.payload.is_empty();
+            let datagram_type = match (has_status, has_extension_headers, datagram.end_of_group) {
+                (true, _, true) => return Err(EncodeError::InvalidValue.into()),
+                (true, true, false) => data::DatagramType::ObjectIdStatusExt,
+                (true, false, false) => data::DatagramType::ObjectIdStatus,
+                (false, true, true) => data::DatagramType::ObjectIdPayloadExtEndOfGroup,
+                (false, false, true) => data::DatagramType::ObjectIdPayloadEndOfGroup,
+                (false, true, false) => data::DatagramType::ObjectIdPayloadExt,
+                (false, false, false) => data::DatagramType::ObjectIdPayload,
             };
 
             // Bound locally so the logging and largest-location updates below
@@ -798,14 +833,14 @@ impl ObjectForwarder {
                 track_alias: self.track_alias,
                 group_id: datagram.group_id,
                 object_id: Some(object_id),
-                publisher_priority: datagram.priority,
+                publisher_priority: Some(datagram.priority),
                 extension_headers: if has_extension_headers {
                     Some(datagram.extension_headers.clone())
                 } else {
                     None
                 },
-                status: None,
-                payload: Some(datagram.payload),
+                status: has_status.then_some(datagram.status),
+                payload: (!has_status).then_some(datagram.payload),
             };
 
             let payload_len = encoded_datagram
@@ -817,7 +852,7 @@ impl ObjectForwarder {
             encoded_datagram.encode(&mut buffer)?;
 
             tracing::trace!(
-                "[PUBLISHER] serve_datagrams: sending datagram #{} - track_alias={}, group_id={}, object_id={}, priority={}, payload_len={}, extension_headers={:?}, total_encoded_len={}",
+                "[PUBLISHER] serve_datagrams: sending datagram #{} - track_alias={}, group_id={}, object_id={}, priority={:?}, payload_len={}, extension_headers={:?}, total_encoded_len={}",
                 datagram_count + 1,
                 encoded_datagram.track_alias,
                 encoded_datagram.group_id,
@@ -843,10 +878,12 @@ impl ObjectForwarder {
 
             self.publisher.send_datagram(buffer.into()).await?;
 
-            self.state
-                .lock_mut()
-                .ok_or(ServeError::Done)?
-                .update_largest_location(encoded_datagram.group_id, object_id)?;
+            if datagram.status == data::ObjectStatus::NormalObject {
+                self.state
+                    .lock_mut()
+                    .ok_or(ServeError::Done)?
+                    .update_largest_location(encoded_datagram.group_id, object_id)?;
+            }
 
             datagram_count += 1;
         }
@@ -881,7 +918,8 @@ impl ObjectForwarderRecv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::test_support::loopback_session_pair;
+    use crate::coding::Decode;
+    use crate::session::test_support::{loopback_raw_session_pair, loopback_session_pair};
     use crate::session::Reader;
     use bytes::Bytes;
 
@@ -911,6 +949,286 @@ mod tests {
         )
         .unwrap();
         (subscribed, recv, outgoing_recv)
+    }
+
+    async fn forward_datagram(
+        publisher_session: web_transport::Session,
+        peer_session: web_transport::Session,
+        datagram: serve::Datagram,
+    ) -> (data::Datagram, Option<Location>) {
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (mut forwarder, _recv) = ObjectForwarder::new(publisher, 42, None);
+        let (writer, reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "datagram",
+        )
+        .produce();
+        let mut writer = writer.datagrams().unwrap();
+        writer.write(datagram).unwrap();
+        drop(writer);
+        let serve::TrackReaderMode::Datagrams(reader) = reader.mode().await.unwrap() else {
+            panic!("expected datagram mode");
+        };
+
+        let send = forwarder.serve_datagrams(
+            reader,
+            DeliveryFilter {
+                forward: true,
+                start_location: None,
+                end_group_id: None,
+            },
+        );
+        let receive = async move {
+            let mut encoded = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                peer_session.recv_datagram(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            data::Datagram::decode(&mut encoded).unwrap()
+        };
+        let (send, received) = tokio::join!(send, receive);
+        send.unwrap();
+        let largest_location = forwarder.state.lock().largest_location;
+        (received, largest_location)
+    }
+
+    fn payload_datagram() -> serve::Datagram {
+        let mut properties = data::ExtensionHeaders::new();
+        properties.set_intvalue(2, 7);
+        serve::Datagram {
+            group_id: 3,
+            object_id: 0,
+            priority: 200,
+            status: data::ObjectStatus::NormalObject,
+            end_of_group: true,
+            payload: Bytes::from_static(b"payload"),
+            extension_headers: properties,
+        }
+    }
+
+    fn assert_payload_datagram((received, largest): (data::Datagram, Option<Location>)) {
+        assert_eq!(
+            received.datagram_type,
+            data::DatagramType::ObjectIdPayloadExtEndOfGroup
+        );
+        assert_eq!(received.track_alias, 42);
+        assert_eq!(received.group_id, 3);
+        assert_eq!(received.object_id, Some(0));
+        assert_eq!(received.publisher_priority, Some(200));
+        assert_eq!(received.status, None);
+        assert_eq!(received.payload, Some(Bytes::from_static(b"payload")));
+        assert!(received.extension_headers.unwrap().has(2));
+        assert_eq!(largest, Some(Location::new(3, 0)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwards_datagram_semantics_over_webtransport() {
+        let (publisher, peer) = loopback_session_pair().await;
+        assert_payload_datagram(forward_datagram(publisher, peer, payload_datagram()).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwards_datagram_semantics_over_raw_quic() {
+        let (publisher, peer) = loopback_raw_session_pair().await;
+        assert_payload_datagram(forward_datagram(publisher, peer, payload_datagram()).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwards_datagram_status_without_payload() {
+        let (publisher, peer) = loopback_session_pair().await;
+        let (received, largest) = forward_datagram(
+            publisher,
+            peer,
+            serve::Datagram {
+                group_id: 8,
+                object_id: 9,
+                priority: 201,
+                status: data::ObjectStatus::EndOfTrack,
+                end_of_group: false,
+                payload: Bytes::new(),
+                extension_headers: data::ExtensionHeaders::default(),
+            },
+        )
+        .await;
+        assert_eq!(received.datagram_type, data::DatagramType::ObjectIdStatus);
+        assert_eq!(received.object_id, Some(9));
+        assert_eq!(received.publisher_priority, Some(201));
+        assert_eq!(received.status, Some(data::ObjectStatus::EndOfTrack));
+        assert_eq!(received.payload, None);
+        assert_eq!(largest, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscription_filter_uses_pre_wait_track_position() {
+        let (publisher_session, peer_session) = loopback_session_pair().await;
+        let (outgoing, mut outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let mut params = KeyValuePairs::default();
+        params
+            .set_subscription_filter(&message::SubscriptionFilter {
+                filter_type: message::FilterType::NextGroupStart,
+                start_location: None,
+                end_group_id: None,
+            })
+            .unwrap();
+        let (subscribed, _recv) = Subscribed::new(
+            publisher,
+            message::Subscribe {
+                id: 0,
+                track_namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
+                track_name: "datagram".into(),
+                params,
+            },
+            None,
+        )
+        .unwrap();
+        let (writer, reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "datagram",
+        )
+        .produce();
+        let mut writer = writer.datagrams().unwrap();
+        writer.write(payload_datagram()).unwrap();
+        drop(writer);
+
+        let serve = subscribed.serve_with_largest_location(reader, None);
+        let accept = async move {
+            assert!(matches!(
+                outgoing_recv.pop().await,
+                Some(message::Message::SubscribeOk(_))
+            ));
+        };
+        let receive = async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                peer_session.recv_datagram(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        let (serve, _, mut received) = tokio::join!(serve, accept, receive);
+        serve.unwrap();
+        let received = data::Datagram::decode(&mut received).unwrap();
+        assert_eq!(received.group_id, 3);
+        assert_eq!(received.object_id, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_status_datagram_with_end_of_group_bit() {
+        let (publisher_session, _peer_session) = loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (mut forwarder, _recv) = ObjectForwarder::new(publisher, 42, None);
+        let (writer, reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "datagram",
+        )
+        .produce();
+        let mut writer = writer.datagrams().unwrap();
+        writer
+            .write(serve::Datagram {
+                group_id: 1,
+                object_id: 2,
+                priority: 200,
+                status: data::ObjectStatus::EndOfTrack,
+                end_of_group: true,
+                payload: Bytes::new(),
+                extension_headers: data::ExtensionHeaders::default(),
+            })
+            .unwrap();
+        drop(writer);
+        let serve::TrackReaderMode::Datagrams(reader) = reader.mode().await.unwrap() else {
+            panic!("expected datagram mode");
+        };
+
+        assert!(matches!(
+            forwarder
+                .serve_datagrams(
+                    reader,
+                    DeliveryFilter {
+                        forward: true,
+                        start_location: None,
+                        end_group_id: None,
+                    },
+                )
+                .await,
+            Err(SessionError::Encode(EncodeError::InvalidValue))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_non_normal_status_with_payload() {
+        let (publisher_session, _peer_session) = loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (mut forwarder, _recv) = ObjectForwarder::new(publisher, 42, None);
+        let (writer, reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "datagram",
+        )
+        .produce();
+        let mut writer = writer.datagrams().unwrap();
+        writer
+            .write(serve::Datagram {
+                group_id: 1,
+                object_id: 2,
+                priority: 200,
+                status: data::ObjectStatus::EndOfTrack,
+                end_of_group: false,
+                payload: Bytes::from_static(b"invalid"),
+                extension_headers: data::ExtensionHeaders::default(),
+            })
+            .unwrap();
+        drop(writer);
+        let serve::TrackReaderMode::Datagrams(reader) = reader.mode().await.unwrap() else {
+            panic!("expected datagram mode");
+        };
+
+        assert!(matches!(
+            forwarder
+                .serve_datagrams(
+                    reader,
+                    DeliveryFilter {
+                        forward: true,
+                        start_location: None,
+                        end_group_id: None,
+                    },
+                )
+                .await,
+            Err(SessionError::Encode(EncodeError::InvalidValue))
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -349,6 +349,7 @@ impl Producer {
             };
 
             if let Some(local) = local {
+                let largest_location = local.largest_location;
                 let ns = namespace.to_utf8_path();
                 tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", local.reader.info);
                 timing_guard.set_label("source", "local");
@@ -404,6 +405,7 @@ impl Producer {
                 return Self::serve_resolved_track(
                     subscribed,
                     local.reader,
+                    largest_location,
                     deadline,
                     &mut timing_guard,
                 )
@@ -452,6 +454,7 @@ impl Producer {
 
             match remote {
                 Ok(Some((track, interest_guard))) => {
+                    let largest_location = track.largest_location();
                     let ns = namespace.to_utf8_path();
                     tracing::info!(namespace = %ns, track = %track_name, source = "remote", "serving subscribe from remote: {:?}", track.info);
                     // Update label to indicate remote source, timing recorded on drop
@@ -466,6 +469,7 @@ impl Producer {
                     return Self::serve_resolved_track(
                         subscribed,
                         track,
+                        largest_location,
                         deadline,
                         &mut timing_guard,
                     )
@@ -639,14 +643,20 @@ impl Producer {
     async fn serve_resolved_track(
         subscribed: Subscribed,
         track: TrackReader,
+        largest_location: Option<moq_transport::coding::Location>,
         deadline: Option<tokio::time::Instant>,
         timing_guard: &mut TimingGuard,
     ) -> Result<(), anyhow::Error> {
         let Some(deadline) = deadline else {
-            return Ok(subscribed.serve(track).await?);
+            return Ok(subscribed
+                .serve_with_largest_location(track, largest_location)
+                .await?);
         };
 
-        match subscribed.serve_with_deadline(track, deadline).await {
+        match subscribed
+            .serve_with_deadline_and_largest_location(track, deadline, largest_location)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(ServeWithDeadlineError::DeadlineExpired) => {
                 Self::record_rendezvous_timeout(timing_guard);

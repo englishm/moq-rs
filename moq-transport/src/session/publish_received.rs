@@ -388,29 +388,18 @@ impl PublishReceivedRecv {
     ///
     /// Mirrors `SubscribeRecv::datagram`.
     pub fn datagram(&mut self, datagram: data::Datagram) -> Result<(), ServeError> {
+        let datagram = serve::Datagram::from_data(datagram, self.default_publisher_priority);
         let writer = self.writer.take().ok_or(ServeError::Done)?;
 
         match writer {
             TrackWriterMode::Track(track) => {
                 let mut datagrams = track.datagrams()?;
-                datagrams.write(serve::Datagram {
-                    group_id: datagram.group_id,
-                    object_id: datagram.object_id.unwrap_or(0),
-                    priority: datagram.publisher_priority,
-                    payload: datagram.payload.unwrap_or_default(),
-                    extension_headers: datagram.extension_headers.unwrap_or_default(),
-                })?;
+                datagrams.write(datagram)?;
                 self.writer = Some(TrackWriterMode::Datagrams(datagrams));
                 Ok(())
             }
             TrackWriterMode::Datagrams(mut datagrams) => {
-                datagrams.write(serve::Datagram {
-                    group_id: datagram.group_id,
-                    object_id: datagram.object_id.unwrap_or(0),
-                    priority: datagram.publisher_priority,
-                    payload: datagram.payload.unwrap_or_default(),
-                    extension_headers: datagram.extension_headers.unwrap_or_default(),
-                })?;
+                datagrams.write(datagram)?;
                 self.writer = Some(TrackWriterMode::Datagrams(datagrams));
                 Ok(())
             }
@@ -568,6 +557,37 @@ mod tests {
             pr.take_reader().is_err(),
             "reader must only be given out once"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn datagram_resolves_publish_default_priority_and_preserves_status() {
+        let (mut publish, mut recv, _subscriber) = make_pair(13).await;
+        recv.default_publisher_priority = 200;
+        let reader = publish.take_reader().unwrap();
+
+        recv.datagram(data::Datagram {
+            datagram_type: data::DatagramType::StatusDefaultPriority,
+            track_alias: 42,
+            group_id: 8,
+            object_id: None,
+            publisher_priority: None,
+            extension_headers: None,
+            status: Some(data::ObjectStatus::EndOfTrack),
+            payload: None,
+        })
+        .unwrap();
+
+        let crate::serve::TrackReaderMode::Datagrams(mut datagrams) = reader.mode().await.unwrap()
+        else {
+            panic!("expected datagram mode");
+        };
+        let datagram = datagrams.read().await.unwrap().unwrap();
+        assert_eq!(datagram.group_id, 8);
+        assert_eq!(datagram.object_id, 0);
+        assert_eq!(datagram.priority, 200);
+        assert_eq!(datagram.status, data::ObjectStatus::EndOfTrack);
+        assert!(!datagram.end_of_group);
+        assert!(datagram.payload.is_empty());
     }
 
     fn subgroup_header(group_id: u64) -> data::SubgroupHeader {

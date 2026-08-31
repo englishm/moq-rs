@@ -1863,7 +1863,12 @@ impl Subscriber {
     /// Handle reception of a datagram from the QUIC session.
     pub async fn recv_datagram(&mut self, datagram: bytes::Bytes) -> Result<(), SessionError> {
         let mut cursor = io::Cursor::new(datagram);
-        let datagram = data::Datagram::decode(&mut cursor)?;
+        let datagram = data::Datagram::decode(&mut cursor).map_err(|err| match err {
+            crate::coding::DecodeError::More(_) => {
+                SessionError::ProtocolViolation("truncated datagram".to_string())
+            }
+            err => SessionError::Decode(err),
+        })?;
 
         if let Some(ref mlog) = self.mlog {
             if let Ok(mut mlog_guard) = mlog.lock() {
@@ -1925,7 +1930,7 @@ impl Subscriber {
                     .and_then(|s| s.get_mut(&subscribe_id))
                 {
                     tracing::trace!(
-                        "[SUBSCRIBER] recv_datagram (SUBSCRIBE): track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                        "[SUBSCRIBER] recv_datagram (SUBSCRIBE): track_alias={}, group_id={}, object_id={}, publisher_priority={:?}, status={}, payload_length={}",
                         datagram.track_alias,
                         datagram.group_id,
                         datagram.object_id.unwrap_or(0),
@@ -1944,7 +1949,7 @@ impl Subscriber {
                     .and_then(|m| m.get_mut(&publish_id))
                 {
                     tracing::trace!(
-                        "[SUBSCRIBER] recv_datagram (PUBLISH): track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                        "[SUBSCRIBER] recv_datagram (PUBLISH): track_alias={}, group_id={}, object_id={}, publisher_priority={:?}, status={}, payload_length={}",
                         datagram.track_alias,
                         datagram.group_id,
                         datagram.object_id.unwrap_or(0),
@@ -1956,7 +1961,7 @@ impl Subscriber {
             }
             None => {
                 tracing::warn!(
-                    "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                    "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={:?}, status={}, payload_length={}",
                     datagram.track_alias,
                     datagram.group_id,
                     datagram.object_id.unwrap_or(0),
@@ -1973,19 +1978,163 @@ impl Subscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::test_support::{loopback_session, loopback_session_pair};
+    use crate::session::test_support::{
+        loopback_raw_session_pair, loopback_session, loopback_session_pair,
+    };
 
     fn test_subscriber(session: web_transport::Session) -> Subscriber {
+        test_subscriber_for_transport(session, super::super::Transport::WebTransport)
+    }
+
+    fn test_subscriber_for_transport(
+        session: web_transport::Session,
+        transport: super::super::Transport,
+    ) -> Subscriber {
         let outgoing = Queue::default().split().0;
         let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
         Subscriber::new(
             outgoing,
             session,
-            super::super::Transport::WebTransport,
+            transport,
             None,
             RequestId::new(0, 1),
             bidi_task_tx,
         )
+    }
+
+    async fn assert_compact_datagram_ingress(
+        receiver_session: web_transport::Session,
+        peer_session: web_transport::Session,
+        transport: super::super::Transport,
+    ) {
+        let subscriber = test_subscriber_for_transport(receiver_session.clone(), transport);
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), "datagram").produce();
+        let _subscribe =
+            register_test_subscribe_with_priority(&subscriber, track_writer, 0, 42, 200);
+        let receive = tokio::spawn(super::super::Session::run_datagrams(
+            receiver_session,
+            Some(subscriber),
+        ));
+
+        peer_session
+            .send_datagram(bytes::Bytes::from_static(&[
+                0x0e, // payload, EOG, Object ID zero, inherited priority
+                42,   // Track Alias
+                3,    // Group ID
+                b'x',
+            ]))
+            .await
+            .unwrap();
+
+        let mode = tokio::time::timeout(std::time::Duration::from_secs(2), track_reader.mode())
+            .await
+            .unwrap()
+            .unwrap();
+        let serve::TrackReaderMode::Datagrams(mut datagrams) = mode else {
+            panic!("expected datagram delivery");
+        };
+        let datagram = tokio::time::timeout(std::time::Duration::from_secs(2), datagrams.read())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(datagram.group_id, 3);
+        assert_eq!(datagram.object_id, 0);
+        assert_eq!(datagram.priority, 200);
+        assert_eq!(datagram.status, data::ObjectStatus::NormalObject);
+        assert!(datagram.end_of_group);
+        assert_eq!(datagram.payload, bytes::Bytes::from_static(b"x"));
+        receive.abort();
+        assert!(receive.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receives_compact_datagram_over_webtransport() {
+        let (receiver, peer) = loopback_session_pair().await;
+        assert_compact_datagram_ingress(receiver, peer, super::super::Transport::WebTransport)
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receives_compact_datagram_over_raw_quic() {
+        let (receiver, peer) = loopback_raw_session_pair().await;
+        assert_compact_datagram_ingress(receiver, peer, super::super::Transport::RawQuic).await;
+    }
+
+    async fn assert_compact_publish_datagram_ingress(
+        receiver_session: web_transport::Session,
+        peer_session: web_transport::Session,
+        transport: super::super::Transport,
+    ) {
+        let mut subscriber = test_subscriber_for_transport(receiver_session.clone(), transport);
+        let mut track_extensions = message::TrackExtensions::default();
+        track_extensions.set_default_publisher_priority(200);
+        subscriber
+            .recv_publish(&message::Publish {
+                id: 1,
+                track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+                track_name: "datagram".into(),
+                track_alias: 42,
+                params: KeyValuePairs::default(),
+                track_extensions,
+            })
+            .unwrap();
+        let mut publish = subscriber.publish_received().await.unwrap();
+        let track_reader = publish.take_reader().unwrap();
+        let receive = tokio::spawn(super::super::Session::run_datagrams(
+            receiver_session,
+            Some(subscriber),
+        ));
+
+        peer_session
+            .send_datagram(bytes::Bytes::from_static(&[
+                0x0e, // payload, EOG, Object ID zero, inherited priority
+                42,   // Track Alias
+                3,    // Group ID
+                b'x',
+            ]))
+            .await
+            .unwrap();
+
+        let mode = tokio::time::timeout(std::time::Duration::from_secs(2), track_reader.mode())
+            .await
+            .unwrap()
+            .unwrap();
+        let serve::TrackReaderMode::Datagrams(mut datagrams) = mode else {
+            panic!("expected datagram delivery");
+        };
+        let datagram = tokio::time::timeout(std::time::Duration::from_secs(2), datagrams.read())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(datagram.group_id, 3);
+        assert_eq!(datagram.object_id, 0);
+        assert_eq!(datagram.priority, 200);
+        assert_eq!(datagram.status, data::ObjectStatus::NormalObject);
+        assert!(datagram.end_of_group);
+        assert_eq!(datagram.payload, bytes::Bytes::from_static(b"x"));
+        receive.abort();
+        assert!(receive.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receives_compact_publish_datagram_over_webtransport() {
+        let (receiver, peer) = loopback_session_pair().await;
+        assert_compact_publish_datagram_ingress(
+            receiver,
+            peer,
+            super::super::Transport::WebTransport,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receives_compact_publish_datagram_over_raw_quic() {
+        let (receiver, peer) = loopback_raw_session_pair().await;
+        assert_compact_publish_datagram_ingress(receiver, peer, super::super::Transport::RawQuic)
+            .await;
     }
 
     /// Like `test_subscriber`, but keeps the background-task receiver alive.

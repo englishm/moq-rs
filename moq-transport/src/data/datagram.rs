@@ -5,6 +5,12 @@
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use crate::data::{ExtensionHeaders, ObjectStatus};
 
+const PROPERTIES: u64 = 0x01;
+const END_OF_GROUP: u64 = 0x02;
+const ZERO_OBJECT_ID: u64 = 0x04;
+const DEFAULT_PRIORITY: u64 = 0x08;
+const STATUS: u64 = 0x20;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DatagramType {
     ObjectIdPayload = 0x00,
@@ -15,24 +21,43 @@ pub enum DatagramType {
     PayloadExt = 0x05,
     PayloadEndOfGroup = 0x06,
     PayloadExtEndOfGroup = 0x07,
+    ObjectIdPayloadDefaultPriority = 0x08,
+    ObjectIdPayloadExtDefaultPriority = 0x09,
+    ObjectIdPayloadEndOfGroupDefaultPriority = 0x0a,
+    ObjectIdPayloadExtEndOfGroupDefaultPriority = 0x0b,
+    PayloadDefaultPriority = 0x0c,
+    PayloadExtDefaultPriority = 0x0d,
+    PayloadEndOfGroupDefaultPriority = 0x0e,
+    PayloadExtEndOfGroupDefaultPriority = 0x0f,
     ObjectIdStatus = 0x20,
     ObjectIdStatusExt = 0x21,
+    Status = 0x24,
+    StatusExt = 0x25,
+    ObjectIdStatusDefaultPriority = 0x28,
+    ObjectIdStatusExtDefaultPriority = 0x29,
+    StatusDefaultPriority = 0x2c,
+    StatusExtDefaultPriority = 0x2d,
 }
 
 impl DatagramType {
-    fn has_extension_headers(self) -> bool {
-        matches!(
-            self,
-            Self::ObjectIdPayloadExt
-                | Self::ObjectIdPayloadExtEndOfGroup
-                | Self::PayloadExt
-                | Self::PayloadExtEndOfGroup
-                | Self::ObjectIdStatusExt
-        )
+    pub fn has_properties(self) -> bool {
+        self as u64 & PROPERTIES != 0
     }
 
-    fn has_status(self) -> bool {
-        matches!(self, Self::ObjectIdStatus | Self::ObjectIdStatusExt)
+    pub fn end_of_group(self) -> bool {
+        !self.has_status() && self as u64 & END_OF_GROUP != 0
+    }
+
+    pub fn has_object_id(self) -> bool {
+        self as u64 & ZERO_OBJECT_ID == 0
+    }
+
+    pub fn uses_default_priority(self) -> bool {
+        self as u64 & DEFAULT_PRIORITY != 0
+    }
+
+    pub fn has_status(self) -> bool {
+        self as u64 & STATUS != 0
     }
 }
 
@@ -47,8 +72,22 @@ impl Decode for DatagramType {
             0x05 => Ok(Self::PayloadExt),
             0x06 => Ok(Self::PayloadEndOfGroup),
             0x07 => Ok(Self::PayloadExtEndOfGroup),
+            0x08 => Ok(Self::ObjectIdPayloadDefaultPriority),
+            0x09 => Ok(Self::ObjectIdPayloadExtDefaultPriority),
+            0x0a => Ok(Self::ObjectIdPayloadEndOfGroupDefaultPriority),
+            0x0b => Ok(Self::ObjectIdPayloadExtEndOfGroupDefaultPriority),
+            0x0c => Ok(Self::PayloadDefaultPriority),
+            0x0d => Ok(Self::PayloadExtDefaultPriority),
+            0x0e => Ok(Self::PayloadEndOfGroupDefaultPriority),
+            0x0f => Ok(Self::PayloadExtEndOfGroupDefaultPriority),
             0x20 => Ok(Self::ObjectIdStatus),
             0x21 => Ok(Self::ObjectIdStatusExt),
+            0x24 => Ok(Self::Status),
+            0x25 => Ok(Self::StatusExt),
+            0x28 => Ok(Self::ObjectIdStatusDefaultPriority),
+            0x29 => Ok(Self::ObjectIdStatusExtDefaultPriority),
+            0x2c => Ok(Self::StatusDefaultPriority),
+            0x2d => Ok(Self::StatusExtDefaultPriority),
             _ => Err(DecodeError::InvalidDatagramType),
         }
     }
@@ -56,36 +95,23 @@ impl Decode for DatagramType {
 
 impl Encode for DatagramType {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        let val = *self as u64;
-        val.encode(w)?;
-        Ok(())
+        (*self as u64).encode(w)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Datagram {
-    /// The type of this datagram object
     pub datagram_type: DatagramType,
-
-    /// The track alias.
     pub track_alias: u64,
-
-    /// The sequence number within the track.
     pub group_id: u64,
 
-    /// The object ID within the group.
+    /// `None` when ZERO_OBJECT_ID is set; the semantic Object ID is zero.
     pub object_id: Option<u64>,
 
-    /// Publisher priority, where **smaller** values are sent first.
-    pub publisher_priority: u8,
-
-    /// Optional extension headers if type is 0x1 (NoEndOfGroupWithExtensions) or 0x3 (EndofGroupWithExtensions)
+    /// `None` when DEFAULT_PRIORITY is set; resolve it from Track Properties.
+    pub publisher_priority: Option<u8>,
     pub extension_headers: Option<ExtensionHeaders>,
-
-    /// The Object Status.
     pub status: Option<ObjectStatus>,
-
-    /// The payload.
     pub payload: Option<bytes::Bytes>,
 }
 
@@ -94,22 +120,15 @@ impl Decode for Datagram {
         let datagram_type = DatagramType::decode(r)?;
         let track_alias = u64::decode(r)?;
         let group_id = u64::decode(r)?;
+        let object_id = datagram_type
+            .has_object_id()
+            .then(|| u64::decode(r))
+            .transpose()?;
+        let publisher_priority = (!datagram_type.uses_default_priority())
+            .then(|| u8::decode(r))
+            .transpose()?;
 
-        // Decode Object Id if required
-        let object_id = match datagram_type {
-            DatagramType::ObjectIdPayload
-            | DatagramType::ObjectIdPayloadExt
-            | DatagramType::ObjectIdPayloadEndOfGroup
-            | DatagramType::ObjectIdPayloadExtEndOfGroup
-            | DatagramType::ObjectIdStatus
-            | DatagramType::ObjectIdStatusExt => Some(u64::decode(r)?),
-            _ => None,
-        };
-
-        let publisher_priority = u8::decode(r)?;
-
-        // Decode Extension Headers if required
-        let extension_headers = if datagram_type.has_extension_headers() {
+        let extension_headers = if datagram_type.has_properties() {
             let headers = ExtensionHeaders::decode(r)?;
             if headers.is_empty() {
                 return Err(DecodeError::InvalidValue);
@@ -119,30 +138,21 @@ impl Decode for Datagram {
             None
         };
 
-        // Decode Status if required
-        let status = if datagram_type.has_status() {
-            Some(ObjectStatus::decode(r)?)
+        let (status, payload) = if datagram_type.has_status() {
+            let status = ObjectStatus::decode(r)?;
+            if status != ObjectStatus::NormalObject && extension_headers.is_some() {
+                return Err(DecodeError::InvalidValue);
+            }
+            if r.has_remaining() {
+                return Err(DecodeError::InvalidValue);
+            }
+            (Some(status), None)
         } else {
-            None
-        };
-
-        if status.is_some_and(|status| status != ObjectStatus::NormalObject)
-            && extension_headers.is_some()
-        {
-            return Err(DecodeError::InvalidValue);
-        }
-
-        // Decode Payload if required
-        let payload = match datagram_type {
-            DatagramType::ObjectIdPayload
-            | DatagramType::ObjectIdPayloadExt
-            | DatagramType::ObjectIdPayloadEndOfGroup
-            | DatagramType::ObjectIdPayloadExtEndOfGroup
-            | DatagramType::Payload
-            | DatagramType::PayloadExt
-            | DatagramType::PayloadEndOfGroup
-            | DatagramType::PayloadExtEndOfGroup => Some(r.copy_to_bytes(r.remaining())),
-            _ => None,
+            let payload = r.copy_to_bytes(r.remaining());
+            if payload.is_empty() {
+                return Err(DecodeError::InvalidValue);
+            }
+            (None, Some(payload))
         };
 
         Ok(Self {
@@ -160,492 +170,320 @@ impl Decode for Datagram {
 
 impl Encode for Datagram {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+        self.validate()?;
         self.datagram_type.encode(w)?;
         self.track_alias.encode(w)?;
         self.group_id.encode(w)?;
 
-        // Encode Object Id if required
-        match self.datagram_type {
-            DatagramType::ObjectIdPayload
-            | DatagramType::ObjectIdPayloadExt
-            | DatagramType::ObjectIdPayloadEndOfGroup
-            | DatagramType::ObjectIdPayloadExtEndOfGroup
-            | DatagramType::ObjectIdStatus
-            | DatagramType::ObjectIdStatusExt => {
-                if let Some(object_id) = &self.object_id {
-                    object_id.encode(w)?;
-                } else {
-                    return Err(EncodeError::MissingField("ObjectId".to_string()));
-                }
-            }
-            _ => {}
-        };
-
-        self.publisher_priority.encode(w)?;
-
-        // Encode Extension Headers if required
-        match self.datagram_type {
-            DatagramType::ObjectIdPayloadExt
-            | DatagramType::ObjectIdPayloadExtEndOfGroup
-            | DatagramType::PayloadExt
-            | DatagramType::PayloadExtEndOfGroup
-            | DatagramType::ObjectIdStatusExt => {
-                if let Some(extension_headers) = &self.extension_headers {
-                    if extension_headers.is_empty() {
-                        return Err(EncodeError::InvalidValue);
-                    }
-                    extension_headers.encode(w)?;
-                } else {
-                    return Err(EncodeError::MissingField("ExtensionHeaders".to_string()));
-                }
-            }
-            _ => {}
-        };
-
-        // Decode Status if required
-        match self.datagram_type {
-            DatagramType::ObjectIdStatus | DatagramType::ObjectIdStatusExt => {
-                if let Some(status) = &self.status {
-                    if self.extension_headers.is_some() && *status != ObjectStatus::NormalObject {
-                        return Err(EncodeError::InvalidValue);
-                    }
-                    status.encode(w)?;
-                } else {
-                    return Err(EncodeError::MissingField("Status".to_string()));
-                }
-            }
-            _ => {}
+        if let Some(object_id) = self.object_id {
+            object_id.encode(w)?;
         }
-
-        // Decode Payload if required
-        match self.datagram_type {
-            DatagramType::ObjectIdPayload
-            | DatagramType::ObjectIdPayloadExt
-            | DatagramType::ObjectIdPayloadEndOfGroup
-            | DatagramType::ObjectIdPayloadExtEndOfGroup
-            | DatagramType::Payload
-            | DatagramType::PayloadExt
-            | DatagramType::PayloadEndOfGroup
-            | DatagramType::PayloadExtEndOfGroup => {
-                if let Some(payload) = &self.payload {
-                    Self::encode_remaining(w, payload.len())?;
-                    w.put_slice(payload);
-                } else {
-                    return Err(EncodeError::MissingField("Payload".to_string()));
-                }
-            }
-            _ => {}
+        if let Some(priority) = self.publisher_priority {
+            priority.encode(w)?;
+        }
+        if let Some(properties) = &self.extension_headers {
+            properties.encode(w)?;
+        }
+        if let Some(status) = self.status {
+            status.encode(w)?;
+        }
+        if let Some(payload) = &self.payload {
+            Self::encode_remaining(w, payload.len())?;
+            w.put_slice(payload);
         }
 
         Ok(())
     }
 }
 
+impl Datagram {
+    fn validate(&self) -> Result<(), EncodeError> {
+        validate_field(
+            self.object_id.is_some(),
+            self.datagram_type.has_object_id(),
+            "ObjectId",
+        )?;
+        validate_field(
+            self.publisher_priority.is_some(),
+            !self.datagram_type.uses_default_priority(),
+            "PublisherPriority",
+        )?;
+        validate_field(
+            self.extension_headers.is_some(),
+            self.datagram_type.has_properties(),
+            "Properties",
+        )?;
+        validate_field(
+            self.status.is_some(),
+            self.datagram_type.has_status(),
+            "Status",
+        )?;
+        validate_field(
+            self.payload.is_some(),
+            !self.datagram_type.has_status(),
+            "Payload",
+        )?;
+        if self
+            .extension_headers
+            .as_ref()
+            .is_some_and(ExtensionHeaders::is_empty)
+        {
+            return Err(EncodeError::InvalidValue);
+        }
+        if self.payload.as_ref().is_some_and(bytes::Bytes::is_empty) {
+            return Err(EncodeError::InvalidValue);
+        }
+        if self
+            .status
+            .is_some_and(|status| status != ObjectStatus::NormalObject)
+            && self.extension_headers.is_some()
+        {
+            return Err(EncodeError::InvalidValue);
+        }
+        Ok(())
+    }
+}
+
+fn validate_field(present: bool, required: bool, name: &str) -> Result<(), EncodeError> {
+    match (present, required) {
+        (false, true) => Err(EncodeError::MissingField(name.to_string())),
+        (true, false) => Err(EncodeError::InvalidValue),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use bytes::BytesMut;
+    use bytes::{Bytes, BytesMut};
 
-    #[test]
-    fn encode_decode_datagram_type() {
-        let mut buf = BytesMut::new();
+    const VALID_TYPES: &[(u64, DatagramType)] = &[
+        (0x00, DatagramType::ObjectIdPayload),
+        (0x01, DatagramType::ObjectIdPayloadExt),
+        (0x02, DatagramType::ObjectIdPayloadEndOfGroup),
+        (0x03, DatagramType::ObjectIdPayloadExtEndOfGroup),
+        (0x04, DatagramType::Payload),
+        (0x05, DatagramType::PayloadExt),
+        (0x06, DatagramType::PayloadEndOfGroup),
+        (0x07, DatagramType::PayloadExtEndOfGroup),
+        (0x08, DatagramType::ObjectIdPayloadDefaultPriority),
+        (0x09, DatagramType::ObjectIdPayloadExtDefaultPriority),
+        (0x0a, DatagramType::ObjectIdPayloadEndOfGroupDefaultPriority),
+        (
+            0x0b,
+            DatagramType::ObjectIdPayloadExtEndOfGroupDefaultPriority,
+        ),
+        (0x0c, DatagramType::PayloadDefaultPriority),
+        (0x0d, DatagramType::PayloadExtDefaultPriority),
+        (0x0e, DatagramType::PayloadEndOfGroupDefaultPriority),
+        (0x0f, DatagramType::PayloadExtEndOfGroupDefaultPriority),
+        (0x20, DatagramType::ObjectIdStatus),
+        (0x21, DatagramType::ObjectIdStatusExt),
+        (0x24, DatagramType::Status),
+        (0x25, DatagramType::StatusExt),
+        (0x28, DatagramType::ObjectIdStatusDefaultPriority),
+        (0x29, DatagramType::ObjectIdStatusExtDefaultPriority),
+        (0x2c, DatagramType::StatusDefaultPriority),
+        (0x2d, DatagramType::StatusExtDefaultPriority),
+    ];
 
-        let dt = DatagramType::ObjectIdPayload;
-        dt.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0x00]);
-        let decoded = DatagramType::decode(&mut buf).unwrap();
-        assert_eq!(decoded, dt);
+    fn properties() -> ExtensionHeaders {
+        let mut properties = ExtensionHeaders::new();
+        properties.set_bytesvalue(3, b"property".to_vec());
+        properties
+    }
 
-        let dt = DatagramType::ObjectIdPayloadExt;
-        dt.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0x01]);
-        let decoded = DatagramType::decode(&mut buf).unwrap();
-        assert_eq!(decoded, dt);
-
-        let dt = DatagramType::ObjectIdPayloadEndOfGroup;
-        dt.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0x02]);
-        let decoded = DatagramType::decode(&mut buf).unwrap();
-        assert_eq!(decoded, dt);
-
-        let dt = DatagramType::ObjectIdPayloadExtEndOfGroup;
-        dt.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0x03]);
-        let decoded = DatagramType::decode(&mut buf).unwrap();
-        assert_eq!(decoded, dt);
-
-        let dt = DatagramType::Payload;
-        dt.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0x04]);
-        let decoded = DatagramType::decode(&mut buf).unwrap();
-        assert_eq!(decoded, dt);
-
-        let dt = DatagramType::PayloadExt;
-        dt.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0x05]);
-        let decoded = DatagramType::decode(&mut buf).unwrap();
-        assert_eq!(decoded, dt);
-
-        let dt = DatagramType::PayloadEndOfGroup;
-        dt.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0x06]);
-        let decoded = DatagramType::decode(&mut buf).unwrap();
-        assert_eq!(decoded, dt);
-
-        let dt = DatagramType::PayloadExtEndOfGroup;
-        dt.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0x07]);
-        let decoded = DatagramType::decode(&mut buf).unwrap();
-        assert_eq!(decoded, dt);
-
-        let dt = DatagramType::ObjectIdStatus;
-        dt.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0x20]);
-        let decoded = DatagramType::decode(&mut buf).unwrap();
-        assert_eq!(decoded, dt);
-
-        let dt = DatagramType::ObjectIdStatusExt;
-        dt.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0x21]);
-        let decoded = DatagramType::decode(&mut buf).unwrap();
-        assert_eq!(decoded, dt);
+    fn datagram(datagram_type: DatagramType) -> Datagram {
+        Datagram {
+            datagram_type,
+            track_alias: 12,
+            group_id: 10,
+            object_id: datagram_type.has_object_id().then_some(1234),
+            publisher_priority: (!datagram_type.uses_default_priority()).then_some(200),
+            extension_headers: datagram_type.has_properties().then(properties),
+            status: datagram_type
+                .has_status()
+                .then_some(ObjectStatus::NormalObject),
+            payload: (!datagram_type.has_status()).then(|| Bytes::from_static(b"payload")),
+        }
     }
 
     #[test]
-    fn encode_decode_datagram() {
-        let mut buf = BytesMut::new();
-
-        // One ExtensionHeader for testing
-        let mut ext_hdrs = ExtensionHeaders::new();
-        ext_hdrs.set_bytesvalue(123, vec![0x00, 0x01, 0x02, 0x03]);
-
-        // DatagramType = ObjectIdPayload
-        let msg = Datagram {
-            datagram_type: DatagramType::ObjectIdPayload,
-            track_alias: 12,
-            group_id: 10,
-            object_id: Some(1234),
-            publisher_priority: 127,
-            extension_headers: None,
-            status: None,
-            payload: Some(Bytes::from("payload")),
-        };
-        msg.encode(&mut buf).unwrap();
-        // Length should be: Type(1)+Alias(1)+GroupId(1)+ObjectId(2)+Priority(1)+Payload(7) = 13
-        assert_eq!(13, buf.len());
-        let decoded = Datagram::decode(&mut buf).unwrap();
-        assert_eq!(decoded, msg);
-
-        // DatagramType = ObjectIdPayloadExt
-        let msg = Datagram {
-            datagram_type: DatagramType::ObjectIdPayloadExt,
-            track_alias: 12,
-            group_id: 10,
-            object_id: Some(1234),
-            publisher_priority: 127,
-            extension_headers: Some(ext_hdrs.clone()),
-            status: None,
-            payload: Some(Bytes::from("payload")),
-        };
-        msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 13 + 7 = 20
-        assert_eq!(20, buf.len());
-        let decoded = Datagram::decode(&mut buf).unwrap();
-        assert_eq!(decoded, msg);
-
-        // DatagramType = ObjectIdPayloadEndOfGroup
-        let msg = Datagram {
-            datagram_type: DatagramType::ObjectIdPayloadEndOfGroup,
-            track_alias: 12,
-            group_id: 10,
-            object_id: Some(1234),
-            publisher_priority: 127,
-            extension_headers: None,
-            status: None,
-            payload: Some(Bytes::from("payload")),
-        };
-        msg.encode(&mut buf).unwrap();
-        // Length should be: Type(1)+Alias(1)+GroupId(1)+ObjectId(2)+Priority(1)+Payload(7) = 13
-        assert_eq!(13, buf.len());
-        let decoded = Datagram::decode(&mut buf).unwrap();
-        assert_eq!(decoded, msg);
-
-        // DatagramType = ObjectIdPayloadExtEndOfGroup
-        let msg = Datagram {
-            datagram_type: DatagramType::ObjectIdPayloadExtEndOfGroup,
-            track_alias: 12,
-            group_id: 10,
-            object_id: Some(1234),
-            publisher_priority: 127,
-            extension_headers: Some(ext_hdrs.clone()),
-            status: None,
-            payload: Some(Bytes::from("payload")),
-        };
-        msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 13 + 7 = 20
-        assert_eq!(20, buf.len());
-        let decoded = Datagram::decode(&mut buf).unwrap();
-        assert_eq!(decoded, msg);
-
-        // DatagramType = ObjectIdStatus
-        let msg = Datagram {
-            datagram_type: DatagramType::ObjectIdStatus,
-            track_alias: 12,
-            group_id: 10,
-            object_id: Some(1234),
-            publisher_priority: 127,
-            extension_headers: None,
-            status: Some(ObjectStatus::NormalObject),
-            payload: None,
-        };
-        msg.encode(&mut buf).unwrap();
-        // Length should be: Type(1)+Alias(1)+GroupId(1)+ObjectId(2)+Priority(1)+Status(1) = 7
-        assert_eq!(7, buf.len());
-        let decoded = Datagram::decode(&mut buf).unwrap();
-        assert_eq!(decoded, msg);
-
-        // DatagramType = ObjectIdStatusExt
-        let msg = Datagram {
-            datagram_type: DatagramType::ObjectIdStatusExt,
-            track_alias: 12,
-            group_id: 10,
-            object_id: Some(1234),
-            publisher_priority: 127,
-            extension_headers: Some(ext_hdrs.clone()),
-            status: Some(ObjectStatus::NormalObject),
-            payload: None,
-        };
-        msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 7 + 7 = 14
-        assert_eq!(14, buf.len());
-        let decoded = Datagram::decode(&mut buf).unwrap();
-        assert_eq!(decoded, msg);
-
-        // DatagramType = Payload
-        let msg = Datagram {
-            datagram_type: DatagramType::Payload,
-            track_alias: 12,
-            group_id: 10,
-            object_id: None,
-            publisher_priority: 127,
-            extension_headers: None,
-            status: None,
-            payload: Some(Bytes::from("payload")),
-        };
-        msg.encode(&mut buf).unwrap();
-        // Length should be: Type(1)+Alias(1)+GroupId(1)+Priority(1)+Payload(7) = 11
-        assert_eq!(11, buf.len());
-        let decoded = Datagram::decode(&mut buf).unwrap();
-        assert_eq!(decoded, msg);
-
-        // DatagramType = PayloadExt
-        let msg = Datagram {
-            datagram_type: DatagramType::PayloadExt,
-            track_alias: 12,
-            group_id: 10,
-            object_id: None,
-            publisher_priority: 127,
-            extension_headers: Some(ext_hdrs.clone()),
-            status: None,
-            payload: Some(Bytes::from("payload")),
-        };
-        msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 11 + 7 = 18
-        assert_eq!(18, buf.len());
-        let decoded = Datagram::decode(&mut buf).unwrap();
-        assert_eq!(decoded, msg);
-
-        // DatagramType = PayloadEndOfGroup
-        let msg = Datagram {
-            datagram_type: DatagramType::PayloadEndOfGroup,
-            track_alias: 12,
-            group_id: 10,
-            object_id: None,
-            publisher_priority: 127,
-            extension_headers: None,
-            status: None,
-            payload: Some(Bytes::from("payload")),
-        };
-        msg.encode(&mut buf).unwrap();
-        // Length should be: Type(1)+Alias(1)+GroupId(1)+Priority(1)+Payload(7) = 11
-        assert_eq!(11, buf.len());
-        let decoded = Datagram::decode(&mut buf).unwrap();
-        assert_eq!(decoded, msg);
-
-        // DatagramType = PayloadExtEndOfGroup
-        let msg = Datagram {
-            datagram_type: DatagramType::PayloadExtEndOfGroup,
-            track_alias: 12,
-            group_id: 10,
-            object_id: None,
-            publisher_priority: 127,
-            extension_headers: Some(ext_hdrs.clone()),
-            status: None,
-            payload: Some(Bytes::from("payload")),
-        };
-        msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 11 + 7 = 18
-        assert_eq!(18, buf.len());
-        let decoded = Datagram::decode(&mut buf).unwrap();
-        assert_eq!(decoded, msg);
+    fn classifies_exact_draft_18_type_registry() {
+        for code in 0u8..=0x3f {
+            let mut encoded = Bytes::from(vec![code]);
+            let decoded = DatagramType::decode(&mut encoded);
+            let expected = VALID_TYPES
+                .iter()
+                .find(|(valid, _)| *valid == u64::from(code));
+            match expected {
+                Some((_, expected)) => assert_eq!(decoded.unwrap(), *expected),
+                None => assert!(matches!(decoded, Err(DecodeError::InvalidDatagramType))),
+            }
+        }
     }
 
     #[test]
-    fn encode_datagram_missing_fields() {
-        let mut buf = BytesMut::new();
-
-        // DatagramType = ObjectIdPayloadExt - missing extensions
-        let msg = Datagram {
-            datagram_type: DatagramType::ObjectIdPayloadExt,
-            track_alias: 12,
-            group_id: 10,
-            object_id: Some(1234),
-            publisher_priority: 127,
-            extension_headers: None,
-            status: None,
-            payload: Some(Bytes::from("payload")),
-        };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
-
-        // DatagramType = ObjectIdPayloadExtEndOfGroup - missing extensions
-        let msg = Datagram {
-            datagram_type: DatagramType::ObjectIdPayloadExtEndOfGroup,
-            track_alias: 12,
-            group_id: 10,
-            object_id: Some(1234),
-            publisher_priority: 127,
-            extension_headers: None,
-            status: None,
-            payload: Some(Bytes::from("payload")),
-        };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
-
-        // DatagramType = ObjectIdPayloadExtEndOfGroup - missing extensions
-        let msg = Datagram {
-            datagram_type: DatagramType::ObjectIdPayloadExtEndOfGroup,
-            track_alias: 12,
-            group_id: 10,
-            object_id: Some(1234),
-            publisher_priority: 127,
-            extension_headers: None,
-            status: Some(ObjectStatus::EndOfTrack),
-            payload: None,
-        };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
-
-        // DatagramType = Payload - missing payload
-        let msg = Datagram {
-            datagram_type: DatagramType::Payload,
-            track_alias: 12,
-            group_id: 10,
-            object_id: None,
-            publisher_priority: 127,
-            extension_headers: None,
-            status: None,
-            payload: None,
-        };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
-
-        // DatagramType = ObjectIdStatus - missing status
-        let msg = Datagram {
-            datagram_type: DatagramType::ObjectIdStatus,
-            track_alias: 12,
-            group_id: 10,
-            object_id: Some(1234),
-            publisher_priority: 127,
-            extension_headers: None,
-            status: None,
-            payload: None,
-        };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
-
-        // TODO SLG - add tests
+    fn round_trips_every_valid_type_and_field_shape() {
+        for (code, datagram_type) in VALID_TYPES {
+            let expected = datagram(*datagram_type);
+            let mut encoded = BytesMut::new();
+            expected.encode(&mut encoded).unwrap();
+            assert_eq!(encoded[0], *code as u8);
+            assert_eq!(Datagram::decode(&mut encoded).unwrap(), expected);
+        }
     }
 
     #[test]
-    fn decode_rejects_extension_bit_with_zero_length() {
-        let data = vec![
-            0x01, // ObjectIdPayloadExt
-            0x01, // track alias
-            0x01, // group id
-            0x01, // object id
-            0x7f, // publisher priority
-            0x00, // extension headers length
-        ];
-        let mut buf: Bytes = data.into();
+    fn decodes_zero_id_default_priority_fixture() {
+        let mut encoded = Bytes::from_static(&[
+            0x0c, // payload, Object ID zero, inherited priority
+            0x01, // Track Alias
+            0x02, // Group ID
+            b't', b'e', b's', b't',
+        ]);
+        let decoded = Datagram::decode(&mut encoded).unwrap();
+        assert_eq!(decoded.datagram_type, DatagramType::PayloadDefaultPriority);
+        assert_eq!(decoded.track_alias, 1);
+        assert_eq!(decoded.group_id, 2);
+        assert_eq!(decoded.object_id, None);
+        assert_eq!(decoded.publisher_priority, None);
+        assert_eq!(decoded.payload, Some(Bytes::from_static(b"test")));
+    }
 
+    #[test]
+    fn rejects_all_status_end_of_group_types() {
+        for code in [0x22, 0x23, 0x26, 0x27, 0x2a, 0x2b, 0x2e, 0x2f] {
+            let mut encoded = Bytes::from(vec![code]);
+            assert!(matches!(
+                DatagramType::decode(&mut encoded),
+                Err(DecodeError::InvalidDatagramType)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_after_status() {
+        let mut encoded = Bytes::from_static(&[
+            0x20, // status with explicit Object ID and priority
+            0x01, // Track Alias
+            0x02, // Group ID
+            0x03, // Object ID
+            0x7f, // Publisher Priority
+            0x04, // End of Track
+            0xff, // illegal trailing payload
+        ]);
         assert!(matches!(
-            Datagram::decode(&mut buf).unwrap_err(),
-            DecodeError::InvalidValue
+            Datagram::decode(&mut encoded),
+            Err(DecodeError::InvalidValue)
         ));
     }
 
     #[test]
-    fn encode_rejects_extension_bit_with_empty_headers() {
-        let mut buf = BytesMut::new();
-        let msg = Datagram {
-            datagram_type: DatagramType::ObjectIdPayloadExt,
-            track_alias: 1,
-            group_id: 1,
-            object_id: Some(1),
-            publisher_priority: 1,
-            extension_headers: Some(ExtensionHeaders::default()),
-            status: None,
-            payload: Some(Bytes::new()),
-        };
-
+    fn zero_length_normal_object_requires_status_form() {
+        let mut payload_form = Bytes::from_static(&[
+            0x00, // payload with explicit Object ID and priority
+            0x01, // Track Alias
+            0x02, // Group ID
+            0x03, // Object ID
+            0x7f, // Publisher Priority
+        ]);
         assert!(matches!(
-            msg.encode(&mut buf).unwrap_err(),
-            EncodeError::InvalidValue
+            Datagram::decode(&mut payload_form),
+            Err(DecodeError::InvalidValue)
+        ));
+
+        let mut status_form = Bytes::from_static(&[
+            0x20, // status with explicit Object ID and priority
+            0x01, // Track Alias
+            0x02, // Group ID
+            0x03, // Object ID
+            0x7f, // Publisher Priority
+            0x00, // Normal Object
+        ]);
+        let decoded = Datagram::decode(&mut status_form).unwrap();
+        assert_eq!(decoded.status, Some(ObjectStatus::NormalObject));
+        assert_eq!(decoded.payload, None);
+
+        let mut empty_payload = datagram(DatagramType::ObjectIdPayloadEndOfGroup);
+        empty_payload.payload = Some(Bytes::new());
+        assert!(matches!(
+            empty_payload.encode(&mut BytesMut::new()),
+            Err(EncodeError::InvalidValue)
         ));
     }
 
     #[test]
-    fn decode_rejects_non_normal_status_with_extension_headers() {
-        let data = vec![
-            0x21, // ObjectIdStatusExt
-            0x01, // track alias
-            0x01, // group id
-            0x01, // object id
-            0x7f, // publisher priority
-            0x02, // extension headers byte length
-            0x00, // extension delta type
-            0x01, // extension value
-            0x04, // EndOfTrack
-        ];
-        let mut buf: Bytes = data.into();
-
+    fn rejects_non_normal_status_with_properties() {
+        let mut invalid = datagram(DatagramType::ObjectIdStatusExt);
+        invalid.status = Some(ObjectStatus::EndOfTrack);
+        let mut encoded = BytesMut::new();
         assert!(matches!(
-            Datagram::decode(&mut buf).unwrap_err(),
-            DecodeError::InvalidValue
+            invalid.encode(&mut encoded),
+            Err(EncodeError::InvalidValue)
+        ));
+
+        let mut wire = BytesMut::new();
+        DatagramType::ObjectIdStatusExt.encode(&mut wire).unwrap();
+        1u64.encode(&mut wire).unwrap();
+        2u64.encode(&mut wire).unwrap();
+        3u64.encode(&mut wire).unwrap();
+        127u8.encode(&mut wire).unwrap();
+        properties().encode(&mut wire).unwrap();
+        ObjectStatus::EndOfTrack.encode(&mut wire).unwrap();
+        assert!(matches!(
+            Datagram::decode(&mut wire),
+            Err(DecodeError::InvalidValue)
         ));
     }
 
     #[test]
-    fn encode_rejects_non_normal_status_with_extension_headers() {
-        let mut ext_hdrs = ExtensionHeaders::new();
-        ext_hdrs.set_intvalue(0, 1);
-        let mut buf = BytesMut::new();
-        let msg = Datagram {
-            datagram_type: DatagramType::ObjectIdStatusExt,
-            track_alias: 1,
-            group_id: 1,
-            object_id: Some(1),
-            publisher_priority: 1,
-            extension_headers: Some(ext_hdrs),
-            status: Some(ObjectStatus::EndOfTrack),
-            payload: None,
-        };
-
+    fn rejects_properties_bit_with_empty_properties() {
+        let mut encoded = Bytes::from_static(&[
+            0x01, // payload with Properties
+            0x01, // Track Alias
+            0x02, // Group ID
+            0x03, // Object ID
+            0x7f, // Publisher Priority
+            0x00, // Properties Length
+            b'x', // payload
+        ]);
         assert!(matches!(
-            msg.encode(&mut buf).unwrap_err(),
-            EncodeError::InvalidValue
+            Datagram::decode(&mut encoded),
+            Err(DecodeError::InvalidValue)
+        ));
+    }
+
+    #[test]
+    fn rejects_fields_that_disagree_with_type_bits() {
+        let mut encoded = BytesMut::new();
+
+        let mut missing_priority = datagram(DatagramType::ObjectIdPayload);
+        missing_priority.publisher_priority = None;
+        assert!(matches!(
+            missing_priority.encode(&mut encoded),
+            Err(EncodeError::MissingField(_))
+        ));
+
+        let mut unexpected_priority = datagram(DatagramType::PayloadDefaultPriority);
+        unexpected_priority.publisher_priority = Some(1);
+        assert!(matches!(
+            unexpected_priority.encode(&mut encoded),
+            Err(EncodeError::InvalidValue)
+        ));
+
+        let mut missing_properties = datagram(DatagramType::ObjectIdPayloadExt);
+        missing_properties.extension_headers = None;
+        assert!(matches!(
+            missing_properties.encode(&mut encoded),
+            Err(EncodeError::MissingField(_))
+        ));
+
+        let mut empty_properties = datagram(DatagramType::ObjectIdPayloadExt);
+        empty_properties.extension_headers = Some(ExtensionHeaders::default());
+        assert!(matches!(
+            empty_properties.encode(&mut encoded),
+            Err(EncodeError::InvalidValue)
         ));
     }
 }
