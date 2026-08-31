@@ -2017,4 +2017,82 @@ mod tests {
         assert_eq!(close.error_code.into_inner(), 0x3);
         drop(client_session);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn truncated_webtransport_datagram_closes_with_protocol_violation() {
+        let (client_transport, server_transport) = test_support::loopback_session_pair().await;
+        let client_peer = client_transport.clone();
+        let client_close = client_transport.clone();
+        let (client, server) = tokio::join!(
+            Session::connect(client_transport, None, Transport::WebTransport),
+            Session::accept(server_transport, None, Transport::WebTransport),
+        );
+        let (client_session, _client_publisher, _client_subscriber) = client.unwrap();
+        let (server_session, _server_publisher, _server_subscriber) = server.unwrap();
+
+        let send_invalid = async move {
+            client_peer
+                .send_datagram(bytes::Bytes::from_static(&[0x0e, 42]))
+                .await
+                .unwrap();
+            client_close.closed().await
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(server_session.run(), send_invalid)
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            result.0,
+            Err(SessionError::ProtocolViolation(ref reason)) if reason == "truncated datagram"
+        ));
+        assert!(matches!(
+            result.1,
+            web_transport::Error::Session(web_transport::quinn::SessionError::WebTransportError(
+                web_transport::quinn::WebTransportError::Closed(0x3, _)
+            ))
+        ));
+        drop(client_session);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn truncated_raw_quic_datagram_closes_with_protocol_violation() {
+        let (client_transport, server_transport) = test_support::loopback_raw_session_pair().await;
+        let client_peer = client_transport.clone();
+        let client_close = client_transport.clone();
+        let (client, server) = tokio::join!(
+            Session::connect(client_transport, None, Transport::RawQuic),
+            Session::accept(server_transport, None, Transport::RawQuic),
+        );
+        let (client_session, _client_publisher, _client_subscriber) = client.unwrap();
+        let (server_session, _server_publisher, _server_subscriber) = server.unwrap();
+
+        let send_invalid = async move {
+            client_peer
+                .send_datagram(bytes::Bytes::from_static(&[0x0e, 42]))
+                .await
+                .unwrap();
+            client_close.closed().await
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(server_session.run(), send_invalid)
+        })
+        .await
+        .unwrap();
+        let (run_result, close_error) = result;
+
+        assert!(matches!(
+            run_result,
+            Err(SessionError::ProtocolViolation(ref reason)) if reason == "truncated datagram"
+        ));
+        let web_transport::Error::Session(web_transport::quinn::SessionError::ConnectionError(
+            web_transport::quinn::quinn::ConnectionError::ApplicationClosed(close),
+        )) = close_error
+        else {
+            panic!("expected raw QUIC application close, got {close_error:?}");
+        };
+        assert_eq!(close.error_code.into_inner(), 0x3);
+        drop(client_session);
+    }
 }

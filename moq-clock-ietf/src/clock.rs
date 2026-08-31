@@ -67,6 +67,8 @@ impl Publisher {
                         group_id: next_group_id as u64,
                         object_id: 0,
                         priority: 127,
+                        status: moq_transport::data::ObjectStatus::NormalObject,
+                        end_of_group: false,
                         payload: time_str.clone().into_bytes().into(),
                         extension_headers: Default::default(),
                     })

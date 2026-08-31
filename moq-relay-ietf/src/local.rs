@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 use moq_transport::{
-    coding::{TrackNamespace, TrackNamespacePrefix},
+    coding::{Location, TrackNamespace, TrackNamespacePrefix},
     serve::{FullTrackName, ServeError, Track, TrackReader, TrackWriter},
 };
 use tokio::sync::{broadcast, mpsc, watch, OwnedSemaphorePermit, Semaphore};
@@ -249,6 +249,9 @@ struct TrackEntry {
 pub struct LocalTrack {
     /// The media reader to serve downstream.
     pub reader: TrackReader,
+
+    /// Greatest Object present when this lookup resolved.
+    pub largest_location: Option<Location>,
 
     /// Held for as long as the caller serves [`Self::reader`]. Dropping it is what
     /// eventually lets an idle upstream subscription be released.
@@ -824,6 +827,7 @@ impl Locals {
             if let Some(entry) = bucket.get(&full_name) {
                 if !entry.reader.is_closed() {
                     return Some(LocalTrack {
+                        largest_location: entry.reader.largest_location(),
                         reader: entry.reader.clone(),
                         interest: entry.interest.as_ref().map(TrackInterest::guard),
                         upstream: entry.upstream.clone(),
@@ -896,6 +900,7 @@ impl Locals {
 
         Some(LocalTrack {
             reader,
+            largest_location: None,
             interest: Some(guard),
             upstream: Some(upstream),
         })
@@ -948,6 +953,7 @@ impl Locals {
             match bucket.get(full_name) {
                 Some(entry) if !entry.reader.is_closed() => {
                     return Some(LocalTrack {
+                        largest_location: entry.reader.largest_location(),
                         reader: entry.reader.clone(),
                         interest: entry.interest.as_ref().map(TrackInterest::guard),
                         upstream: entry.upstream.clone(),
@@ -1373,6 +1379,39 @@ mod tests {
             no_second_request.is_err(),
             "cache hit should not request again"
         );
+    }
+
+    #[tokio::test]
+    async fn new_pull_through_track_keeps_its_pre_publish_snapshot() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/snapshot");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let local = locals
+            .get_or_request_track(None, namespace, "video")
+            .await
+            .expect("track should resolve through namespace source");
+        assert_eq!(local.largest_location, None);
+
+        let request = requests.recv().await.expect("source should get request");
+        let mut datagrams = request.writer.datagrams().unwrap();
+        datagrams
+            .write(moq_transport::serve::Datagram {
+                group_id: 2,
+                object_id: 3,
+                priority: 128,
+                status: moq_transport::data::ObjectStatus::NormalObject,
+                end_of_group: false,
+                payload: b"payload".to_vec().into(),
+                extension_headers: moq_transport::data::ExtensionHeaders::default(),
+            })
+            .unwrap();
+
+        assert_eq!(local.reader.largest_location(), Some(Location::new(2, 3)));
+        assert_eq!(local.largest_location, None);
     }
 
     #[tokio::test]

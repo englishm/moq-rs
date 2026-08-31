@@ -460,30 +460,19 @@ impl SubscribeRecv {
     }
 
     pub fn datagram(&mut self, datagram: data::Datagram) -> Result<(), ServeError> {
+        let datagram = serve::Datagram::from_data(datagram, self.default_publisher_priority);
         let writer = self.writer.take().ok_or(ServeError::Done)?;
 
         match writer {
             TrackWriterMode::Track(track) => {
                 // convert Track -> Datagrams writer, write, then put Datagrams back
                 let mut datagrams = track.datagrams()?;
-                datagrams.write(serve::Datagram {
-                    group_id: datagram.group_id,
-                    object_id: datagram.object_id.unwrap_or(0),
-                    priority: datagram.publisher_priority,
-                    payload: datagram.payload.unwrap_or_default(),
-                    extension_headers: datagram.extension_headers.unwrap_or_default(),
-                })?;
+                datagrams.write(datagram)?;
                 self.writer = Some(TrackWriterMode::Datagrams(datagrams));
                 Ok(())
             }
             TrackWriterMode::Datagrams(mut datagrams) => {
-                datagrams.write(serve::Datagram {
-                    group_id: datagram.group_id,
-                    object_id: datagram.object_id.unwrap_or(0),
-                    priority: datagram.publisher_priority,
-                    payload: datagram.payload.unwrap_or_default(),
-                    extension_headers: datagram.extension_headers.unwrap_or_default(),
-                })?;
+                datagrams.write(datagram)?;
                 self.writer = Some(TrackWriterMode::Datagrams(datagrams));
                 Ok(())
             }
@@ -510,7 +499,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn test_recv() -> (Subscribe, SubscribeRecv) {
+    async fn test_recv_with_reader() -> (Subscribe, SubscribeRecv, serve::TrackReader) {
         let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
         let subscriber = crate::session::Subscriber::new(
             crate::watch::Queue::default(),
@@ -520,11 +509,48 @@ mod tests {
             crate::session::RequestId::new(0, 1),
             bidi_task_tx,
         );
-        let (writer, _reader) =
+        let (writer, reader) =
             crate::serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
         let (send, recv, _msg) =
             Subscribe::new(subscriber, 0, writer, KeyValuePairs::default()).unwrap();
+        (send, recv, reader)
+    }
+
+    async fn test_recv() -> (Subscribe, SubscribeRecv) {
+        let (send, recv, _reader) = test_recv_with_reader().await;
         (send, recv)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn datagram_resolves_default_priority_and_preserves_semantics() {
+        let (_send, mut recv, reader) = test_recv_with_reader().await;
+        recv.ok(42, 200).unwrap();
+
+        let mut properties = data::ExtensionHeaders::new();
+        properties.set_intvalue(2, 7);
+        recv.datagram(data::Datagram {
+            datagram_type: data::DatagramType::PayloadExtEndOfGroupDefaultPriority,
+            track_alias: 42,
+            group_id: 3,
+            object_id: None,
+            publisher_priority: None,
+            extension_headers: Some(properties),
+            status: None,
+            payload: Some(bytes::Bytes::from_static(b"payload")),
+        })
+        .unwrap();
+
+        let serve::TrackReaderMode::Datagrams(mut datagrams) = reader.mode().await.unwrap() else {
+            panic!("expected datagram mode");
+        };
+        let datagram = datagrams.read().await.unwrap().unwrap();
+        assert_eq!(datagram.group_id, 3);
+        assert_eq!(datagram.object_id, 0);
+        assert_eq!(datagram.priority, 200);
+        assert_eq!(datagram.status, data::ObjectStatus::NormalObject);
+        assert!(datagram.end_of_group);
+        assert_eq!(datagram.payload, bytes::Bytes::from_static(b"payload"));
+        assert!(datagram.extension_headers.has(2));
     }
 
     /// §10.11: the request stream can die while a data stream is still being
