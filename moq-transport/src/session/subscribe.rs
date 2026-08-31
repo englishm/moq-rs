@@ -222,6 +222,7 @@ impl Subscribe {
         let recv = SubscribeRecv {
             state: recv,
             writer: Some(track.into()),
+            default_publisher_priority: data::DEFAULT_PUBLISHER_PRIORITY,
             drain: StreamDrain::default(),
         };
 
@@ -282,12 +283,13 @@ impl ops::Deref for Subscribe {
 pub(super) struct SubscribeRecv {
     state: State<SubscribeState>,
     writer: Option<TrackWriterMode>,
+    pub(super) default_publisher_priority: u8,
     /// PUBLISH_DONE Stream Count accounting (draft-18 §10.11).
     drain: StreamDrain<ServeError>,
 }
 
 impl SubscribeRecv {
-    pub fn ok(&mut self, alias: u64) -> Result<(), ServeError> {
+    pub fn ok(&mut self, alias: u64, default_publisher_priority: u8) -> Result<(), ServeError> {
         let state = self.state.lock();
         if state.ok {
             return Err(ServeError::Duplicate);
@@ -297,6 +299,7 @@ impl SubscribeRecv {
             state.ok = true;
             state.track_alias = Some(alias);
         }
+        self.default_publisher_priority = default_publisher_priority;
 
         Ok(())
     }
@@ -426,12 +429,24 @@ impl SubscribeRecv {
             }
         };
 
-        let writer = match subgroups.create(serve::Subgroup {
-            group_id: header.group_id,
-            // When subgroup_id is not present in the header type, it implicitly means subgroup 0
-            subgroup_id: header.subgroup_id.unwrap_or(0),
-            priority: header.publisher_priority,
-        }) {
+        let priority = if header.header_type.uses_default_priority() {
+            self.default_publisher_priority
+        } else {
+            header.publisher_priority
+        };
+        let writer = match subgroups.create_with_metadata(
+            serve::Subgroup {
+                group_id: header.group_id,
+                // When subgroup_id is not present in the header type, it implicitly means subgroup 0
+                subgroup_id: header.subgroup_id.unwrap_or(0),
+                priority,
+            },
+            serve::SubgroupStreamMetadata {
+                has_properties: header.header_type.has_properties(),
+                end_of_group: header.header_type.end_of_group(),
+                first_object: header.header_type.begins_with_first_object(),
+            },
+        ) {
             Ok(writer) => writer,
             Err(err) => {
                 self.writer = Some(subgroups.into());
@@ -500,6 +515,7 @@ mod tests {
         let subscriber = crate::session::Subscriber::new(
             crate::watch::Queue::default(),
             crate::session::test_support::loopback_session().await,
+            crate::session::Transport::WebTransport,
             None,
             crate::session::RequestId::new(0, 1),
             bidi_task_tx,

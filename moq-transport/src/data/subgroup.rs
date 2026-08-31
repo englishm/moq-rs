@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
-use crate::data::{ExtensionHeaders, ObjectStatus, StreamHeaderType};
+use crate::data::{ExtensionHeaders, ObjectStatus, StreamHeaderType, DEFAULT_PUBLISHER_PRIORITY};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum ObjectIdDeltaError {
@@ -96,7 +96,11 @@ impl SubgroupHeader {
             }
         };
 
-        let publisher_priority = u8::decode(r)?;
+        let publisher_priority = if header_type.uses_default_priority() {
+            DEFAULT_PUBLISHER_PRIORITY
+        } else {
+            u8::decode(r)?
+        };
         tracing::trace!(
             "[DECODE] SubgroupHeader: publisher_priority={}, buffer_remaining={} bytes",
             publisher_priority,
@@ -169,11 +173,13 @@ impl Encode for SubgroupHeader {
             tracing::trace!("[ENCODE] SubgroupHeader: subgroup_id not encoded (not required for this header type)");
         }
 
-        self.publisher_priority.encode(w)?;
-        tracing::trace!(
-            "[ENCODE] SubgroupHeader: encoded publisher_priority={}",
-            self.publisher_priority
-        );
+        if !self.header_type.uses_default_priority() {
+            self.publisher_priority.encode(w)?;
+            tracing::trace!(
+                "[ENCODE] SubgroupHeader: encoded publisher_priority={}",
+                self.publisher_priority
+            );
+        }
 
         let bytes_written = start_pos - w.remaining_mut();
         tracing::trace!(
@@ -408,6 +414,7 @@ impl Encode for SubgroupObjectExt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::{StreamHeader, SubgroupIdMode};
     use bytes::Bytes;
     use bytes::BytesMut;
 
@@ -423,6 +430,64 @@ mod tests {
             let decoded =
                 deltas.map(|delta| decode_object_id_delta(&mut decode_previous, delta).unwrap());
             assert_eq!(decoded, object_ids);
+        }
+    }
+
+    #[test]
+    fn type_78_omits_priority_without_consuming_the_first_object() {
+        let header = SubgroupHeader {
+            header_type: StreamHeaderType::subgroup(SubgroupIdMode::Zero, false, true, true, true),
+            track_alias: 0,
+            group_id: 0,
+            subgroup_id: None,
+            publisher_priority: 200,
+        };
+        let mut encoded = BytesMut::new();
+        header.encode(&mut encoded).unwrap();
+        assert_eq!(encoded.as_ref(), &[0x78, 0x00, 0x00]);
+        encoded.extend_from_slice(&[0x00, 0x01, b'x']);
+
+        let mut encoded = encoded.freeze();
+        let decoded = StreamHeader::decode(&mut encoded)
+            .unwrap()
+            .subgroup_header
+            .unwrap();
+        assert_eq!(decoded.header_type.value(), 0x78);
+        assert_eq!(decoded.publisher_priority, 128);
+        assert_eq!(encoded.as_ref(), &[0x00, 0x01, b'x']);
+
+        let object = SubgroupObject::decode(&mut encoded).unwrap();
+        assert_eq!(object.object_id_delta, 0);
+        assert_eq!(object.payload_length, 1);
+        assert_eq!(encoded.as_ref(), b"x");
+    }
+
+    #[test]
+    fn subgroup_id_modes_consume_only_their_declared_fields() {
+        for (mode, subgroup_id, expected_id) in [
+            (SubgroupIdMode::Zero, None, None),
+            (SubgroupIdMode::FirstObject, None, None),
+            (SubgroupIdMode::Explicit, Some(9), Some(9)),
+        ] {
+            let header = SubgroupHeader {
+                header_type: StreamHeaderType::subgroup(mode, false, false, true, false),
+                track_alias: 7,
+                group_id: 8,
+                subgroup_id,
+                publisher_priority: 200,
+            };
+            let mut encoded = BytesMut::new();
+            header.encode(&mut encoded).unwrap();
+            encoded.extend_from_slice(&[0x0b, 0x01, b'x']);
+
+            let mut encoded = encoded.freeze();
+            let decoded = StreamHeader::decode(&mut encoded)
+                .unwrap()
+                .subgroup_header
+                .unwrap();
+            assert_eq!(decoded.subgroup_id, expected_id);
+            assert_eq!(decoded.publisher_priority, 128);
+            assert_eq!(encoded.as_ref(), &[0x0b, 0x01, b'x']);
         }
     }
 
