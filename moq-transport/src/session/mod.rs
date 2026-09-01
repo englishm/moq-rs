@@ -41,9 +41,11 @@ pub use track_status_requested::*;
 use reader::*;
 use writer::*;
 
+use bytes::Buf;
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -52,7 +54,8 @@ use crate::message::Message;
 use crate::mlog;
 use crate::watch::Queue;
 use crate::{message, setup};
-use std::path::PathBuf;
+
+pub(super) const CANCELLED_STREAM_CODE: u32 = crate::data::DataStreamResetCode::Cancelled as u32;
 
 pub(crate) struct BidiResponse {
     message: Message,
@@ -1073,6 +1076,23 @@ impl Session {
                 }
             };
 
+        // PUBLISH_NAMESPACE ends when either endpoint cancels its request stream.
+        if let Message::PublishNamespace(msg) = msg {
+            if let Some(ref mlog) = mlog {
+                if let Ok(mut mlog) = mlog.lock() {
+                    let time = mlog.elapsed_ms();
+                    let _ = mlog.add_event(mlog::events::publish_namespace_parsed(time, 0, &msg));
+                }
+            }
+
+            request_id.validate_incoming(msg.id)?;
+            let recv = subscriber
+                .as_mut()
+                .ok_or(SessionError::RoleViolation)?
+                .recv_publish_namespace(&msg)?;
+            return recv.run(writer, reader, mlog).await;
+        }
+
         // SUBSCRIBE_NAMESPACE owns its stream for the whole life of the request:
         // the reply is not one terminal message but an open-ended NAMESPACE /
         // NAMESPACE_DONE feed. Hand both halves straight to the publisher-side
@@ -1372,11 +1392,7 @@ impl Session {
                 },
             };
 
-            if let Err(err) = dispatched {
-                // Session::run decides: a protocol violation closes the session,
-                // anything else only ends this request.
-                return Err(err);
-            }
+            dispatched?;
 
             if let Some(terminal) = terminal {
                 return Ok(terminal);
@@ -1580,6 +1596,10 @@ impl Session {
                 )))
             }
         }?;
+
+        if buf.has_remaining() {
+            return Err(DecodeError::InvalidLength(0, buf.remaining()).into());
+        }
 
         if !msg.parameter_scopes_valid() {
             return Err(DecodeError::InvalidParameter.into());
@@ -2092,8 +2112,8 @@ mod tests {
         assert!(matches!(
             data_reader.done().await,
             Err(SessionError::WebTransport(web_transport::Error::Read(
-                web_transport::quinn::ReadError::Reset(0)
-            )))
+                web_transport::quinn::ReadError::Reset(code)
+            ))) if code == u32::from(crate::data::DataStreamResetCode::Cancelled)
         ));
         handler.await.unwrap().unwrap();
         drop(subgroup);
@@ -2137,8 +2157,8 @@ mod tests {
         assert!(matches!(
             data_reader.done().await,
             Err(SessionError::WebTransport(web_transport::Error::Read(
-                web_transport::quinn::ReadError::Reset(0)
-            )))
+                web_transport::quinn::ReadError::Reset(code)
+            ))) if code == u32::from(crate::data::DataStreamResetCode::Cancelled)
         ));
         drop(subgroup);
         drop(subgroups);

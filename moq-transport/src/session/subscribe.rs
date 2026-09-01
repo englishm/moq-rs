@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::ops;
+use std::{ops, time::Duration};
 
 use crate::{
     coding::{KeyValuePairs, Location, TrackName, TrackNamespace},
@@ -16,6 +16,9 @@ use crate::watch::State;
 use super::SessionError;
 use super::Subscriber;
 use super::{DoneOutcome, StreamDrain};
+
+const SUBSCRIBE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+type SubscribeRequestSink = tokio::sync::mpsc::Sender<message::Message>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryFilter {
@@ -70,7 +73,7 @@ pub struct SubscribeInfo {
     pub end_group_id: Option<u64>,
 
     /// None means the SUBSCRIPTION_FILTER parameter was omitted and the
-    /// subscription is unfiltered per draft-16 §9.2.2.5.
+    /// subscription is unfiltered.
     pub filter: Option<SubscriptionFilter>,
 
     /// Optional parameters
@@ -152,6 +155,7 @@ fn next_group_location(largest_location: Option<Location>) -> Location {
 
 struct SubscribeState {
     ok: bool,
+    peer_rejected: bool,
     track_alias: Option<u64>,
     closed: Result<(), ServeError>,
 }
@@ -160,6 +164,7 @@ impl Default for SubscribeState {
     fn default() -> Self {
         Self {
             ok: Default::default(),
+            peer_rejected: false,
             track_alias: None,
             closed: Ok(()),
         }
@@ -171,6 +176,9 @@ impl Default for SubscribeState {
 pub struct Subscribe {
     state: State<SubscribeState>,
     subscriber: Subscriber,
+    stream: Option<SubscribeRequestSink>,
+    request_done: Option<tokio::sync::oneshot::Receiver<()>>,
+    request_cancel: Option<tokio::sync::oneshot::Sender<u32>>,
 
     pub info: SubscribeInfo,
 }
@@ -216,6 +224,9 @@ impl Subscribe {
         let send = Subscribe {
             state: send,
             subscriber,
+            stream: None,
+            request_done: None,
+            request_cancel: None,
             info,
         };
 
@@ -227,6 +238,74 @@ impl Subscribe {
         };
 
         (send, recv)
+    }
+
+    pub(super) fn set_stream(
+        &mut self,
+        stream: SubscribeRequestSink,
+        request_done: tokio::sync::oneshot::Receiver<()>,
+        request_cancel: tokio::sync::oneshot::Sender<u32>,
+    ) {
+        self.stream = Some(stream);
+        self.request_done = Some(request_done);
+        self.request_cancel = Some(request_cancel);
+    }
+
+    /// End the subscription and wait until the peer terminates its request
+    /// stream. This provides an ordering barrier before opening another
+    /// SUBSCRIBE for the same track.
+    pub async fn unsubscribe(mut self) {
+        self.unsubscribe_before(SUBSCRIBE_TEARDOWN_TIMEOUT).await;
+    }
+
+    pub(super) async fn unsubscribe_before(&mut self, timeout: Duration) {
+        self.send_unsubscribe();
+        if let Some(mut request_done) = self.request_done.take() {
+            if tokio::time::timeout(timeout, &mut request_done)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    request_id = self.info.id,
+                    "peer did not finish SUBSCRIBE request stream after UNSUBSCRIBE; resetting it"
+                );
+                if let Some(cancel) = self.request_cancel.take() {
+                    let _ = cancel.send(super::CANCELLED_STREAM_CODE);
+                }
+                // RESET_STREAM is not ordered against a new QUIC stream. Retire
+                // this session before releasing a cache generation so a retry
+                // cannot overtake teardown on the same connection. This also
+                // interrupts every other subscription multiplexed on the peer;
+                // they reconnect through normal upstream routing.
+                tracing::warn!(
+                    request_id = self.info.id,
+                    "retiring upstream session after stuck SUBSCRIBE teardown; all multiplexed subscriptions will reconnect"
+                );
+                self.subscriber.close_session(
+                    super::CANCELLED_STREAM_CODE,
+                    "SUBSCRIBE request stream teardown timed out",
+                );
+                if tokio::time::timeout(timeout, &mut request_done)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        request_id = self.info.id,
+                        "SUBSCRIBE request stream did not stop after reset"
+                    );
+                }
+            }
+        }
+        self.subscriber.remove_subscribe(self.info.id);
+    }
+
+    fn send_unsubscribe(&mut self) {
+        let stream = self.stream.take();
+        if self.state.lock().closed.is_ok() {
+            if let Some(stream) = &stream {
+                let _ = stream.try_send(message::Unsubscribe { id: self.info.id }.into());
+            }
+        }
     }
 
     pub async fn closed(&self) -> Result<(), ServeError> {
@@ -262,12 +341,16 @@ impl Subscribe {
             .await;
         }
     }
+
+    /// Whether the request ended with REQUEST_ERROR from the peer.
+    pub fn peer_rejected(&self) -> bool {
+        self.state.lock().peer_rejected
+    }
 }
 
 impl Drop for Subscribe {
     fn drop(&mut self) {
-        self.subscriber
-            .send_message(message::Unsubscribe { id: self.info.id });
+        self.send_unsubscribe();
         self.subscriber.remove_subscribe(self.info.id);
     }
 }
@@ -379,7 +462,7 @@ impl SubscribeRecv {
 
     /// Apply the terminal state, closing the writer so the reader sees the end
     /// of the track.
-    fn finish(&mut self, err: ServeError) {
+    pub(super) fn finish(&mut self, err: ServeError) {
         self.drain.mark_finished();
         if let Some(writer) = self.writer.take() {
             if let Err(err) = writer.close(err.clone()) {
@@ -408,6 +491,13 @@ impl SubscribeRecv {
         state.closed = Err(err);
 
         Ok(())
+    }
+
+    pub fn reject(self, err: ServeError) -> Result<(), ServeError> {
+        if let Some(mut state) = self.state.lock().into_mut() {
+            state.peer_rejected = true;
+        }
+        self.error(err)
     }
 
     pub fn subgroup(

@@ -8,15 +8,83 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     message::RequestErrorCode,
     serve::{ServeError, Tracks},
-    session::{PublishReceived, PublishedNamespace, SessionError, Subscriber},
+    session::{PublishReceived, PublishedNamespace, SessionError, Subscribe, Subscriber},
 };
 use tokio::sync::Semaphore;
 
 use crate::{
-    metrics::GaugeGuard, Coordinator, Locals, Producer, RemoteManager, SessionContext, TrackRequest,
+    metrics::GaugeGuard, CacheLease, Coordinator, Locals, Producer, RemoteManager, SessionContext,
+    SessionInterface, TrackRequest,
 };
 
 const MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION: usize = 1024;
+
+struct CacheSubscriptionCleanup {
+    subscribe: Option<Subscribe>,
+    lease: Option<CacheLease>,
+}
+
+impl CacheSubscriptionCleanup {
+    fn new(lease: CacheLease) -> Self {
+        Self {
+            subscribe: None,
+            lease: Some(lease),
+        }
+    }
+
+    fn attach(&mut self, subscribe: Subscribe) {
+        self.subscribe = Some(subscribe);
+    }
+
+    fn handles(&self) -> Result<(&Subscribe, &CacheLease), ServeError> {
+        match (self.subscribe.as_ref(), self.lease.as_ref()) {
+            (Some(subscribe), Some(lease)) => Ok((subscribe, lease)),
+            _ => Err(ServeError::Internal(
+                "cache subscription cleanup is missing ownership".to_string(),
+            )),
+        }
+    }
+
+    fn finish(mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let subscribe = self.subscribe.take();
+        let lease = self.lease.take()?;
+        lease.begin_release();
+        Some(tokio::spawn(async move {
+            if let Some(subscribe) = subscribe {
+                subscribe.unsubscribe().await;
+            }
+            lease.finish_release();
+        }))
+    }
+}
+
+impl Drop for CacheSubscriptionCleanup {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        lease.begin_release();
+        let subscribe = self.subscribe.take();
+
+        if let Some(subscribe) = subscribe {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                std::mem::drop(runtime.spawn(async move {
+                    subscribe.unsubscribe().await;
+                    lease.finish_release();
+                }));
+                return;
+            }
+
+            tracing::warn!(
+                request_id = subscribe.id,
+                "could not wait for cache subscription teardown outside a Tokio runtime"
+            );
+            drop(subscribe);
+        }
+
+        lease.finish_release();
+    }
+}
 
 /// Consumer of tracks from a remote Publisher
 #[derive(Clone)]
@@ -104,6 +172,67 @@ impl Consumer {
         }
     }
 
+    /// Serve a PUBLISH_NAMESPACE forwarded by a peer relay: advertise it for
+    /// discovery, and route nothing through this session.
+    ///
+    /// The peer that forwarded this is not the origin, it is relaying on the
+    /// origin's behalf, so this relay must not present itself as a source. It
+    /// registers the namespace the same way the SUBSCRIBE_NAMESPACE pull path
+    /// does. The namespace is visible to discovery but absent from local routing,
+    /// so a downstream SUBSCRIBE resolves through the coordinator to its owner.
+    ///
+    /// Deliberately absent, each for its own reason:
+    ///
+    /// * **No coordinator registration.** Ownership is the origin's. Claiming it
+    ///   here races the origin for one key and loses. The losing path then
+    ///   unwinds the local registration while the publisher is still live.
+    ///
+    /// * **No request queue.** With no local route nothing can queue against
+    ///   this session, so there is no queue to strand and no need to drain one.
+    ///
+    /// * **No subscribe reaching this session.** That matters twice over: the
+    ///   forwarding peer publishes a placeholder track container whose request
+    ///   channel is closed at creation, and that publication takes priority
+    ///   over the peer's own unknown-subscribe fall-through. A dialed session
+    ///   also has no `Producer` draining
+    ///   `subscribed()` at all, so it could not be served even if the
+    ///   placeholder were gone.
+    ///
+    /// * **No onward fan-out.** The coordinator already returns no subscriber
+    ///   relays for an internal context; not asking is one fewer way to
+    ///   propagate a forwarded announce into a loop.
+    async fn serve_proxied(
+        self,
+        mut published_ns: PublishedNamespace,
+    ) -> Result<(), anyhow::Error> {
+        let ns = published_ns.namespace.to_utf8_path();
+
+        let _registration = match self
+            .locals
+            .register_remote_namespace(self.context.scope(), published_ns.namespace.clone())
+        {
+            Ok(registration) => registration,
+            Err(err) => {
+                metrics::counter!("moq_relay_announce_errors_total", "phase" => "remote_register")
+                    .increment(1);
+                return Err(err);
+            }
+        };
+        tracing::debug!(namespace = %ns, "registered proxied namespace for discovery");
+
+        if let Err(err) = published_ns.ok() {
+            metrics::counter!("moq_relay_announce_errors_total", "phase" => "send_ok").increment(1);
+            return Err(err.into());
+        }
+        metrics::counter!("moq_relay_announce_ok_total", "kind" => "proxied").increment(1);
+        tracing::info!(namespace = %ns, "serving proxied PUBLISH_NAMESPACE from peer relay");
+
+        published_ns.closed().await?;
+        tracing::info!(namespace = %ns, "proxied PUBLISH_NAMESPACE closed");
+
+        Ok(())
+    }
+
     /// Serve an inbound PUBLISH_NAMESPACE.
     async fn serve(mut self, mut published_ns: PublishedNamespace) -> Result<(), anyhow::Error> {
         // Track active publishers - decrements when this function returns.
@@ -113,6 +242,12 @@ impl Consumer {
             futures::future::BoxFuture<'static, Result<(), anyhow::Error>>,
         > = FuturesUnordered::new();
         let ns = published_ns.namespace.to_utf8_path();
+
+        // A namespace forwarded by a peer relay is proxied, not ours, so it is
+        // advertised for discovery and nothing more.
+        if self.context.interface == SessionInterface::Internal {
+            return self.serve_proxied(published_ns).await;
+        }
 
         // Register namespace routing metadata locally. This does not register
         // any media tracks; it only creates a request queue used when a
@@ -159,13 +294,13 @@ impl Consumer {
             return Err(err.into());
         }
         tracing::debug!(namespace = %ns, "sent REQUEST_OK for PUBLISH_NAMESPACE");
-        metrics::counter!("moq_relay_announce_ok_total").increment(1);
+        metrics::counter!("moq_relay_announce_ok_total", "kind" => "client").increment(1);
 
         // Forward the namespace upstream, if configured.
         if let Some(mut forward) = self.forward {
-            // The forwarding API still uses the moq-transport Tracks helper.
-            // This helper is not the relay-local registry; it is only an
-            // adapter for the outgoing publish_namespace API.
+            // This advertise-only container cannot route a subscribe back down
+            // the dialed session. Supporting that requires the dialed side to
+            // run a Producer, which is outside this forwarding path.
             let (_, _forward_request, forward_reader) =
                 Tracks::new(published_ns.namespace.clone()).produce();
             tasks.push(
@@ -219,6 +354,10 @@ impl Consumer {
             // The forwarding API uses the moq-transport Tracks helper as an
             // adapter for the outgoing publish_namespace call; it is not the
             // relay-local registry.
+            // The request half is dropped before this task runs, so this reader
+            // can advertise the namespace but cannot serve a subscription. The
+            // receiving relay must keep it out of local routing; see
+            // `serve_proxied`.
             let (_, _request, reader) = Tracks::new(published_ns.namespace.clone()).produce();
             tasks.push(
                 async move {
@@ -260,6 +399,7 @@ impl Consumer {
                     let mut subscriber = self.subscriber.clone();
 
                     tasks.push(async move {
+                        let mut cleanup = CacheSubscriptionCleanup::new(lease);
                         let info = writer.info.clone();
                         let namespace = info.namespace.to_utf8_path();
                         let track_name = info.name.clone();
@@ -269,16 +409,29 @@ impl Consumer {
                             "forwarding subscribe: {:?}", info
                         );
 
-                        // Hold the subscription explicitly rather than using
-                        // `subscribe()`, so it can be dropped — sending
-                        // UNSUBSCRIBE — once downstream interest goes away.
-                        //
-                        // `subscribe_open` resolves once the upstream publisher
-                        // answers, so its outcome is exactly what downstream
-                        // subscribers are waiting on to satisfy draft-16 §8.4.
-                        let subscribe = match subscriber.subscribe_open(writer).await {
+                        // Stop opening the upstream stream when all downstream
+                        // interest disappears. Once opening succeeds, cleanup
+                        // owns the stream through ordered teardown.
+                        let lease = cleanup.lease.as_ref().ok_or_else(|| {
+                            ServeError::Internal(
+                                "cache subscription cleanup is missing its lease".to_string(),
+                            )
+                        })?;
+                        let subscribe_result = tokio::select! {
+                            biased;
+                            result = subscriber.subscribe_start(writer) => Some(result),
+                            _ = lease.abandoned() => None,
+                        };
+                        let Some(subscribe_result) = subscribe_result else {
+                            tracing::debug!(
+                                namespace = %namespace,
+                                track = %track_name,
+                                "downstream left while opening upstream subscribe"
+                            );
+                            return Ok(());
+                        };
+                        let subscribe = match subscribe_result {
                             Ok(subscribe) => {
-                                upstream.established();
                                 subscribe
                             }
                             Err(err) => {
@@ -295,6 +448,41 @@ impl Consumer {
                                 return Ok(());
                             }
                         };
+                        cleanup.attach(subscribe);
+                        let (subscribe, lease) = cleanup.handles()?;
+
+                        // Opening wins a tied wake above, so recheck abandonment
+                        // before accepting the upstream subscription.
+                        let accepted = tokio::select! {
+                            result = subscribe.ok() => Some(result),
+                            _ = lease.abandoned() => None,
+                        };
+                        let Some(accepted) = accepted else {
+                            tracing::debug!(
+                                namespace = %namespace,
+                                track = %track_name,
+                                "downstream left before upstream accepted subscribe"
+                            );
+                            if let Some(task) = cleanup.finish() {
+                                let _ = task.await;
+                            }
+                            return Ok(());
+                        };
+                        if let Err(err) = accepted {
+                            tracing::warn!(
+                                namespace = %namespace,
+                                track = %track_name,
+                                error = %err,
+                                "failed forwarding subscribe: {:?}", info
+                            );
+                            upstream.failed(err);
+                            if let Some(task) = cleanup.finish() {
+                                let _ = task.await;
+                            }
+                            return Ok(());
+                        }
+                        upstream.established();
+                        let (subscribe, lease) = cleanup.handles()?;
 
                         tokio::select! {
                             res = subscribe.closed() => {
@@ -308,8 +496,8 @@ impl Consumer {
                                 }
                             }
                             // The cached track went unwatched long enough to be
-                            // evicted, so stop pulling it. Dropping `subscribe`
-                            // below sends UNSUBSCRIBE upstream.
+                            // evicted, so stop pulling it and complete ordered
+                            // request-stream teardown below.
                             _ = lease.released() => {
                                 tracing::info!(
                                     namespace = %namespace,
@@ -318,8 +506,9 @@ impl Consumer {
                                 );
                             }
                         }
-
-                        drop(subscribe);
+                        if let Some(task) = cleanup.finish() {
+                            let _ = task.await;
+                        }
 
                         Ok(())
                     }.boxed());
@@ -406,5 +595,50 @@ impl Consumer {
         tracing::info!(namespace = %namespace, track = %track_name, "PUBLISH closed");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use moq_transport::serve::FullTrackName;
+
+    use super::CacheSubscriptionCleanup;
+    use crate::{Locals, TrackRequest};
+
+    fn ns(path: &str) -> moq_transport::coding::TrackNamespace {
+        moq_transport::coding::TrackNamespace::try_from(path).expect("valid namespace")
+    }
+
+    #[tokio::test]
+    async fn cleanup_before_subscribe_start_removes_the_cache_generation() {
+        let namespace = ns("room/123");
+        let mut locals = Locals::new();
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("register namespace source");
+        let local = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("request missing track");
+        let TrackRequest {
+            writer,
+            lease,
+            upstream,
+        } = requests.recv().await.expect("receive track request");
+        drop(local);
+        lease.abandoned().await;
+
+        let full_name = FullTrackName {
+            namespace,
+            name: "video".into(),
+        };
+        assert!(locals.retrieve_track(None, &full_name).is_some());
+
+        drop(CacheSubscriptionCleanup::new(lease));
+
+        assert!(locals.retrieve_track(None, &full_name).is_none());
+        drop(writer);
+        drop(upstream);
     }
 }

@@ -10,16 +10,14 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
 use crate::coding::{Encode, EncodeError, KeyValuePairs, Location, ReasonPhrase};
+use crate::data::DataStreamResetCode;
 use crate::message::RequestErrorCode;
 use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
 
-use super::{
-    DeliveryError, DeliveryFilter, Publisher, ResetOnDropWriter, SessionError, SubscribeInfo,
-    Writer,
-};
+use super::{DeliveryError, DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
 
 // This file defines Publisher handling of inbound Subscriptions
 
@@ -236,6 +234,161 @@ impl ObjectForwarder {
     }
 }
 
+/// A subgroup data stream that is reset unless it is explicitly finished.
+///
+/// Draft-18 Section 11.4.3 allows FIN only after all subgroup objects required
+/// by the subscription have been delivered. Dropping a QUIC send stream
+/// implicitly finishes it, so this wrapper resets unfinished streams by default.
+struct SubgroupStream {
+    writer: Writer,
+    terminated: bool,
+}
+
+impl SubgroupStream {
+    fn new(writer: Writer) -> Self {
+        Self {
+            writer,
+            terminated: false,
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), SessionError> {
+        if self.terminated {
+            return Ok(());
+        }
+        self.terminated = true;
+        self.writer.finish()
+    }
+
+    fn reset(&mut self, code: DataStreamResetCode) {
+        if self.terminated {
+            return;
+        }
+        self.terminated = true;
+        self.writer.reset(code.into());
+    }
+}
+
+impl Drop for SubgroupStream {
+    fn drop(&mut self) {
+        // Async cancellation can drop the forwarding future without reaching an
+        // error path. The subgroup is incomplete in that case.
+        self.reset(DataStreamResetCode::Cancelled);
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubgroupTermination {
+    Fin,
+    Reset(DataStreamResetCode),
+}
+
+enum SubgroupSink {
+    Stream(SubgroupStream),
+    #[cfg(test)]
+    Buffer {
+        buffer: bytes::BytesMut,
+        termination: Option<SubgroupTermination>,
+    },
+}
+
+/// Tracks whether an encoded object still has payload bytes outstanding.
+struct SubgroupOutput {
+    sink: SubgroupSink,
+    owed: usize,
+}
+
+impl SubgroupOutput {
+    fn stream(writer: Writer) -> Self {
+        Self {
+            sink: SubgroupSink::Stream(SubgroupStream::new(writer)),
+            owed: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn buffer() -> Self {
+        Self {
+            sink: SubgroupSink::Buffer {
+                buffer: bytes::BytesMut::new(),
+                termination: None,
+            },
+            owed: 0,
+        }
+    }
+
+    async fn encode<T: Encode>(&mut self, msg: &T) -> Result<(), SessionError> {
+        match &mut self.sink {
+            SubgroupSink::Stream(stream) => stream.writer.encode(msg).await,
+            #[cfg(test)]
+            SubgroupSink::Buffer { buffer, .. } => {
+                msg.encode(buffer)?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn write(&mut self, buf: &[u8]) -> Result<(), SessionError> {
+        match &mut self.sink {
+            SubgroupSink::Stream(stream) => stream.writer.write(buf).await?,
+            #[cfg(test)]
+            SubgroupSink::Buffer { buffer, .. } => buffer.extend_from_slice(buf),
+        }
+
+        self.owed = self.owed.saturating_sub(buf.len());
+        Ok(())
+    }
+
+    fn begin_object(&mut self, len: usize) {
+        self.owed = len;
+    }
+
+    fn at_object_boundary(&self) -> bool {
+        self.owed == 0
+    }
+
+    fn finish(&mut self) -> Result<(), SessionError> {
+        if !self.at_object_boundary() {
+            tracing::warn!(
+                owed = self.owed,
+                "refusing to FIN a subgroup stream mid-object; resetting instead"
+            );
+            self.reset(DataStreamResetCode::InternalError);
+            return Err(ServeError::Size.into());
+        }
+
+        match &mut self.sink {
+            SubgroupSink::Stream(stream) => stream.finish(),
+            #[cfg(test)]
+            SubgroupSink::Buffer { termination, .. } => {
+                termination.get_or_insert(SubgroupTermination::Fin);
+                Ok(())
+            }
+        }
+    }
+
+    fn reset(&mut self, code: DataStreamResetCode) {
+        match &mut self.sink {
+            SubgroupSink::Stream(stream) => stream.reset(code),
+            #[cfg(test)]
+            SubgroupSink::Buffer { termination, .. } => {
+                termination.get_or_insert(SubgroupTermination::Reset(code));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn into_parts(self) -> (bytes::BytesMut, Option<SubgroupTermination>) {
+        match self.sink {
+            SubgroupSink::Buffer {
+                buffer,
+                termination,
+            } => (buffer, termination),
+            SubgroupSink::Stream(_) => unreachable!("test output should use a buffer"),
+        }
+    }
+}
 impl Subscribed {
     pub(super) fn new(
         publisher: Publisher,
@@ -298,7 +451,7 @@ impl Subscribed {
             !self.ok && matches!(result, Err(SessionError::Serve(ServeError::Timeout)));
 
         if deadline_expired {
-            // A simultaneous UNSUBSCRIBE may have closed the shared state first,
+            // Simultaneous request cancellation may have closed the shared state first,
             // but the relay still needs the deadline result for its response and metric.
             if let Err(err) = &result {
                 let _ = self.forwarder.close(err.clone().into(), 0);
@@ -307,6 +460,8 @@ impl Subscribed {
         }
 
         if let Err(err) = &result {
+            // The forwarding error remains authoritative if a concurrent
+            // request cancellation already closed the shared state.
             let _ = self.forwarder.close(err.clone().into(), 0);
         }
         let terminal = self.finish().await;
@@ -324,6 +479,8 @@ impl Subscribed {
     ) -> Result<(), SessionError> {
         let res = self.serve_inner(track, deadline, largest_location).await;
         if let Err(err) = &res {
+            // The forwarding error remains authoritative if a concurrent
+            // request cancellation already closed the shared state.
             let _ = self.forwarder.close(err.clone().into(), 0);
         }
         let terminal = self.finish().await;
@@ -436,7 +593,7 @@ impl Drop for Subscribed {
                 reason: ReasonPhrase(err.to_string()),
             });
         } else {
-            // Draft-16 §9.8: subscription rejection uses REQUEST_ERROR, not the
+            // Draft-18 Section 10.6 uses REQUEST_ERROR for subscription rejection, not the
             // legacy SUBSCRIBE_ERROR.
             self.forwarder.publisher.send_request_error(
                 "subscribe",
@@ -467,7 +624,7 @@ impl Subscribed {
             ServeError::NotFound | ServeError::NotFoundWithId(_, _) => {
                 RequestErrorCode::DoesNotExist as u64
             }
-            // draft-18 §10.2.6 distinguishes the two: DOES_NOT_EXIST when the relay
+            // Draft-18 Section 10.2.6 distinguishes the two: DOES_NOT_EXIST when the relay
             // did not wait, TIMEOUT when it held the subscription and no publisher
             // arrived before the subscriber's RENDEZVOUS_TIMEOUT elapsed.
             ServeError::Timeout => RequestErrorCode::Timeout as u64,
@@ -544,7 +701,12 @@ impl ObjectForwarder {
                     Ok(None) => done = Some(Ok(())),
                     Err(err) => done = Some(Err(err)),
                 },
-                res = self.closed(), if done.is_none() || !tasks.is_empty() => return res.map_err(Into::into),
+                res = self.closed(), if done.is_none() || !tasks.is_empty() => {
+                    // Returning drops active subgroup futures. Their
+                    // SubgroupStream guards reset any stream that has not
+                    // reached FIN, including one blocked on a partial object.
+                    return res.map_err(SessionError::from);
+                },
                 res = tasks.next(), if !tasks.is_empty() => {
                     // Remaining subgroups still get their chance to send; the
                     // first local failure is reported once they settle.
@@ -554,8 +716,8 @@ impl ObjectForwarder {
                         }
                     }
                 },
-                // Reached only once both the subgroup source and `closed()` are
-                // disabled, which requires `done` to be set.
+                // Reached once the subgroup source has ended and every active
+                // subgroup task has settled.
                 else => {
                     // The track's own outcome is the authoritative one; a
                     // per-subgroup fault is only reported when the track itself
@@ -587,21 +749,11 @@ impl ObjectForwarder {
             subgroup_reader.priority
         );
 
-        let mut writer: Option<ResetOnDropWriter> = None;
-        let mut object_count = 0;
-        let mut previous_object_id = None;
-        let mut filtered_prefix = false;
         let metadata = subgroup_reader.metadata();
-        loop {
-            let mut subgroup_object_reader = match subgroup_reader.next().await {
-                Ok(Some(object)) => object,
-                Ok(None) => break,
-                Err(err) => {
-                    if let Some(writer) = writer.as_mut() {
-                        writer.reset(0);
-                    }
-                    return Err(err.into());
-                }
+        let mut filtered_prefix = false;
+        let first_object = loop {
+            let Some(subgroup_object_reader) = subgroup_reader.next().await? else {
+                return Ok(());
             };
             if !delivery_filter.allows(subgroup_reader.group_id, subgroup_object_reader.object_id) {
                 tracing::trace!(
@@ -613,59 +765,146 @@ impl ObjectForwarder {
                 continue;
             }
 
-            if writer.is_none() {
-                let header = data::SubgroupHeader {
-                    header_type: data::StreamHeaderType::subgroup(
-                        data::SubgroupIdMode::Explicit,
-                        metadata.has_properties,
-                        metadata.end_of_group,
-                        false,
-                        metadata.first_object && !filtered_prefix,
-                    ),
-                    track_alias,
-                    group_id: subgroup_reader.group_id,
-                    subgroup_id: Some(subgroup_reader.subgroup_id),
-                    publisher_priority: subgroup_reader.priority,
-                };
-                let mut send_stream = publisher.open_uni().await?;
-                tracing::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
+            break subgroup_object_reader;
+        };
 
-                // TODO figure out u32 vs u64 priority
-                send_stream.set_priority(subgroup_reader.priority as i32);
-                let mut new_writer = ResetOnDropWriter::new(Writer::new(send_stream));
-                stream_count.opened();
+        let header = data::SubgroupHeader {
+            header_type: data::StreamHeaderType::subgroup(
+                data::SubgroupIdMode::Explicit,
+                metadata.has_properties,
+                metadata.end_of_group,
+                false,
+                metadata.first_object && !filtered_prefix,
+            ),
+            track_alias,
+            group_id: subgroup_reader.group_id,
+            subgroup_id: Some(subgroup_reader.subgroup_id),
+            publisher_priority: subgroup_reader.priority,
+        };
+        let mut send_stream = publisher.open_uni().await?;
+        tracing::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
 
-                {
-                    let locked = state.lock();
-                    let closed = locked.closed.clone();
-                    closed?;
+        // TODO figure out u32 vs u64 priority
+        send_stream.set_priority(subgroup_reader.priority as i32);
+
+        let mut output = SubgroupOutput::stream(Writer::new(send_stream));
+        stream_count.opened();
+        let state_status = state.lock().closed.clone();
+        let res = if let Err(err) = state_status {
+            Err(err.into())
+        } else {
+            Self::serve_subgroup_objects(
+                header,
+                subgroup_reader,
+                first_object,
+                &mut output,
+                state,
+                mlog,
+                delivery_filter,
+            )
+            .await
+        };
+
+        // Draft-18 Section 11.4.3 requires a reset when forwarding stops before
+        // all subgroup objects required by the subscription have been delivered.
+        match res {
+            Ok(()) => output.finish(),
+            Err(err) => {
+                output.reset(Self::reset_code_for(&err));
+                Err(err)
+            }
+        }
+    }
+
+    /// Map a forwarding failure onto a draft-18 stream reset code.
+    fn reset_code_for(err: &SessionError) -> DataStreamResetCode {
+        match err {
+            SessionError::Serve(ServeError::Done | ServeError::Cancel) => {
+                DataStreamResetCode::Cancelled
+            }
+            SessionError::Serve(ServeError::Size) => DataStreamResetCode::MalformedTrack,
+            SessionError::Serve(ServeError::Closed(code)) => match *code {
+                code if code == message::PublishDoneCode::GoingAway as u64 => {
+                    DataStreamResetCode::GoingAway
                 }
-
-                tracing::trace!(
-                    "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
-                    header.track_alias,
-                    header.group_id,
-                    header.subgroup_id,
-                    header.publisher_priority,
-                    header.header_type
-                );
-
-                new_writer.encode(&header).await?;
-
-                // Log subgroup header created/sent
-                if let Some(ref mlog) = mlog {
-                    if let Ok(mut mlog_guard) = mlog.lock() {
-                        let time = mlog_guard.elapsed_ms();
-                        let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
-                        let event = mlog::subgroup_header_created(time, stream_id, &header);
-                        let _ = mlog_guard.add_event(event);
-                    }
+                code if code == message::PublishDoneCode::TooFarBehind as u64 => {
+                    DataStreamResetCode::TooFarBehind
                 }
+                code if code == message::PublishDoneCode::ExcessiveLoad as u64 => {
+                    DataStreamResetCode::ExcessiveLoad
+                }
+                code if code == message::PublishDoneCode::MalformedTrack as u64 => {
+                    DataStreamResetCode::MalformedTrack
+                }
+                _ => DataStreamResetCode::InternalError,
+            },
+            _ => DataStreamResetCode::InternalError,
+        }
+    }
 
-                writer = Some(new_writer);
+    async fn next_allowed_object(
+        subgroup_reader: &mut serve::SubgroupReader,
+        delivery_filter: DeliveryFilter,
+    ) -> Result<Option<serve::SubgroupObjectReader>, ServeError> {
+        while let Some(subgroup_object_reader) = subgroup_reader.next().await? {
+            if delivery_filter.allows(subgroup_reader.group_id, subgroup_object_reader.object_id) {
+                return Ok(Some(subgroup_object_reader));
             }
 
-            let writer = writer.as_mut().ok_or(SessionError::Internal)?;
+            tracing::trace!(
+                "[PUBLISHER] serve_subgroup: filtered object group_id={}, object_id={}",
+                subgroup_reader.group_id,
+                subgroup_object_reader.object_id
+            );
+        }
+
+        Ok(None)
+    }
+
+    async fn serve_subgroup_objects(
+        header: data::SubgroupHeader,
+        mut subgroup_reader: serve::SubgroupReader,
+        first_object: serve::SubgroupObjectReader,
+        output: &mut SubgroupOutput,
+        state: State<ObjectForwarderState>,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        delivery_filter: DeliveryFilter,
+    ) -> Result<(), SessionError> {
+        tracing::trace!(
+            "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
+            header.track_alias,
+            header.group_id,
+            header.subgroup_id,
+            header.publisher_priority,
+            header.header_type
+        );
+
+        output.encode(&header).await?;
+
+        // Log subgroup header created/sent
+        if let Some(ref mlog) = mlog {
+            if let Ok(mut mlog_guard) = mlog.lock() {
+                let time = mlog_guard.elapsed_ms();
+                let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
+                let event = mlog::subgroup_header_created(time, stream_id, &header);
+                let _ = mlog_guard.add_event(event);
+            }
+        }
+
+        let mut object_count = 0;
+        let mut previous_object_id = None;
+        let mut next_object = Some(first_object);
+        loop {
+            let mut subgroup_object_reader = match next_object.take() {
+                Some(reader) => reader,
+                None => {
+                    match Self::next_allowed_object(&mut subgroup_reader, delivery_filter).await? {
+                        Some(reader) => reader,
+                        None => break,
+                    }
+                }
+            };
+
             let object_id_delta = data::encode_object_id_delta(
                 &mut previous_object_id,
                 subgroup_object_reader.object_id,
@@ -687,14 +926,24 @@ impl ObjectForwarder {
                 subgroup_object_reader.extension_headers
             );
 
-            if metadata.has_properties {
+            // Check cancellation before the object header commits us to its
+            // payload length.
+            state
+                .lock_mut()
+                .ok_or(ServeError::Done)?
+                .update_largest_location(
+                    subgroup_reader.group_id,
+                    subgroup_object_reader.object_id,
+                )?;
+
+            if header.header_type.has_properties() {
                 let subgroup_object = data::SubgroupObjectExt {
                     object_id_delta,
                     extension_headers: subgroup_object_reader.extension_headers.clone(),
                     payload_length: subgroup_object_reader.size,
                     status,
                 };
-                writer.encode(&subgroup_object).await?;
+                output.encode(&subgroup_object).await?;
 
                 if let Some(ref mlog) = mlog {
                     if let Ok(mut mlog_guard) = mlog.lock() {
@@ -713,7 +962,6 @@ impl ObjectForwarder {
                 }
             } else {
                 if !subgroup_object_reader.extension_headers.is_empty() {
-                    writer.reset(0);
                     return Err(ServeError::internal_ctx(
                         "subgroup Object has properties without the PROPERTIES header bit",
                     )
@@ -724,7 +972,7 @@ impl ObjectForwarder {
                     payload_length: subgroup_object_reader.size,
                     status,
                 };
-                writer.encode(&subgroup_object).await?;
+                output.encode(&subgroup_object).await?;
 
                 if let Some(ref mlog) = mlog {
                     if let Ok(mut mlog_guard) = mlog.lock() {
@@ -742,14 +990,7 @@ impl ObjectForwarder {
                     }
                 }
             }
-
-            state
-                .lock_mut()
-                .ok_or(ServeError::Done)?
-                .update_largest_location(
-                    subgroup_reader.group_id,
-                    subgroup_object_reader.object_id,
-                )?;
+            output.begin_object(subgroup_object_reader.size);
 
             let mut chunks_sent = 0;
             let mut bytes_sent = 0;
@@ -757,10 +998,7 @@ impl ObjectForwarder {
                 let chunk = match subgroup_object_reader.read().await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => break,
-                    Err(err) => {
-                        writer.reset(0);
-                        return Err(err.into());
-                    }
+                    Err(err) => return Err(err.into()),
                 };
                 tracing::trace!(
                     "[PUBLISHER] serve_subgroup: sending payload chunk #{} for object #{} ({} bytes)",
@@ -769,7 +1007,7 @@ impl ObjectForwarder {
                     chunk.len()
                 );
                 bytes_sent += chunk.len();
-                writer.write(&chunk).await?;
+                output.write(&chunk).await?;
                 chunks_sent += 1;
             }
 
@@ -779,6 +1017,18 @@ impl ObjectForwarder {
                 chunks_sent,
                 bytes_sent
             );
+
+            if !output.at_object_boundary() {
+                tracing::warn!(
+                    group_id = subgroup_reader.group_id,
+                    object_id = subgroup_object_reader.object_id,
+                    promised = subgroup_object_reader.size,
+                    sent = bytes_sent,
+                    "upstream object ended short of its declared payload length"
+                );
+                return Err(ServeError::Size.into());
+            }
+
             object_count += 1;
         }
 
@@ -789,11 +1039,56 @@ impl ObjectForwarder {
             object_count
         );
 
-        if let Some(writer) = writer.as_mut() {
-            writer.finish()?;
-        }
-
         Ok(())
+    }
+
+    #[cfg(test)]
+    async fn serve_subgroup_to_parts(
+        header: data::SubgroupHeader,
+        mut subgroup_reader: serve::SubgroupReader,
+        state: State<ObjectForwarderState>,
+        stream_count: StreamCount,
+        delivery_filter: DeliveryFilter,
+    ) -> (
+        bytes::BytesMut,
+        Result<(), SessionError>,
+        Option<SubgroupTermination>,
+    ) {
+        let first_object =
+            match Self::next_allowed_object(&mut subgroup_reader, delivery_filter).await {
+                Ok(Some(first_object)) => first_object,
+                Ok(None) => return (bytes::BytesMut::new(), Ok(()), None),
+                Err(err) => return (bytes::BytesMut::new(), Err(err.into()), None),
+            };
+
+        let mut output = SubgroupOutput::buffer();
+        stream_count.opened();
+        let state_status = state.lock().closed.clone();
+        let res = if state_status.is_ok() {
+            Self::serve_subgroup_objects(
+                header,
+                subgroup_reader,
+                first_object,
+                &mut output,
+                state,
+                None,
+                delivery_filter,
+            )
+            .await
+        } else {
+            Err(ServeError::Done.into())
+        };
+
+        let res = match res {
+            Ok(()) => output.finish(),
+            Err(err) => {
+                output.reset(Self::reset_code_for(&err));
+                Err(err)
+            }
+        };
+
+        let (buffer, termination) = output.into_parts();
+        (buffer, res, termination)
     }
 
     async fn serve_datagrams(
@@ -1611,8 +1906,9 @@ mod tests {
             assert!(matches!(
                 reader.done().await,
                 Err(SessionError::WebTransport(web_transport::Error::Read(
-                    web_transport::quinn::ReadError::Reset(0)
+                    web_transport::quinn::ReadError::Reset(code)
                 )))
+                    if code == u32::from(DataStreamResetCode::Cancelled)
             ));
         };
         let cancel = async move {
@@ -1775,8 +2071,9 @@ mod tests {
             assert!(matches!(
                 reader.done().await,
                 Err(SessionError::WebTransport(web_transport::Error::Read(
-                    web_transport::quinn::ReadError::Reset(0)
+                    web_transport::quinn::ReadError::Reset(code)
                 )))
+                    if code == u32::from(DataStreamResetCode::Cancelled)
             ));
         };
         let cancel = async move {
@@ -1793,6 +2090,42 @@ mod tests {
             .unwrap();
         serve_result.unwrap();
         drop(subgroup_writer);
+    }
+
+    #[tokio::test]
+    async fn dropping_subgroup_stream_resets_the_peer() {
+        let (client, server) = crate::session::test_support::loopback_session_pair().await;
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let received = tokio::spawn(async move {
+            let mut stream = server.accept_uni().await.expect("accept subgroup stream");
+            let _ = accepted_tx.send(());
+            loop {
+                match stream.read(1024).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("unfinished subgroup ended with FIN"),
+                    Err(error) => return error,
+                }
+            }
+        });
+
+        let send = client.open_uni().await.expect("open subgroup stream");
+        let mut stream = SubgroupStream::new(Writer::new(send));
+        stream.writer.write(b"partial").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), accepted_rx)
+            .await
+            .expect("peer did not accept subgroup stream")
+            .expect("subgroup accept task ended");
+        drop(stream);
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), received)
+            .await
+            .expect("peer did not receive subgroup reset")
+            .expect("join subgroup receiver");
+        assert!(matches!(
+            error,
+            web_transport::Error::Read(web_transport::quinn::ReadError::Reset(code))
+                if code == DataStreamResetCode::Cancelled as u32
+        ));
     }
 
     #[tokio::test]
@@ -2076,6 +2409,371 @@ mod tests {
         let locked = recv.state.lock();
         assert!(locked.unsubscribed);
         assert!(matches!(locked.closed, Err(ServeError::Cancel)));
+    }
+
+    #[cfg(test)]
+    async fn subgroup_with_one_object() -> (serve::SubgroupReader, data::SubgroupHeader) {
+        use bytes::Bytes;
+
+        use crate::coding::TrackNamespace;
+
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "video").produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(serve::Subgroup {
+                group_id: 1,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        subgroup_writer.write(Bytes::from_static(b"hello")).unwrap();
+        drop(subgroup_writer);
+        drop(subgroups_writer);
+
+        let mut subgroups = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(subgroups) => subgroups,
+            _ => panic!("expected subgroups mode"),
+        };
+        let subgroup = subgroups.next().await.unwrap().expect("subgroup available");
+        let header = data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupIdExt,
+            track_alias: 1,
+            group_id: subgroup.group_id,
+            subgroup_id: Some(subgroup.subgroup_id),
+            publisher_priority: subgroup.priority,
+        };
+
+        (subgroup, header)
+    }
+
+    #[cfg(test)]
+    fn all_objects() -> DeliveryFilter {
+        DeliveryFilter {
+            forward: true,
+            start_location: None,
+            end_group_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_subgroup_writes_object_and_fin() {
+        use bytes::Buf;
+
+        use crate::coding::Decode;
+
+        let (subgroup, header) = subgroup_with_one_object().await;
+        let state = State::<ObjectForwarderState>::default();
+        let stream_count = StreamCount::default();
+
+        let (buffer, res, termination) = ObjectForwarder::serve_subgroup_to_parts(
+            header.clone(),
+            subgroup,
+            state.clone(),
+            stream_count.clone(),
+            all_objects(),
+        )
+        .await;
+
+        res.expect("serving a complete subgroup should succeed");
+        assert_eq!(termination, Some(SubgroupTermination::Fin));
+        assert_eq!(stream_count.get(), 1);
+
+        let mut buffer = buffer.freeze();
+        let header_type = data::StreamHeaderType::decode(&mut buffer).unwrap();
+        assert_eq!(
+            data::SubgroupHeader::decode(header_type, &mut buffer).unwrap(),
+            header
+        );
+
+        let object = data::SubgroupObjectExt::decode(&mut buffer).unwrap();
+        assert_eq!(object.payload_length, 5);
+        assert_eq!(&buffer.copy_to_bytes(object.payload_length)[..], b"hello");
+        assert!(!buffer.has_remaining());
+    }
+
+    #[tokio::test]
+    async fn filtered_subgroup_does_not_open_stream() {
+        let (subgroup, header) = subgroup_with_one_object().await;
+        let state = State::<ObjectForwarderState>::default();
+        let stream_count = StreamCount::default();
+
+        let (buffer, res, termination) = ObjectForwarder::serve_subgroup_to_parts(
+            header,
+            subgroup,
+            state.clone(),
+            stream_count.clone(),
+            DeliveryFilter {
+                forward: false,
+                start_location: None,
+                end_group_id: None,
+            },
+        )
+        .await;
+
+        res.expect("filtering a subgroup should succeed");
+        assert!(buffer.is_empty());
+        assert_eq!(termination, None);
+        assert_eq!(stream_count.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_resets_at_an_object_boundary() {
+        use bytes::{Buf, Bytes};
+
+        use crate::coding::{Decode, TrackNamespace};
+
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "video").produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(serve::Subgroup {
+                group_id: 1,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+
+        subgroup_writer.write(Bytes::from_static(b"hello")).unwrap();
+
+        let mut subgroups = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(subgroups) => subgroups,
+            _ => panic!("expected subgroups mode"),
+        };
+        let subgroup = subgroups.next().await.unwrap().expect("subgroup available");
+        let header = data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupIdExt,
+            track_alias: 1,
+            group_id: subgroup.group_id,
+            subgroup_id: Some(subgroup.subgroup_id),
+            publisher_priority: subgroup.priority,
+        };
+
+        let (cancel_handle, state) = State::new(ObjectForwarderState {
+            largest_location: Some(Location::new(0, 0)),
+            ..Default::default()
+        })
+        .split();
+        let observer = state.clone();
+
+        let fut = ObjectForwarder::serve_subgroup_to_parts(
+            header.clone(),
+            subgroup,
+            state,
+            StreamCount::default(),
+            all_objects(),
+        );
+        tokio::pin!(fut);
+
+        loop {
+            let changed = {
+                let current = observer.lock();
+                if current.largest_location == Some(Location::new(1, 0)) {
+                    break;
+                }
+                current
+                    .modified()
+                    .expect("forwarder state should remain open")
+            };
+
+            tokio::select! {
+                _ = changed => {},
+                _ = &mut fut => panic!("forwarder should await the next object"),
+            }
+        }
+
+        drop(cancel_handle);
+        subgroup_writer.write(Bytes::from_static(b"world")).unwrap();
+
+        let (buffer, res, termination) = fut.await;
+
+        assert!(matches!(res, Err(SessionError::Serve(ServeError::Done))));
+        assert_eq!(
+            termination,
+            Some(SubgroupTermination::Reset(DataStreamResetCode::Cancelled)),
+            "an incomplete subgroup must be reset"
+        );
+
+        let mut buffer = buffer.freeze();
+        let header_type = data::StreamHeaderType::decode(&mut buffer).unwrap();
+        assert_eq!(
+            data::SubgroupHeader::decode(header_type, &mut buffer).unwrap(),
+            header
+        );
+
+        let object = data::SubgroupObjectExt::decode(&mut buffer).unwrap();
+        assert_eq!(object.payload_length, 5);
+        assert_eq!(&buffer.copy_to_bytes(object.payload_length)[..], b"hello");
+        assert!(
+            !buffer.has_remaining(),
+            "no partial object should follow the last complete one"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_stops_a_partial_object_after_source_closes() {
+        use bytes::Bytes;
+
+        use crate::coding::TrackNamespace;
+
+        let (mut subscribed, mut recv, _outgoing, _responses) = test_subscribed().await;
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(serve::Subgroup {
+                group_id: 1,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        let mut object_writer = subgroup_writer.create(5, None).unwrap();
+        object_writer.write(Bytes::from_static(b"hel")).unwrap();
+
+        let stream_count = subscribed.forwarder.stream_count_handle();
+        let serve = subscribed.forwarder.serve(track_reader, all_objects());
+        tokio::pin!(serve);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if stream_count.get() == 1 {
+                    break;
+                }
+                tokio::select! {
+                    result = &mut serve => panic!("serve ended before opening a stream: {result:?}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        })
+        .await
+        .expect("subgroup stream did not open");
+
+        // The source can end while its latest subgroup still has an incomplete
+        // object. Cancellation must continue to interrupt that subgroup.
+        drop(subgroups_writer);
+        recv.recv_unsubscribe().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut serve)
+            .await
+            .expect("UNSUBSCRIBE did not stop the partial object");
+        assert!(matches!(
+            result,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+
+        drop(object_writer);
+        drop(subgroup_writer);
+    }
+
+    #[tokio::test]
+    async fn short_object_resets_subgroup_as_malformed() {
+        use bytes::Bytes;
+
+        use crate::coding::{Decode, TrackNamespace};
+
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "video").produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(serve::Subgroup {
+                group_id: 1,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        let mut object_writer = subgroup_writer.create(5, None).unwrap();
+        object_writer.write(Bytes::from_static(b"hel")).unwrap();
+        drop(object_writer);
+        drop(subgroup_writer);
+        drop(subgroups_writer);
+
+        let mut subgroups = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(subgroups) => subgroups,
+            _ => panic!("expected subgroups mode"),
+        };
+        let subgroup = subgroups.next().await.unwrap().expect("subgroup available");
+        let header = data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupIdExt,
+            track_alias: 1,
+            group_id: subgroup.group_id,
+            subgroup_id: Some(subgroup.subgroup_id),
+            publisher_priority: subgroup.priority,
+        };
+
+        let (buffer, res, termination) = ObjectForwarder::serve_subgroup_to_parts(
+            header,
+            subgroup,
+            State::default(),
+            StreamCount::default(),
+            all_objects(),
+        )
+        .await;
+
+        assert!(matches!(res, Err(SessionError::Serve(ServeError::Size))));
+        assert_eq!(
+            termination,
+            Some(SubgroupTermination::Reset(
+                DataStreamResetCode::MalformedTrack
+            ))
+        );
+
+        let mut buffer = buffer.freeze();
+        let header_type = data::StreamHeaderType::decode(&mut buffer).unwrap();
+        data::SubgroupHeader::decode(header_type, &mut buffer).unwrap();
+        let object = data::SubgroupObjectExt::decode(&mut buffer).unwrap();
+        assert_eq!(object.payload_length, 5);
+        assert_eq!(&buffer[..], b"hel");
+    }
+
+    #[tokio::test]
+    async fn finish_mid_object_resets_instead_of_truncating() {
+        let mut output = SubgroupOutput::buffer();
+
+        output.begin_object(10);
+        output.write(b"abc").await.unwrap();
+        assert!(!output.at_object_boundary());
+
+        let err = output.finish().expect_err("FIN mid-object must be refused");
+        assert!(matches!(err, SessionError::Serve(ServeError::Size)));
+
+        let (_buffer, termination) = output.into_parts();
+        assert_eq!(
+            termination,
+            Some(SubgroupTermination::Reset(
+                DataStreamResetCode::InternalError
+            ))
+        );
+    }
+
+    #[test]
+    fn forwarding_failures_use_matching_reset_codes() {
+        assert_eq!(
+            ObjectForwarder::reset_code_for(&ServeError::Done.into()),
+            DataStreamResetCode::Cancelled
+        );
+        assert_eq!(
+            ObjectForwarder::reset_code_for(&ServeError::Cancel.into()),
+            DataStreamResetCode::Cancelled
+        );
+        assert_eq!(
+            ObjectForwarder::reset_code_for(&ServeError::Size.into()),
+            DataStreamResetCode::MalformedTrack
+        );
+        assert_eq!(
+            ObjectForwarder::reset_code_for(
+                &ServeError::Closed(message::PublishDoneCode::TooFarBehind as u64).into()
+            ),
+            DataStreamResetCode::TooFarBehind
+        );
+        assert_eq!(
+            ObjectForwarder::reset_code_for(
+                &ServeError::Closed(message::PublishDoneCode::TrackEnded as u64).into()
+            ),
+            DataStreamResetCode::InternalError
+        );
+        assert_eq!(
+            ObjectForwarder::reset_code_for(&ServeError::internal_ctx("boom").into()),
+            DataStreamResetCode::InternalError
+        );
     }
 
     #[test]

@@ -64,6 +64,146 @@ struct SubscribeNamespaceCleanup {
     active: bool,
 }
 
+/// Releases an outbound SUBSCRIBE's track-name reservation until its receive
+/// state is registered and takes ownership of cleanup.
+struct SubscribeCleanup {
+    subscriber: Subscriber,
+    request_id: u64,
+    active: bool,
+}
+
+/// Cleans session state whether a SUBSCRIBE stream pump returns or is dropped
+/// by structured-concurrency shutdown.
+struct SubscribeStreamCleanup {
+    subscriber: Subscriber,
+    request_id: u64,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+    active: bool,
+}
+
+/// Resets both halves when opening a request is cancelled before its response
+/// pump takes ownership of the stream.
+struct OpeningRequestStream {
+    session: web_transport::Session,
+    writer: Option<Writer>,
+    reader: Option<Reader>,
+}
+
+enum SubscribeStreamEvent {
+    Cancel(Result<u32, tokio::sync::oneshot::error::RecvError>),
+    Outgoing(Option<Message>),
+    Response(Result<Message, SessionError>),
+}
+
+struct DrainFinalizer {
+    subscriber: Subscriber,
+    request_id: u64,
+    expire: fn(&Subscriber, u64),
+}
+
+impl Drop for DrainFinalizer {
+    fn drop(&mut self) {
+        (self.expire)(&self.subscriber, self.request_id);
+    }
+}
+
+impl SubscribeStreamCleanup {
+    fn new(
+        subscriber: Subscriber,
+        request_id: u64,
+        done: tokio::sync::oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            subscriber,
+            request_id,
+            done: Some(done),
+            active: true,
+        }
+    }
+
+    fn complete(mut self, result: &Result<(), SessionError>) {
+        if result.as_ref().is_err_and(|err| err.is_session_fatal()) {
+            return;
+        }
+
+        self.active = false;
+        self.subscriber.abort_subscribe(self.request_id);
+    }
+}
+
+impl OpeningRequestStream {
+    fn new(
+        session: web_transport::Session,
+        send: web_transport::SendStream,
+        recv: web_transport::RecvStream,
+    ) -> Self {
+        Self {
+            session,
+            writer: Some(Writer::new(send)),
+            reader: Some(Reader::new(recv)),
+        }
+    }
+
+    fn into_parts(mut self) -> Result<(Writer, Reader), SessionError> {
+        let writer = self.writer.take().ok_or(SessionError::Internal)?;
+        let reader = self.reader.take().ok_or(SessionError::Internal)?;
+        Ok((writer, reader))
+    }
+}
+
+impl Drop for OpeningRequestStream {
+    fn drop(&mut self) {
+        let cancelled = self.writer.is_some() || self.reader.is_some();
+        if let Some(writer) = &mut self.writer {
+            writer.reset(super::CANCELLED_STREAM_CODE);
+        }
+        if let Some(reader) = &mut self.reader {
+            reader.stop(super::CANCELLED_STREAM_CODE);
+        }
+        if cancelled {
+            self.session.close(
+                super::CANCELLED_STREAM_CODE,
+                "request stream opening cancelled",
+            );
+        }
+    }
+}
+
+impl Drop for SubscribeStreamCleanup {
+    fn drop(&mut self) {
+        if self.active {
+            if let Some(mut subscribe) = self.subscriber.remove_subscribe(self.request_id) {
+                subscribe.finish(ServeError::Cancel);
+            }
+        }
+        if let Some(done) = self.done.take() {
+            let _ = done.send(());
+        }
+    }
+}
+
+impl SubscribeCleanup {
+    fn new(subscriber: Subscriber, request_id: u64) -> Self {
+        Self {
+            subscriber,
+            request_id,
+            active: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for SubscribeCleanup {
+    fn drop(&mut self) {
+        if self.active {
+            self.subscriber.drop_subscribe_name(self.request_id);
+        }
+    }
+}
+
 impl SubscribeNamespaceCleanup {
     fn new(subscriber: Subscriber, request_id: u64) -> Self {
         Self {
@@ -149,7 +289,7 @@ impl TrackAliasRegistry {
 #[derive(Clone)]
 pub struct Subscriber {
     /// Active inbound PUBLISH_NAMESPACE messages, keyed by namespace.
-    published_namespaces: Arc<Mutex<HashMap<TrackNamespace, PublishedNamespaceRecv>>>,
+    published_namespaces: Arc<Mutex<HashMap<TrackNamespace, u64>>>,
 
     /// Queue of inbound PUBLISH_NAMESPACE events waiting to be consumed by the application.
     published_namespace_queue: Queue<PublishedNamespace>,
@@ -289,6 +429,10 @@ impl Subscriber {
         Ok((session, subscriber))
     }
 
+    pub(super) fn close_session(&self, code: u32, reason: &str) {
+        self.webtransport.close(code, reason);
+    }
+
     /// Wait for the next inbound PUBLISH_NAMESPACE from the peer, if any.
     pub async fn published_namespace(&mut self) -> Option<PublishedNamespace> {
         self.published_namespace_queue.pop().await
@@ -316,11 +460,6 @@ impl Subscriber {
 
     fn log_request_error_created(&self, request_kind: &str, msg: &message::RequestError) {
         self.add_mlog_event(|time| mlog::events::request_error_created(time, 0, request_kind, msg));
-    }
-
-    pub(super) fn send_request_ok(&mut self, request_kind: &str, msg: message::RequestOk) {
-        self.add_mlog_event(|time| mlog::events::request_ok_created(time, 0, request_kind, &msg));
-        self.send_message(msg);
     }
 
     pub(super) fn send_request_error(&mut self, request_kind: &str, msg: message::RequestError) {
@@ -379,9 +518,11 @@ impl Subscriber {
         let frame = super::encode_request_frame(msg)?;
 
         let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
-        let mut writer = Writer::new(send_stream);
+        let mut opening =
+            OpeningRequestStream::new(self.webtransport.clone(), send_stream, recv_stream);
+        let writer = opening.writer.as_mut().ok_or(SessionError::Internal)?;
         writer.write(&frame).await?;
-        Ok((writer, Reader::new(recv_stream)))
+        opening.into_parts()
     }
 
     /// Send a TRACK_STATUS request for a track.
@@ -441,6 +582,28 @@ impl Subscriber {
         track: serve::TrackWriter,
         params: KeyValuePairs,
     ) -> Result<Subscribe, ServeError> {
+        let send = self.subscribe_start_with_params(track, params).await?;
+        send.ok().await?;
+        Ok(send)
+    }
+
+    /// Start a SUBSCRIBE request without waiting for acknowledgement.
+    ///
+    /// This is useful when cancellation must race the peer's response and then
+    /// wait for request-stream teardown through [`Subscribe::unsubscribe`].
+    pub async fn subscribe_start(
+        &mut self,
+        track: serve::TrackWriter,
+    ) -> Result<Subscribe, ServeError> {
+        self.subscribe_start_with_params(track, KeyValuePairs::default())
+            .await
+    }
+
+    async fn subscribe_start_with_params(
+        &mut self,
+        track: serve::TrackWriter,
+        params: KeyValuePairs,
+    ) -> Result<Subscribe, ServeError> {
         let request_id = self
             .get_next_request_id()
             .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
@@ -448,7 +611,7 @@ impl Subscriber {
         // §5.1: at most one subscriber-role subscription per track. Outbound
         // SUBSCRIBE and inbound PUBLISH both make this endpoint the subscriber,
         // so they share one registry. Reserved before the stream is opened;
-        // `remove_subscribe` releases it.
+        // `SubscribeCleanup` releases it until the receive state is registered.
         let full_name = FullTrackName {
             namespace: track.namespace.clone(),
             name: track.name.clone(),
@@ -463,19 +626,17 @@ impl Subscriber {
             }
             names.insert(full_name, request_id);
         }
+        let cleanup = SubscribeCleanup::new(self.clone(), request_id);
 
-        let (send, recv, subscribe) = match Subscribe::new(self.clone(), request_id, track, params)
-        {
-            Ok(subscribe) => subscribe,
-            Err(err) => {
-                if let Ok(mut names) = self.subscriber_names.lock() {
-                    names.remove_by_request_id(request_id);
+        let (mut send, recv, subscribe) =
+            match Subscribe::new(self.clone(), request_id, track, params) {
+                Ok(subscribe) => subscribe,
+                Err(err) => {
+                    return Err(ServeError::internal_ctx(format!(
+                        "invalid subscribe parameters: {err}"
+                    )));
                 }
-                return Err(ServeError::internal_ctx(format!(
-                    "invalid subscribe parameters: {err}"
-                )));
-            }
-        };
+            };
 
         // Open a bidi stream and send the SUBSCRIBE message BEFORE
         // registering in the subscribes map — avoids a leaked entry if
@@ -487,9 +648,6 @@ impl Subscriber {
             match self.open_request_stream(&subscribe_msg).await {
                 Ok(streams) => streams,
                 Err(e) => {
-                    if let Ok(mut names) = self.subscriber_names.lock() {
-                        names.remove_by_request_id(request_id);
-                    }
                     return Err(ServeError::internal_ctx(format!(
                         "failed to open request stream: {}",
                         e
@@ -503,58 +661,137 @@ impl Subscriber {
         match self.subscribes.lock() {
             Ok(mut subscribes) => {
                 subscribes.insert(request_id, recv);
+                cleanup.disarm();
             }
             Err(_) => {
                 tracing::warn!(
                     request_id,
                     "subscribes lock poisoned after bidi stream open; finishing stream"
                 );
-                if let Ok(mut names) = self.subscriber_names.lock() {
-                    names.remove_by_request_id(request_id);
-                }
                 let _ = request_writer.finish();
                 return Err(ServeError::internal_ctx("subscribe lock poisoned"));
             }
         }
 
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<Message>(2);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+
         // Hand a reader future for bidi stream responses (draft-18) to
         // Session::run, which polls it cooperatively (structured concurrency).
         // No task is spawned; the future is dropped/cancelled on session exit.
         let mut subscriber_clone = self.clone();
-        let _ = self.bidi_task_tx.send(Box::pin(async move {
-            let result = loop {
-                match Session::decode_bidi_response(&mut response_reader, request_id).await {
-                    Ok(msg) => {
-                        if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg) {
-                            // Returning rather than breaking lets Session::run decide:
-                            // a protocol violation closes the session, anything else is
-                            // logged there and only this stream ends.
-                            if let Err(err) = subscriber_clone.recv_message(pub_msg) {
-                                break Err(err);
+        let stream_cleanup =
+            SubscribeStreamCleanup::new(subscriber_clone.clone(), request_id, done_tx);
+        if self
+            .bidi_task_tx
+            .send(Box::pin(async move {
+                let mut writing = true;
+                let mut cancellation_open = true;
+                let result = 'response: loop {
+                    let event = tokio::select! {
+                        biased;
+                        cancel = &mut cancel_rx, if cancellation_open => {
+                            SubscribeStreamEvent::Cancel(cancel)
+                        }
+                        outgoing = stream_rx.recv(), if writing => {
+                            SubscribeStreamEvent::Outgoing(outgoing)
+                        }
+                        response = Session::decode_bidi_response(&mut response_reader, request_id) => {
+                            SubscribeStreamEvent::Response(response)
+                        }
+                    };
+
+                    match event {
+                        SubscribeStreamEvent::Cancel(cancel) => {
+                            match cancel {
+                                Ok(code) => {
+                                    request_writer.reset(code);
+                                    response_reader.stop(code);
+                                    writing = false;
+                                    break Ok(());
+                                }
+                                Err(_) => cancellation_open = false,
+                            }
+                        }
+                        SubscribeStreamEvent::Outgoing(outgoing) => {
+                            let Some(outgoing) = outgoing else {
+                                let _ = request_writer.finish();
+                                writing = false;
+                                continue;
+                            };
+                            let mut write = Box::pin(Session::encode_bidi_response(
+                                &mut request_writer,
+                                &outgoing,
+                            ));
+                            let write_result: Result<Result<(), SessionError>, u32> = loop {
+                                tokio::select! {
+                                    biased;
+                                    cancel = &mut cancel_rx, if cancellation_open => {
+                                        match cancel {
+                                            Ok(code) => break Err(code),
+                                            Err(_) => cancellation_open = false,
+                                        }
+                                    }
+                                    result = &mut write => break Ok(result),
+                                }
+                            };
+                            drop(write);
+
+                            match write_result {
+                                Err(code) => {
+                                    request_writer.reset(code);
+                                    response_reader.stop(code);
+                                    writing = false;
+                                    break 'response Ok(());
+                                }
+                                Ok(Err(err)) => {
+                                    tracing::debug!(request_id, error = %err, "failed writing on SUBSCRIBE request stream");
+                                    request_writer.reset(super::CANCELLED_STREAM_CODE);
+                                    response_reader.stop(super::CANCELLED_STREAM_CODE);
+                                    writing = false;
+                                    break 'response Ok(());
+                                }
+                                Ok(Ok(())) => {}
+                            }
+                            let _ = request_writer.finish();
+                            writing = false;
+                        }
+                        SubscribeStreamEvent::Response(response) => {
+                            match response {
+                                Ok(msg) => {
+                                    let terminal = matches!(msg, Message::PublishDone(_) | Message::RequestError(_));
+                                    if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg) {
+                                        if let Err(err) = subscriber_clone.recv_message(pub_msg) {
+                                            break Err(err);
+                                        }
+                                    }
+                                    if terminal {
+                                        break Ok(());
+                                    }
+                                }
+                                Err(err) if err.is_stream_ended() => break Ok(()),
+                                Err(err) => break Err(err),
                             }
                         }
                     }
-                    Err(err) if err.is_stream_ended() => break Ok(()),
-                    Err(err) => break Err(err),
+                };
+
+                if writing {
+                    let _ = request_writer.finish();
                 }
-            };
-
-            // Runs on every exit path. Harmless once the subscription is
-            // established, since the entry is gone by then.
-            subscriber_clone.abort_subscribe(request_id);
-            result
-        }));
-
-        // Cleanly finish (FIN) the request stream's send side now that the
-        // SUBSCRIBE has been flushed; we never write again on this stream.
-        // Placed before `send.ok().await?` so the FIN is sent on every exit
-        // path that holds the writer — both the happy path and a failed ack —
-        // rather than letting the drop emit RESET_STREAM(0).
-        if let Err(err) = request_writer.finish() {
-            tracing::debug!(request_id, error = %err, "failed to FIN SUBSCRIBE request stream");
+                stream_cleanup.complete(&result);
+                result
+            }))
+            .is_err()
+        {
+            self.abort_subscribe(request_id);
+            return Err(ServeError::internal_ctx(
+                "session request task queue closed",
+            ));
         }
 
-        send.ok().await?;
+        send.set_stream(stream_tx, done_rx, cancel_tx);
         Ok(send)
     }
 
@@ -641,13 +878,6 @@ impl Subscriber {
     pub(super) fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
         let msg = msg.into();
 
-        // Remove our entry on terminal state.
-        // Draft-16: PUBLISH_NAMESPACE_CANCEL carries Request ID, so look up
-        // the namespace by iterating the map.
-        if let message::Subscriber::PublishNamespaceCancel(msg) = &msg {
-            let _ = self.drop_publish_namespace(msg.id);
-        }
-
         // TODO report dropped messages?
         let _ = self.outgoing.push(msg.into());
     }
@@ -655,9 +885,15 @@ impl Subscriber {
     /// Receive a message from the publisher via the control stream.
     pub(super) fn recv_message(&mut self, msg: message::Publisher) -> Result<(), SessionError> {
         match &msg {
-            message::Publisher::PublishNamespace(msg) => self.recv_publish_namespace(msg)?,
-            message::Publisher::PublishNamespaceDone(msg) => {
-                self.recv_publish_namespace_done(msg)?;
+            message::Publisher::PublishNamespace(_) => {
+                return Err(SessionError::ProtocolViolation(
+                    "PUBLISH_NAMESPACE must start a request stream".to_string(),
+                ));
+            }
+            message::Publisher::PublishNamespaceDone(_) => {
+                return Err(SessionError::ProtocolViolation(
+                    "PUBLISH_NAMESPACE_DONE is not part of draft-18".to_string(),
+                ));
             }
             message::Publisher::Publish(msg) => self.recv_publish(msg)?,
             message::Publisher::PublishDone(msg) => self.recv_publish_done(msg)?,
@@ -679,42 +915,28 @@ impl Subscriber {
     }
 
     /// Handle reception of an inbound PUBLISH_NAMESPACE from the publisher.
-    fn recv_publish_namespace(
+    pub(super) fn recv_publish_namespace(
         &mut self,
         msg: &message::PublishNamespace,
-    ) -> Result<(), SessionError> {
+    ) -> Result<PublishedNamespaceRecv, SessionError> {
         let mut published_namespaces = self
             .published_namespaces
             .lock()
             .map_err(|_| SessionError::Internal)?;
 
         // Duplicate PUBLISH_NAMESPACE for the same namespace within a session is invalid.
-        let entry = match published_namespaces.entry(msg.track_namespace.clone()) {
+        match published_namespaces.entry(msg.track_namespace.clone()) {
             hash_map::Entry::Occupied(_) => return Err(SessionError::Duplicate),
-            hash_map::Entry::Vacant(entry) => entry,
+            hash_map::Entry::Vacant(entry) => entry.insert(msg.id),
         };
+        drop(published_namespaces);
 
         let (published_ns, recv) =
             PublishedNamespace::new(self.clone(), msg.id, msg.track_namespace.clone());
         if let Err(published_ns) = self.published_namespace_queue.push(published_ns) {
             published_ns.close(ServeError::Cancel)?;
-            return Ok(());
         }
-        entry.insert(recv);
-
-        Ok(())
-    }
-
-    /// Handle reception of PUBLISH_NAMESPACE_DONE from the publisher.
-    fn recv_publish_namespace_done(
-        &mut self,
-        msg: &message::PublishNamespaceDone,
-    ) -> Result<(), SessionError> {
-        // Draft-16 §9.22: PUBLISH_NAMESPACE_DONE carries Request ID, not namespace.
-        if let Some(recv) = self.drop_publish_namespace(msg.id) {
-            recv.recv_done()?;
-        }
-        Ok(())
+        Ok(recv)
     }
 
     /// Handle the reception of a SubscribeOk message from the publisher.
@@ -770,10 +992,14 @@ impl Subscriber {
         if let Ok(mut aliases) = self.track_alias_map.lock() {
             aliases.remove_by_request_id(id);
         }
+        self.drop_subscribe_name(id);
+        Some(subscribe)
+    }
+
+    fn drop_subscribe_name(&self, id: u64) {
         if let Ok(mut names) = self.subscriber_names.lock() {
             names.remove_by_request_id(id);
         }
-        Some(subscribe)
     }
 
     /// Handle an outbound SUBSCRIBE whose request stream ended.
@@ -1030,10 +1256,14 @@ impl Subscriber {
     }
 
     fn arm_drain(&self, request_id: u64, expire: fn(&Subscriber, u64)) {
-        let session = self.clone();
+        let finalizer = DrainFinalizer {
+            subscriber: self.clone(),
+            request_id,
+            expire,
+        };
         let drain = async move {
             tokio::time::sleep(PUBLISH_DONE_DRAIN_TIMEOUT).await;
-            expire(&session, request_id);
+            drop(finalizer);
             Ok(())
         };
 
@@ -1044,7 +1274,6 @@ impl Subscriber {
                 request_id,
                 "session is shutting down; ending draining subscription now"
             );
-            expire(self, request_id);
         }
     }
 
@@ -1149,7 +1378,7 @@ impl Subscriber {
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
             self.log_request_error_parsed("subscribe", msg);
             let err = Self::request_error_to_serve_error(msg);
-            subscribe.error(err)?;
+            subscribe.reject(err)?;
         } else {
             self.log_request_error_parsed("unknown", msg);
         }
@@ -1420,17 +1649,16 @@ impl Subscriber {
         }
     }
 
-    fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishedNamespaceRecv> {
+    pub(super) fn remove_published_namespace(&self, id: u64) {
         if let Ok(mut ns) = self.published_namespaces.lock() {
             let key = ns
                 .iter()
-                .find(|(_k, v)| v.request_id == id)
+                .find(|(_k, request_id)| **request_id == id)
                 .map(|(k, _)| k.clone());
             if let Some(key) = key {
-                return ns.remove(&key);
+                ns.remove(&key);
             }
         }
-        None
     }
 
     /// Resolve a Track Alias to its owning subscription, waiting up to the
@@ -2522,6 +2750,416 @@ mod tests {
                 crate::coding::EncodeError::InvalidValue
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn dropping_an_opening_request_resets_a_partial_frame() {
+        let (client, server) = loopback_session_pair().await;
+        let (send, recv) = client.open_bi().await.unwrap();
+        let mut opening = OpeningRequestStream::new(client.clone(), send, recv);
+        opening
+            .writer
+            .as_mut()
+            .unwrap()
+            .write(&[0x4])
+            .await
+            .unwrap();
+
+        let (_peer_send, peer_recv) = server.accept_bi().await.unwrap();
+        let mut peer_reader = Reader::new(peer_recv);
+        assert!(peer_reader.read_chunk(1).await.unwrap().is_some());
+        drop(opening);
+
+        let err = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match peer_reader.read_chunk(64 * 1024).await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => panic!("partially written request finished with FIN"),
+                    Err(err) => break err,
+                }
+            }
+        })
+        .await
+        .expect("peer did not receive the request reset");
+        assert!(err.is_stream_error());
+    }
+
+    #[tokio::test]
+    async fn subscribe_fails_when_the_session_task_queue_is_closed() {
+        let mut subscriber = test_subscriber(loopback_session().await);
+        let (writer, _reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), "video").produce();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            subscriber.subscribe_open(writer),
+        )
+        .await
+        .expect("subscribe did not notice the closed task queue");
+        let _error = match result {
+            Ok(_) => panic!("subscribe should fail when its response task cannot run"),
+            Err(error) => error,
+        };
+
+        assert!(subscriber.subscribes.lock().unwrap().is_empty());
+        assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_while_request_stream_is_blocked_releases_track_name() {
+        let (client, _server) = loopback_session_pair().await;
+        let mut streams = Vec::new();
+
+        // Exhaust the peer's bidi stream credit so subscribe_open reaches its
+        // first cancellable await after reserving the track name.
+        loop {
+            match tokio::time::timeout(Duration::from_millis(20), client.open_bi()).await {
+                Ok(Ok(stream)) => streams.push(stream),
+                Ok(Err(err)) => panic!("failed to open saturation stream: {err}"),
+                Err(_) => break,
+            }
+            assert!(streams.len() < 1024, "bidi stream credit was not bounded");
+        }
+
+        let (mut subscriber, _bidi_task_rx) = test_subscriber_with_tasks(client);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                subscriber.subscribe_open(test_track("blocked")),
+            )
+            .await
+            .is_err(),
+            "SUBSCRIBE unexpectedly opened without bidi stream credit"
+        );
+        assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_accepted_subscribe_sends_unsubscribe_on_request_stream() {
+        let (client, server) = loopback_session_pair().await;
+        let (mut subscriber, mut bidi_task_rx) = test_subscriber_with_tasks(client);
+
+        let peer = tokio::spawn(async move {
+            let (peer_send, peer_recv) = server.accept_bi().await.unwrap();
+            let mut peer_writer = Writer::new(peer_send);
+            let mut peer_reader = Reader::new(peer_recv);
+            let request_id = match peer_reader.decode::<Message>().await.unwrap() {
+                Message::Subscribe(msg) => msg.id,
+                msg => panic!("unexpected request: {}", msg.name()),
+            };
+
+            Session::encode_bidi_response(
+                &mut peer_writer,
+                &Message::SubscribeOk(message::SubscribeOk {
+                    id: request_id,
+                    track_alias: 42,
+                    params: Default::default(),
+                    track_extensions: Default::default(),
+                }),
+            )
+            .await
+            .unwrap();
+
+            let message = Session::decode_bidi_response(&mut peer_reader, request_id)
+                .await
+                .unwrap();
+            peer_writer.finish().unwrap();
+            message
+        });
+
+        let opening = tokio::spawn(async move {
+            let result = subscriber.subscribe_open(test_track("video")).await;
+            (subscriber, result)
+        });
+        let pump = tokio::time::timeout(Duration::from_secs(2), bidi_task_rx.recv())
+            .await
+            .expect("SUBSCRIBE response pump was not registered")
+            .expect("SUBSCRIBE response pump queue closed");
+        let pump = tokio::spawn(pump);
+
+        let (subscriber, subscribe) = opening.await.unwrap();
+        drop(subscribe.unwrap());
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), peer)
+                .await
+                .expect("peer did not receive UNSUBSCRIBE")
+                .unwrap(),
+            Message::Unsubscribe(message::Unsubscribe { id: 0 })
+        ));
+        tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("SUBSCRIBE response pump did not stop")
+            .unwrap()
+            .unwrap();
+        assert!(subscriber.subscribes.lock().unwrap().is_empty());
+        assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_resets_a_request_stream_the_peer_does_not_finish() {
+        let (client, server) = loopback_session_pair().await;
+        let (mut subscriber, mut bidi_task_rx) = test_subscriber_with_tasks(client);
+
+        let peer = tokio::spawn(async move {
+            let (peer_send, peer_recv) = server.accept_bi().await.unwrap();
+            let mut peer_writer = Writer::new(peer_send);
+            let mut peer_reader = Reader::new(peer_recv);
+            let request_id = match peer_reader.decode::<Message>().await.unwrap() {
+                Message::Subscribe(msg) => msg.id,
+                msg => panic!("unexpected request: {}", msg.name()),
+            };
+
+            Session::encode_bidi_response(
+                &mut peer_writer,
+                &Message::SubscribeOk(message::SubscribeOk {
+                    id: request_id,
+                    track_alias: 42,
+                    params: Default::default(),
+                    track_extensions: Default::default(),
+                }),
+            )
+            .await
+            .unwrap();
+
+            let message = Session::decode_bidi_response(&mut peer_reader, request_id)
+                .await
+                .unwrap();
+            let _ = peer_reader.done().await;
+            let response_stopped = peer_writer.closed().await.unwrap();
+            (message, response_stopped)
+        });
+
+        let mut subscribe = subscriber
+            .subscribe_start(test_track("video"))
+            .await
+            .unwrap();
+        let pump = tokio::spawn(bidi_task_rx.recv().await.unwrap());
+        subscribe.ok().await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            subscribe.unsubscribe_before(Duration::from_millis(20)),
+        )
+        .await
+        .expect("bounded unsubscribe did not reset the request stream");
+
+        let (message, response_stopped) = peer.await.unwrap();
+        assert!(matches!(
+            message,
+            Message::Unsubscribe(message::Unsubscribe { id: 0 })
+        ));
+        assert_eq!(
+            response_stopped,
+            Some(u8::try_from(super::super::CANCELLED_STREAM_CODE).unwrap())
+        );
+        tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("reset SUBSCRIBE response pump did not stop")
+            .unwrap()
+            .unwrap();
+        assert!(subscriber.subscribes.lock().unwrap().is_empty());
+        assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_done_drains_an_active_stream_after_the_pump_stops() {
+        let (client, server) = loopback_session_pair().await;
+        let (mut subscriber, mut bidi_task_rx) = test_subscriber_with_tasks(client);
+
+        let peer = tokio::spawn(async move {
+            let (peer_send, peer_recv) = server.accept_bi().await.unwrap();
+            let mut peer_writer = Writer::new(peer_send);
+            let mut peer_reader = Reader::new(peer_recv);
+            let request_id = match peer_reader.decode::<Message>().await.unwrap() {
+                Message::Subscribe(msg) => msg.id,
+                msg => panic!("unexpected request: {}", msg.name()),
+            };
+
+            Session::encode_bidi_response(
+                &mut peer_writer,
+                &Message::SubscribeOk(message::SubscribeOk {
+                    id: request_id,
+                    track_alias: 42,
+                    params: Default::default(),
+                    track_extensions: Default::default(),
+                }),
+            )
+            .await
+            .unwrap();
+            Session::encode_bidi_response(
+                &mut peer_writer,
+                &Message::PublishDone(message::PublishDone {
+                    id: request_id,
+                    status_code: message::PublishDoneCode::TrackEnded as u64,
+                    stream_count: 1,
+                    reason: Default::default(),
+                }),
+            )
+            .await
+            .unwrap();
+
+            peer_reader.done().await.unwrap()
+        });
+
+        let subscribe = subscriber
+            .subscribe_start(test_track("video"))
+            .await
+            .unwrap();
+        assert!(subscriber.note_subscribe_stream_received(0));
+        let pump = tokio::spawn(bidi_task_rx.recv().await.unwrap());
+
+        tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("PUBLISH_DONE did not stop the SUBSCRIBE pump")
+            .unwrap()
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), peer)
+            .await
+            .expect("SUBSCRIBE writer did not finish after PUBLISH_DONE")
+            .unwrap());
+        assert!(
+            subscriber.subscribes.lock().unwrap().contains_key(&0),
+            "normal PUBLISH_DONE must keep state while a data stream is active"
+        );
+
+        subscriber.note_subscribe_stream_finished(0);
+        assert!(matches!(
+            subscribe.closed().await,
+            Err(ServeError::Closed(code))
+                if code == message::PublishDoneCode::TrackEnded as u64
+        ));
+        assert!(subscriber.subscribes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_shutdown_does_not_leave_a_subscribe_drain_queued() {
+        let (client, server) = loopback_session_pair().await;
+        let (mut subscriber, mut bidi_task_rx) = test_subscriber_with_tasks(client);
+
+        let peer = tokio::spawn(async move {
+            let (peer_send, peer_recv) = server.accept_bi().await.unwrap();
+            let mut peer_writer = Writer::new(peer_send);
+            let mut peer_reader = Reader::new(peer_recv);
+            let request_id = match peer_reader.decode::<Message>().await.unwrap() {
+                Message::Subscribe(msg) => msg.id,
+                msg => panic!("unexpected request: {}", msg.name()),
+            };
+
+            Session::encode_bidi_response(
+                &mut peer_writer,
+                &Message::SubscribeOk(message::SubscribeOk {
+                    id: request_id,
+                    track_alias: 42,
+                    params: Default::default(),
+                    track_extensions: Default::default(),
+                }),
+            )
+            .await
+            .unwrap();
+            Session::encode_bidi_response(
+                &mut peer_writer,
+                &Message::PublishDone(message::PublishDone {
+                    id: request_id,
+                    status_code: message::PublishDoneCode::TrackEnded as u64,
+                    stream_count: 1,
+                    reason: Default::default(),
+                }),
+            )
+            .await
+            .unwrap();
+
+            peer_reader.done().await.unwrap()
+        });
+
+        let subscribe = subscriber
+            .subscribe_start(test_track("video"))
+            .await
+            .unwrap();
+        let pump = tokio::spawn(bidi_task_rx.recv().await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("PUBLISH_DONE did not stop the SUBSCRIBE pump")
+            .unwrap()
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), peer)
+            .await
+            .expect("SUBSCRIBE writer did not finish after PUBLISH_DONE")
+            .unwrap());
+
+        let drain = bidi_task_rx
+            .recv()
+            .await
+            .expect("PUBLISH_DONE should arm a drain timer");
+        assert!(!subscriber.subscribes.lock().unwrap().is_empty());
+        assert!(!subscriber.track_alias_map.lock().unwrap().is_empty());
+        assert!(!subscriber.subscriber_names.lock().unwrap().is_empty());
+
+        // Session::run drops its collected futures when any session branch ends.
+        drop(drain);
+
+        assert!(matches!(
+            subscribe.closed().await,
+            Err(ServeError::Closed(code))
+                if code == message::PublishDoneCode::TrackEnded as u64
+        ));
+        assert!(subscriber.subscribes.lock().unwrap().is_empty());
+        assert!(subscriber.track_alias_map.lock().unwrap().is_empty());
+        assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_error_terminates_the_subscribe_pump() {
+        let (client, server) = loopback_session_pair().await;
+        let (mut subscriber, mut bidi_task_rx) = test_subscriber_with_tasks(client);
+
+        let peer = tokio::spawn(async move {
+            let (peer_send, peer_recv) = server.accept_bi().await.unwrap();
+            let mut peer_writer = Writer::new(peer_send);
+            let mut peer_reader = Reader::new(peer_recv);
+            let request_id = match peer_reader.decode::<Message>().await.unwrap() {
+                Message::Subscribe(msg) => msg.id,
+                msg => panic!("unexpected request: {}", msg.name()),
+            };
+
+            Session::encode_bidi_response(
+                &mut peer_writer,
+                &Message::RequestError(message::RequestError {
+                    id: request_id,
+                    error_code: message::RequestErrorCode::DoesNotExist as u64,
+                    retry_interval: 0,
+                    reason: Default::default(),
+                }),
+            )
+            .await
+            .unwrap();
+
+            peer_reader.done().await.unwrap()
+        });
+
+        let (track, _reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), "missing").produce();
+        let subscribe = subscriber.subscribe_start(track).await.unwrap();
+        let pump = tokio::spawn(bidi_task_rx.recv().await.unwrap());
+
+        let _pump_result = tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("REQUEST_ERROR did not stop the SUBSCRIBE pump")
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), peer)
+            .await
+            .expect("SUBSCRIBE writer did not finish after REQUEST_ERROR")
+            .unwrap());
+        let result = subscribe.ok().await;
+        assert!(
+            matches!(
+                result,
+                Err(ServeError::NotFound | ServeError::NotFoundWithId(_, _))
+            ),
+            "unexpected rejection: {result:?}"
+        );
+        assert!(subscribe.peer_rejected());
+        assert!(subscriber.subscribes.lock().unwrap().is_empty());
     }
 
     /// `Subscribe::drop` must remove the request's entry from the subscribes map

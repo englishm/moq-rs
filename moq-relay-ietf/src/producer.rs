@@ -20,6 +20,7 @@ use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 use crate::{
     local::MAX_CONCURRENT_RENDEZVOUS_HOLDS,
     metrics::{GaugeGuard, TimingGuard},
+    remote::RemoteSubscribeError,
     upstream_namespaces::UpstreamNamespaces,
     Coordinator, Locals, NamespaceChange, RemoteManager, SessionContext, TrackChange,
     UpstreamReady,
@@ -186,6 +187,36 @@ impl Producer {
         Some((session, relay))
     }
 
+    fn try_reserve_unresolved_capacity(
+        &self,
+        permit: &mut Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+        gauge: &mut Option<GaugeGuard>,
+    ) -> bool {
+        if permit.is_some() {
+            return true;
+        }
+
+        let Some(acquired) = self.try_acquire_rendezvous_hold() else {
+            return false;
+        };
+        *permit = Some(acquired);
+        *gauge = Some(GaugeGuard::new("moq_relay_active_rendezvous_holds"));
+        true
+    }
+
+    fn reject_unresolved_overload(
+        &self,
+        subscribed: Subscribed,
+        timing_guard: &mut TimingGuard,
+    ) -> Result<(), anyhow::Error> {
+        metrics::counter!("moq_relay_rendezvous_rejections_total").increment(1);
+        timing_guard.set_label("source", "rendezvous_overloaded");
+        let err = ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64);
+        let retry_interval = self.locals.rendezvous_overload_retry_interval();
+        let _ = subscribed.close_with_retry(err.clone(), retry_interval);
+        Err(err.into())
+    }
+
     /// Send PUBLISH_NAMESPACE for a set of tracks to the remote peer.
     pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
         self.publisher.publish_namespace(tracks).await
@@ -300,53 +331,72 @@ impl Producer {
         let mut coordinator_lookup_succeeded = false;
         let mut rendezvous_permit = None;
         let mut rendezvous_guard = None;
+        let full_name = FullTrackName {
+            namespace: namespace.clone(),
+            name: track_name.clone(),
+        };
 
         // Re-entered after a publisher appears. The lookup is repeated rather
         // than trusting the wake, because `Consumer::serve_track` emits
         // TrackChange::Added before the coordinator registration behind it has
         // succeeded, so an event does not guarantee a servable track.
         loop {
-            // Local lookup order inside Locals:
-            // 1. actual FullTrackName -> TrackReader media cache
-            // 2. PUBLISH_NAMESPACE route source, which triggers upstream SUBSCRIBE
             let mut locals = self.locals.clone();
-            let local = if let Some(deadline) = deadline {
-                match Self::await_rendezvous_work(
-                    &subscribed,
-                    deadline,
-                    locals.get_or_request_track(
-                        self.context.scope(),
-                        namespace.clone(),
-                        &track_name,
-                    ),
-                )
-                .await
+            let mut local = locals.retrieve_track_with_interest(self.context.scope(), &full_name);
+
+            // A namespace route creates an upstream request and cache generation,
+            // so admission must precede that work. Exact established tracks above
+            // stay on the unmetered fast path.
+            if local.is_none() && locals.has_namespace_route(self.context.scope(), &namespace) {
+                if !self
+                    .try_reserve_unresolved_capacity(&mut rendezvous_permit, &mut rendezvous_guard)
                 {
-                    RendezvousWork::Completed(result) => result,
-                    RendezvousWork::TimedOut => {
-                        return Self::finish_unresolved_rendezvous(
-                            subscribed,
-                            &mut timing_guard,
-                            coordinator_lookup_succeeded,
-                            &namespace,
-                            &track_name,
-                        );
-                    }
-                    RendezvousWork::DownstreamLeft => {
-                        tracing::debug!(
-                            namespace = %namespace.to_utf8_path(),
-                            track = %track_name,
-                            "subscriber left during a rendezvous local lookup"
-                        );
-                        timing_guard.set_label("source", "downstream_left");
-                        return Ok(());
-                    }
+                    return self.reject_unresolved_overload(subscribed, &mut timing_guard);
                 }
-            } else {
-                locals
-                    .get_or_request_track(self.context.scope(), namespace.clone(), &track_name)
+
+                local = if let Some(deadline) = deadline {
+                    match Self::await_rendezvous_work(
+                        &subscribed,
+                        deadline,
+                        locals.get_or_request_track(
+                            self.context.scope(),
+                            namespace.clone(),
+                            &track_name,
+                        ),
+                    )
                     .await
-            };
+                    {
+                        RendezvousWork::Completed(result) => result,
+                        RendezvousWork::TimedOut => {
+                            return Self::finish_unresolved_rendezvous(
+                                subscribed,
+                                &mut timing_guard,
+                                coordinator_lookup_succeeded,
+                                &namespace,
+                                &track_name,
+                            );
+                        }
+                        RendezvousWork::DownstreamLeft => {
+                            tracing::debug!(
+                                namespace = %namespace.to_utf8_path(),
+                                track = %track_name,
+                                "subscriber left during a rendezvous local lookup"
+                            );
+                            timing_guard.set_label("source", "downstream_left");
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    locals
+                        .get_or_request_track(self.context.scope(), namespace.clone(), &track_name)
+                        .await
+                };
+
+                if local.is_none() {
+                    drop(rendezvous_guard.take());
+                    drop(rendezvous_permit.take());
+                }
+            }
 
             if let Some(local) = local {
                 let largest_location = local.largest_location;
@@ -363,6 +413,19 @@ impl Producer {
                 // downstream SUBSCRIBE." A pull-through cache entry exists before
                 // its upstream subscription does, so wait for it.
                 if let Some(upstream) = local.upstream {
+                    if upstream.is_pending()
+                        && !self.try_reserve_unresolved_capacity(
+                            &mut rendezvous_permit,
+                            &mut rendezvous_guard,
+                        )
+                    {
+                        // Recheck after failed admission because the upstream may
+                        // have completed while permits were inspected.
+                        if upstream.is_pending() {
+                            return self.reject_unresolved_overload(subscribed, &mut timing_guard);
+                        }
+                    }
+
                     if let Err(outcome) =
                         Self::await_upstream(&subscribed, &upstream, deadline).await
                     {
@@ -413,19 +476,19 @@ impl Producer {
             }
 
             // Check remote tracks after local exact tracks and namespace route sources.
+            if !self.try_reserve_unresolved_capacity(&mut rendezvous_permit, &mut rendezvous_guard)
+            {
+                return self.reject_unresolved_overload(subscribed, &mut timing_guard);
+            }
+
+            let remote_lookup = self.remotes.subscribe_with_lookup_status(
+                self.context.scope(),
+                &namespace,
+                &track_name,
+                &mut coordinator_lookup_succeeded,
+            );
             let remote = if let Some(deadline) = deadline {
-                match Self::await_rendezvous_work(
-                    &subscribed,
-                    deadline,
-                    self.remotes.subscribe_with_lookup_status(
-                        self.context.scope(),
-                        &namespace,
-                        &track_name,
-                        &mut coordinator_lookup_succeeded,
-                    ),
-                )
-                .await
-                {
+                match Self::await_rendezvous_work(&subscribed, deadline, remote_lookup).await {
                     RendezvousWork::Completed(result) => result,
                     RendezvousWork::TimedOut => {
                         return Self::finish_unresolved_rendezvous(
@@ -447,9 +510,18 @@ impl Producer {
                     }
                 }
             } else {
-                self.remotes
-                    .subscribe(self.context.scope(), &namespace, &track_name)
-                    .await
+                tokio::select! {
+                    result = remote_lookup => result,
+                    _ = subscribed.closed() => {
+                        tracing::debug!(
+                            namespace = %namespace.to_utf8_path(),
+                            track = %track_name,
+                            "subscriber left during a route lookup"
+                        );
+                        timing_guard.set_label("source", "downstream_left");
+                        return Ok(());
+                    }
+                }
             };
 
             match remote {
@@ -476,7 +548,15 @@ impl Producer {
                     .await;
                 }
                 Ok(None) => coordinator_lookup_succeeded = true,
-                Err(e) => {
+                Err(RemoteSubscribeError::Peer(err)) => {
+                    let ns = namespace.to_utf8_path();
+                    tracing::debug!(namespace = %ns, track = %track_name, error = %err, "upstream relay rejected subscribe");
+                    metrics::counter!("moq_relay_subscribe_upstream_errors_total").increment(1);
+                    timing_guard.set_label("source", "upstream_error");
+                    let _ = subscribed.close(err.clone());
+                    return Err(err.into());
+                }
+                Err(RemoteSubscribeError::Route(e)) => {
                     // Route error = infrastructure failure (couldn't reach coordinator/upstream)
                     // This is different from "not found" - we don't know if the track exists
                     let ns = namespace.to_utf8_path();
@@ -521,17 +601,11 @@ impl Producer {
             // Capacity limits held requests, not ordinary resolution work. An
             // available publisher must be served even when every hold slot is in
             // use, so only acquire a slot after the initial lookup misses.
-            if rendezvous_permit.is_none() {
-                let Some(permit) = self.try_acquire_rendezvous_hold() else {
-                    metrics::counter!("moq_relay_rendezvous_rejections_total").increment(1);
-                    timing_guard.set_label("source", "rendezvous_overloaded");
-                    let err = ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64);
-                    let retry_interval = self.locals.rendezvous_overload_retry_interval();
-                    let _ = subscribed.close_with_retry(err.clone(), retry_interval);
-                    return Err(err.into());
-                };
-                rendezvous_permit = Some(permit);
-                rendezvous_guard = Some(GaugeGuard::new("moq_relay_active_rendezvous_holds"));
+            if rendezvous_permit.is_none()
+                && !self
+                    .try_reserve_unresolved_capacity(&mut rendezvous_permit, &mut rendezvous_guard)
+            {
+                return self.reject_unresolved_overload(subscribed, &mut timing_guard);
             }
 
             match Self::await_rendezvous(
@@ -1179,12 +1253,16 @@ mod tests {
     };
     use crate::{
         Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, Locals,
-        NamespaceOrigin, NamespaceRegistration, RemoteManager, SessionContext,
+        NamespaceOrigin, NamespaceRegistration, RemoteManager, SessionContext, TrackRequest,
     };
 
     #[derive(Default)]
     struct CountingCoordinator {
         track_lookups: Mutex<Vec<String>>,
+    }
+
+    struct RemoteCoordinator {
+        url: url::Url,
     }
 
     impl CountingCoordinator {
@@ -1245,6 +1323,37 @@ mod tests {
                 .map_err(|_| anyhow::anyhow!("track lookup lock poisoned"))?
                 .push(track.to_string());
             Err(CoordinatorError::NamespaceNotFound)
+        }
+    }
+
+    #[async_trait]
+    impl Coordinator for RemoteCoordinator {
+        async fn register_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+            _context: &CoordinatorContext,
+        ) -> CoordinatorResult<NamespaceRegistration> {
+            Ok(NamespaceRegistration::new(()))
+        }
+
+        async fn unregister_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> CoordinatorResult<()> {
+            Ok(())
+        }
+
+        async fn lookup(
+            &self,
+            _scope: Option<&str>,
+            namespace: &TrackNamespace,
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::quic::Client>)> {
+            Ok((
+                NamespaceOrigin::new(namespace.clone(), self.url.clone(), None),
+                None,
+            ))
         }
     }
 
@@ -1395,7 +1504,7 @@ mod tests {
             subscribe_result(&mut first_subscriber, "held", Some(10_000)).await
         });
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !coordinator.looked_up("held") {
+            while !coordinator.looked_up("held") || locals.available_rendezvous_holds() != 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -1416,18 +1525,18 @@ mod tests {
         drop(available);
 
         let absent = rejected_subscribe(&mut second_subscriber, "absent", None).await;
-        assert!(matches!(
+        assert_eq!(
             absent,
-            ServeError::NotFound | ServeError::NotFoundWithId(_, _)
-        ));
-        assert!(coordinator.looked_up("absent"));
+            ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64)
+        );
+        assert!(!coordinator.looked_up("absent"));
 
         let zero = rejected_subscribe(&mut second_subscriber, "zero", Some(0)).await;
-        assert!(matches!(
+        assert_eq!(
             zero,
-            ServeError::NotFound | ServeError::NotFoundWithId(_, _)
-        ));
-        assert!(coordinator.looked_up("zero"));
+            ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64)
+        );
+        assert!(!coordinator.looked_up("zero"));
 
         let overloaded =
             rejected_subscribe(&mut second_subscriber, "overloaded", Some(10_000)).await;
@@ -1435,7 +1544,7 @@ mod tests {
             overloaded,
             ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64)
         );
-        assert!(coordinator.looked_up("overloaded"));
+        assert!(!coordinator.looked_up("overloaded"));
 
         let (_held_writer, held_reader) = Track::new(namespace.clone(), "held").produce();
         let _held_registration = registering_locals
@@ -1448,16 +1557,245 @@ mod tests {
             .expect("join held request")
             .expect("held request was rejected");
 
-        let (_next_writer, next_reader) = Track::new(namespace, "after-release").produce();
-        let _next_registration = registering_locals
-            .register_track(None, next_reader)
-            .await
-            .expect("register track after capacity release");
-        let accepted = subscribe_result(&mut second_subscriber, "after-release", Some(10_000))
-            .await
-            .expect("resolved hold should be released before the next request");
-        drop(accepted);
+        let after_release =
+            rejected_subscribe(&mut second_subscriber, "after-release", Some(25)).await;
+        assert_eq!(
+            after_release,
+            ServeError::Timeout,
+            "resolved hold should release capacity for another rendezvous"
+        );
         drop(first_subscription);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unresolved_pull_through_obeys_capacity_and_releases_on_timeout() {
+        let locals = Locals::with_rendezvous_capacity(1);
+        let namespace = TrackNamespace::from_utf8_path("admission");
+        let (registration, mut requests) = locals
+            .clone()
+            .register_namespace(None, namespace)
+            .await
+            .expect("register namespace source");
+        let coordinator = Arc::new(CountingCoordinator::default());
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let mut first_subscriber =
+            spawn_relay_session(locals.clone(), remotes.clone(), coordinator.clone()).await;
+        let mut second_subscriber = spawn_relay_session(locals.clone(), remotes, coordinator).await;
+
+        let requests_task = tokio::spawn(async move {
+            while let Some(TrackRequest {
+                writer,
+                lease,
+                upstream,
+            }) = requests.recv().await
+            {
+                tokio::spawn(async move {
+                    lease.abandoned().await;
+                    drop(writer);
+                    drop(upstream);
+                });
+            }
+        });
+
+        let first = tokio::spawn(async move {
+            rejected_subscribe(&mut first_subscriber, "first-pending", Some(100)).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while locals.available_rendezvous_holds() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first pull-through did not acquire rendezvous capacity");
+
+        let overloaded =
+            rejected_subscribe(&mut second_subscriber, "overloaded-pending", Some(1_000)).await;
+        assert_eq!(
+            overloaded,
+            ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64)
+        );
+
+        assert_eq!(
+            first.await.expect("join first pull-through"),
+            ServeError::Timeout
+        );
+        let after_timeout =
+            rejected_subscribe(&mut second_subscriber, "after-timeout", Some(25)).await;
+        assert_eq!(after_timeout, ServeError::Timeout);
+
+        drop(registration);
+        requests_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_peer_rejection_is_forwarded_with_and_without_rendezvous() {
+        let (upstream_server_transport, upstream_client_transport) =
+            loopback_webtransport_pair().await;
+        let (upstream_server, upstream_client) = tokio::join!(
+            TransportSession::accept(upstream_server_transport, None, Transport::WebTransport),
+            TransportSession::connect(upstream_client_transport, None, Transport::WebTransport),
+        );
+        let (upstream_server, mut upstream_publisher, _) =
+            upstream_server.expect("accept upstream MoQT session");
+        let (upstream_client, remote_publisher, remote_subscriber) =
+            upstream_client.expect("connect upstream MoQT session");
+        let remote_url = url::Url::parse("https://relay.example.com/live").unwrap();
+        let coordinator = Arc::new(RemoteCoordinator {
+            url: remote_url.clone(),
+        });
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        remotes
+            .insert_test_remote(remote_url, remote_publisher, remote_subscriber)
+            .await;
+
+        let upstream_server_task = tokio::spawn(upstream_server.run());
+        let upstream_client_task = tokio::spawn(upstream_client.run());
+        let reject = tokio::spawn(async move {
+            let publisher = upstream_publisher
+                .as_mut()
+                .expect("upstream server publisher");
+            for _ in 0..2 {
+                let subscribed = publisher
+                    .subscribed()
+                    .await
+                    .expect("receive upstream subscribe");
+                subscribed
+                    .close(ServeError::Closed(RequestErrorCode::Unauthorized as u64))
+                    .expect("reject upstream subscribe");
+            }
+        });
+
+        let locals = Locals::new();
+        let mut subscriber =
+            spawn_relay_session(locals, remotes, coordinator as Arc<dyn Coordinator>).await;
+
+        for rendezvous_timeout in [None, Some(1_000)] {
+            assert_eq!(
+                rejected_subscribe(&mut subscriber, "unauthorized", rendezvous_timeout).await,
+                ServeError::Closed(RequestErrorCode::Unauthorized as u64)
+            );
+        }
+
+        reject.await.expect("join upstream rejection task");
+        upstream_server_task.abort();
+        upstream_client_task.abort();
+    }
+
+    async fn assert_cancelled_remote_subscribe_orders_retry(rendezvous: bool) {
+        let (upstream_server_transport, upstream_client_transport) =
+            loopback_webtransport_pair().await;
+        let (upstream_server, upstream_client) = tokio::join!(
+            TransportSession::accept(upstream_server_transport, None, Transport::WebTransport),
+            TransportSession::connect(upstream_client_transport, None, Transport::WebTransport),
+        );
+        let (upstream_server, mut upstream_publisher, _) =
+            upstream_server.expect("accept upstream MoQT session");
+        let (upstream_client, remote_publisher, remote_subscriber) =
+            upstream_client.expect("connect upstream MoQT session");
+        let remote_url = url::Url::parse("https://relay.example.com/live").unwrap();
+        let coordinator = Arc::new(RemoteCoordinator {
+            url: remote_url.clone(),
+        });
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        remotes
+            .insert_test_remote(remote_url, remote_publisher, remote_subscriber)
+            .await;
+
+        let upstream_server_task = tokio::spawn(upstream_server.run());
+        let upstream_client_task = tokio::spawn(upstream_client.run());
+        let locals = Locals::new();
+        let subscriber =
+            spawn_relay_session(locals, remotes, coordinator as Arc<dyn Coordinator>).await;
+        let namespace = TrackNamespace::from_utf8_path("admission");
+
+        let (first_writer, _first_reader) = Track::new(namespace.clone(), "retry").produce();
+        let mut first_subscriber = subscriber.clone();
+        let first = tokio::spawn(async move {
+            if rendezvous {
+                let mut params = KeyValuePairs::default();
+                params.set_rendezvous_timeout(30_000);
+                first_subscriber
+                    .subscribe_open_with_params(first_writer, params)
+                    .await
+            } else {
+                first_subscriber.subscribe_open(first_writer).await
+            }
+        });
+        let first_upstream = tokio::time::timeout(
+            Duration::from_secs(2),
+            upstream_publisher
+                .as_mut()
+                .expect("upstream server publisher")
+                .subscribed(),
+        )
+        .await
+        .expect("first upstream subscribe timed out")
+        .expect("first upstream subscribe");
+
+        first.abort();
+        match first.await {
+            Err(err) => assert!(err.is_cancelled()),
+            Ok(_) => panic!("first subscribe was not cancelled"),
+        }
+
+        let mut retry_subscriber = subscriber.clone();
+        let retry_namespace = namespace.clone();
+        let retry = tokio::spawn(async move {
+            let (writer, _reader) = Track::new(retry_namespace, "retry").produce();
+            if rendezvous {
+                let mut params = KeyValuePairs::default();
+                params.set_rendezvous_timeout(30_000);
+                retry_subscriber
+                    .subscribe_open_with_params(writer, params)
+                    .await
+            } else {
+                retry_subscriber.subscribe_open(writer).await
+            }
+        });
+
+        let publisher = upstream_publisher
+            .as_mut()
+            .expect("upstream server publisher");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                biased;
+                _ = first_upstream.closed() => {}
+                _ = publisher.subscribed() => {
+                    panic!("same-track retry overtook the first upstream teardown")
+                }
+            }
+        })
+        .await
+        .expect("first upstream teardown did not complete");
+        drop(first_upstream);
+
+        let second_upstream = tokio::time::timeout(Duration::from_secs(2), publisher.subscribed())
+            .await
+            .expect("second upstream subscribe timed out")
+            .expect("second upstream subscribe");
+        second_upstream
+            .close(ServeError::Closed(RequestErrorCode::Uninterested as u64))
+            .expect("reject second upstream subscribe");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), retry)
+                .await
+                .expect("downstream retry timed out")
+                .expect("join downstream retry"),
+            Err(ServeError::Closed(code)) if code == RequestErrorCode::Uninterested as u64
+        ));
+
+        upstream_server_task.abort();
+        upstream_client_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_remote_subscribe_tears_down_before_same_track_retry() {
+        assert_cancelled_remote_subscribe_orders_retry(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_remote_subscribe_without_rendezvous_releases_the_slot() {
+        assert_cancelled_remote_subscribe_orders_retry(false).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1497,7 +1835,7 @@ mod tests {
             overloaded,
             ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64)
         );
-        assert!(coordinator.looked_up("same-session-overloaded"));
+        assert!(!coordinator.looked_up("same-session-overloaded"));
 
         let other_hold = tokio::spawn(async move {
             subscribe_result(&mut other_session, "other-session-hold", Some(10_000)).await

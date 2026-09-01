@@ -74,7 +74,8 @@ pub struct TrackRequest {
     /// Lease on the pull-through cache entry backing this request.
     ///
     /// The requester should hold the upstream subscription open until
-    /// [`CacheLease::released`] resolves, then drop it to send UNSUBSCRIBE.
+    /// [`CacheLease::released`] resolves, wait for upstream cancellation, then
+    /// call [`CacheLease::finish_release`].
     pub lease: CacheLease,
 
     /// Reports whether the upstream subscription was established.
@@ -103,7 +104,7 @@ enum UpstreamState {
 
 /// Readiness gate for the upstream subscription behind a cached track.
 ///
-/// Draft-16 §8.4 requires a relay to have an established upstream subscription
+/// Draft-18 Section 9.4 requires a relay to have an established upstream subscription
 /// before it sends SUBSCRIBE_OK for a downstream SUBSCRIBE. The pull-through
 /// cache reserves its entry synchronously but subscribes upstream asynchronously
 /// (the publishing session owns that side), so the entry exists before the
@@ -119,6 +120,11 @@ pub struct UpstreamReady {
 }
 
 impl UpstreamReady {
+    /// Whether the upstream publisher has not answered yet.
+    pub(crate) fn is_pending(&self) -> bool {
+        matches!(*self.state.borrow(), UpstreamState::Pending)
+    }
+
     /// Wait until the upstream subscription is established.
     ///
     /// Returns the upstream failure if it could not be established, so the caller
@@ -158,13 +164,82 @@ pub struct UpstreamReadyTx {
 impl UpstreamReadyTx {
     /// Report that the upstream publisher acknowledged the SUBSCRIBE.
     pub fn established(&self) {
-        // Fails only when every downstream subscriber has already gone away.
-        let _ = self.state.send(UpstreamState::Established);
+        self.resolve(UpstreamState::Established);
     }
 
     /// Report that the upstream subscription could not be established.
     pub fn failed(&self, err: ServeError) {
-        let _ = self.state.send(UpstreamState::Failed(err));
+        self.resolve(UpstreamState::Failed(err));
+    }
+
+    /// Record the outcome, whether or not anyone is currently waiting.
+    ///
+    /// `watch::Sender::send` refuses to update once the last receiver is gone,
+    /// which would leave the state on `Pending` forever and make a resolved
+    /// subscription indistinguishable from an abandoned one. The outcome is
+    /// what [`Drop`] keys off, so it has to be recorded unconditionally.
+    fn resolve(&self, outcome: UpstreamState) {
+        self.state.send_replace(outcome);
+    }
+}
+
+/// Resolve the gate on drop so abandonment is never silent.
+///
+/// Most ways this sender dies are not calls to [`UpstreamReadyTx::established`]
+/// or [`UpstreamReadyTx::failed`]: the owning session can return early, be torn
+/// down mid-handshake, or have its task dropped while parked on the upstream
+/// SUBSCRIBE. In every one of those cases the publisher really is gone. Failing
+/// the gate releases waiting subscribers before the response timeout.
+///
+/// Without this, the sender's disappearance was only observable as a closed
+/// channel, which surfaced downstream as an unattributable internal error with
+/// no indication of which session gave up or why.
+impl Drop for UpstreamReadyTx {
+    fn drop(&mut self) {
+        // Fast path: already resolved. Checked before building the error so a
+        // successful subscription's teardown neither allocates nor takes the
+        // write lock.
+        //
+        // This must stay an `if` around `matches!`. The condition of an `if` is
+        // a temporary scope, so the read guard is released before the body
+        // runs; `if let` is not, and would hold it across the write lock below
+        // and self-deadlock every abandoned request.
+        if !matches!(&*self.state.borrow(), UpstreamState::Pending) {
+            return;
+        }
+
+        // Deliberately not `ServeError::internal_ctx`: that mints a UUID, and
+        // `Uuid::new_v4` panics rather than degrading when the OS entropy
+        // source is unavailable (seccomp-blocked `getrandom`, an exhausted fd
+        // table with no `/dev/urandom`). A `Drop` must not make a fallible
+        // syscall. This code can run during
+        // unwinding: a panic here while another panic is in flight aborts the
+        // process, turning one failed task into a dead relay.
+        //
+        // Nothing is logged here either. The waiting subscriber already reports
+        // this at its own site, with the namespace and track attached, so the
+        // reason only has to be carried in the error itself. Spelling it out
+        // rather than hiding it behind a correlation id makes that report
+        // self-explanatory and gives the downstream REQUEST_ERROR an honest
+        // reason phrase; there is nothing sensitive in "the publisher left".
+        //
+        // Built out here rather than in the closure so the allocation stays off
+        // the write lock, and so the closure cannot do anything but match and
+        // move, because `send_if_modified` re-raises a panicking closure.
+        let err = ServeError::Internal(
+            "upstream publisher went away before the subscription was established".to_string(),
+        );
+
+        // Re-check under the lock so a concurrently recorded outcome always
+        // wins over this fallback; the sender is never cloned, so this is
+        // belt-and-braces rather than a live race.
+        self.state.send_if_modified(|state| match state {
+            UpstreamState::Pending => {
+                *state = UpstreamState::Failed(err);
+                true
+            }
+            _ => false,
+        });
     }
 }
 
@@ -177,15 +252,16 @@ pub struct CacheLease {
     scope_key: ScopeKey,
     full_name: FullTrackName,
     interest: TrackInterest,
+    finished: bool,
 }
 
 impl CacheLease {
-    /// Resolve once the cache entry has been evicted for lack of interest.
+    /// Resolve once the cache entry is ready for ordered upstream cancellation.
     ///
-    /// The caller should drop its upstream subscription when this returns, which
-    /// sends UNSUBSCRIBE. Eviction happens first so that a subscriber arriving
-    /// afterwards misses the cache and triggers a fresh upstream SUBSCRIBE,
-    /// rather than attaching to a reader that is about to stop being fed.
+    /// The entry remains as a closing generation until
+    /// [`finish_release`](Self::finish_release) is called after the peer has
+    /// ended the old request stream. Subscribers wait for that transition so a
+    /// replacement SUBSCRIBE cannot overtake the old UNSUBSCRIBE.
     ///
     /// Never resolves when the idle timeout is disabled, preserving the previous
     /// behaviour of holding the upstream subscription for the session's lifetime.
@@ -195,13 +271,45 @@ impl CacheLease {
             std::future::pending::<()>().await;
         }
 
+        self.release_after(timeout).await;
+    }
+
+    /// Release an upstream request as soon as every waiting subscriber leaves.
+    ///
+    /// A request that has not been accepted upstream has no warm state worth
+    /// retaining for the normal cache grace period.
+    pub(crate) async fn abandoned(&self) {
+        self.release_after(Duration::ZERO).await;
+    }
+
+    pub(crate) fn finish_release(mut self) {
+        self.release();
+    }
+
+    pub(crate) fn begin_release(&self) {
+        self.locals
+            .mark_cache_entry_closing(&self.scope_key, &self.full_name, &self.interest);
+    }
+
+    fn release(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.locals
+            .remove_cache_generation(&self.scope_key, &self.full_name, &self.interest);
+        self.interest.mark_removed();
+    }
+
+    async fn release_after(&self, timeout: Duration) {
         loop {
             self.interest.idle_for(timeout).await;
 
-            if self
-                .locals
-                .evict_idle_cache_entry(&self.scope_key, &self.full_name, &self.interest)
-            {
+            if self.locals.mark_idle_cache_entry_closing(
+                &self.scope_key,
+                &self.full_name,
+                &self.interest,
+            ) {
                 return;
             }
 
@@ -213,6 +321,14 @@ impl CacheLease {
                 "cache eviction abandoned; downstream interest returned"
             );
         }
+    }
+}
+
+impl Drop for CacheLease {
+    fn drop(&mut self) {
+        // Requests can be abandoned while still buffered in the namespace
+        // queue, before a session takes responsibility for their teardown.
+        self.release();
     }
 }
 
@@ -259,8 +375,8 @@ pub struct LocalTrack {
     /// `None` for locally published tracks, which have no upstream subscription.
     pub interest: Option<TrackInterestGuard>,
 
-    /// Must resolve before the caller sends SUBSCRIBE_OK downstream (draft-16
-    /// §8.4).
+    /// Must resolve before the caller sends SUBSCRIBE_OK downstream (draft-18
+    /// Section 9.4).
     ///
     /// `None` for locally published tracks, which are already established.
     pub upstream: Option<UpstreamReady>,
@@ -402,6 +518,25 @@ impl Locals {
             .ok()
     }
 
+    #[cfg(test)]
+    pub(crate) fn available_rendezvous_holds(&self) -> usize {
+        self.rendezvous_hold_permits.available_permits()
+    }
+
+    #[cfg(test)]
+    fn contains_track_entry(&self, scope: Option<&str>, full_name: &FullTrackName) -> bool {
+        let scope_key = scope.unwrap_or(UNSCOPED);
+        self.tracks
+            .read()
+            .ok()
+            .and_then(|tracks| {
+                tracks
+                    .get(scope_key)
+                    .map(|bucket| bucket.contains_key(full_name))
+            })
+            .unwrap_or(false)
+    }
+
     pub(crate) fn rendezvous_overload_retry_interval(&self) -> u64 {
         let sequence = self
             .rendezvous_retry_sequence
@@ -447,7 +582,7 @@ impl Locals {
 
         // Collect matching readers under a shared read lock so concurrent
         // SUBSCRIBE_NAMESPACE fan-outs don't serialize against each other. Note any
-        // closed entries and prune them afterwards under a brief write lock, keeping
+        // closed entries and handle them afterwards under a brief write lock, keeping
         // the common (no-stale) path read-only.
         let mut matches = Vec::new();
         let mut stale = Vec::new();
@@ -470,35 +605,33 @@ impl Locals {
         }
 
         if !stale.is_empty() {
-            self.prune_closed_tracks(scope_key, &stale);
+            self.mark_closed_cache_tracks(scope_key, &stale);
         }
 
         matches
     }
 
-    /// Remove the given tracks from a scope bucket if they are still closed.
+    /// Mark closed cache entries as closing without removing published generations.
     ///
     /// Invoked off the read path (e.g. by [`Locals::list_tracks_matching`]) so that
-    /// closed-entry cleanup takes the write lock only briefly and only when a closed
-    /// entry was actually observed. The re-check guards against removing an entry
-    /// that a concurrent writer replaced with a live reader.
-    fn prune_closed_tracks(&self, scope_key: &str, keys: &[FullTrackName]) {
-        let Ok(mut tracks) = self.tracks.write() else {
+    /// the transition takes the write lock only briefly. The re-check avoids marking
+    /// an entry that a concurrent writer replaced with a live reader.
+    fn mark_closed_cache_tracks(&self, scope_key: &str, keys: &[FullTrackName]) {
+        let Ok(tracks) = self.tracks.write() else {
             return;
         };
-        let Some(bucket) = tracks.get_mut(scope_key) else {
+        let Some(bucket) = tracks.get(scope_key) else {
             return;
         };
         for key in keys {
-            if bucket
-                .get(key)
-                .is_some_and(|entry| entry.reader.is_closed())
-            {
-                bucket.remove(key);
+            if let Some(entry) = bucket.get(key).filter(|entry| entry.reader.is_closed()) {
+                // Cache entries remain as a closing generation until their
+                // upstream request stream is torn down. Published entries are
+                // removed only by their generation-owning registration.
+                if let Some(interest) = &entry.interest {
+                    interest.mark_closing();
+                }
             }
-        }
-        if bucket.is_empty() {
-            tracks.remove(scope_key);
         }
     }
 
@@ -654,13 +787,14 @@ impl Locals {
 
         let _ = self.track_changes.send(TrackChange::Added {
             scope: scope_key_to_option(&scope_key),
-            track,
+            track: track.clone(),
         });
 
         Ok(LocalTrackRegistration {
             locals: self.clone(),
             scope_key,
             full_name,
+            reader: track,
             _gauge_guard: GaugeGuard::new("moq_relay_active_published_tracks"),
         })
     }
@@ -684,13 +818,13 @@ impl Locals {
             }
         }
 
-        // The entry was closed; remove it under a brief write lock (re-checking in
-        // case a concurrent writer replaced it with a live reader).
-        self.prune_closed_tracks(scope_key, std::slice::from_ref(full_name));
+        // A closed cache entry must remain visible as a closing generation until
+        // its upstream request stream is torn down.
+        self.mark_closed_cache_tracks(scope_key, std::slice::from_ref(full_name));
         None
     }
 
-    /// Remove an unwatched pull-through cache entry.
+    /// Mark an unwatched pull-through cache entry as closing.
     ///
     /// Returns false, leaving the entry in place, if interest returned before the
     /// write lock was acquired, or if the entry has since been replaced by a
@@ -699,7 +833,7 @@ impl Locals {
     /// The idle check happens under the same lock that guards are created under,
     /// so a subscriber racing eviction either gets counted here (and eviction is
     /// abandoned) or misses the cache entirely and requests a fresh one.
-    fn evict_idle_cache_entry(
+    fn mark_idle_cache_entry_closing(
         &self,
         scope_key: &str,
         full_name: &FullTrackName,
@@ -725,6 +859,7 @@ impl Locals {
                     .is_some_and(|current| current.same_generation(interest));
 
                 if !ours {
+                    interest.mark_removed();
                     return true;
                 }
 
@@ -732,25 +867,46 @@ impl Locals {
                     return false;
                 }
 
-                bucket.remove(full_name);
+                interest.mark_closing();
+                metrics::counter!("moq_relay_cache_idle_evictions_total", "source" => "local")
+                    .increment(1);
             }
             // Already gone (e.g. pruned as closed), so the upstream subscription
             // is no longer serving anything.
-            None => return true,
-        }
-
-        if bucket.is_empty() {
-            tracks.remove(scope_key);
+            None => {
+                interest.mark_removed();
+                return true;
+            }
         }
 
         tracing::debug!(
             namespace = %full_name.namespace,
             track = %full_name.name,
-            "evicting idle cached track and releasing upstream subscription"
+            "closing idle cached track before releasing upstream subscription"
         );
-        metrics::counter!("moq_relay_cache_idle_evictions_total", "source" => "local").increment(1);
 
         true
+    }
+
+    fn mark_cache_entry_closing(
+        &self,
+        scope_key: &str,
+        full_name: &FullTrackName,
+        interest: &TrackInterest,
+    ) {
+        let Ok(tracks) = self.tracks.write() else {
+            return;
+        };
+        let ours = tracks
+            .get(scope_key)
+            .and_then(|bucket| bucket.get(full_name))
+            .and_then(|entry| entry.interest.as_ref())
+            .is_some_and(|current| current.same_generation(interest));
+        if ours {
+            interest.mark_closing();
+        } else {
+            interest.mark_removed();
+        }
     }
 
     /// Return the best namespace route source for a requested namespace.
@@ -787,6 +943,14 @@ impl Locals {
         best_match
     }
 
+    pub(crate) fn has_namespace_route(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+    ) -> bool {
+        self.route_namespace(scope, namespace).is_some()
+    }
+
     /// Get an existing exact track or request it from a matching namespace source.
     ///
     /// This replaces the old `TracksReader::subscribe` relay registry behavior:
@@ -809,101 +973,136 @@ impl Locals {
         };
         let scope_key = scope.unwrap_or(UNSCOPED).to_string();
 
-        if let Some(hit) = self.retrieve_track_with_interest(&scope_key, &full_name) {
-            return Some(hit);
-        }
-
-        let source = self.route_namespace(scope, &namespace)?;
-
-        // Reserve the pull-through cache slot under a single lock so concurrent
-        // misses for the same track collapse onto one produced reader. The caller
-        // that finds no live entry claims the slot with a freshly produced track and
-        // owns requesting it from the source; concurrent callers share the reserved
-        // reader instead of racing to insert and failing with a spurious `None`.
-        let (writer, reader, interest, guard, upstream_tx, upstream) = {
-            let mut tracks = self.tracks.write().ok()?;
-            let bucket = tracks.entry(scope_key.clone()).or_default();
-
-            if let Some(entry) = bucket.get(&full_name) {
-                if !entry.reader.is_closed() {
-                    return Some(LocalTrack {
-                        largest_location: entry.reader.largest_location(),
-                        reader: entry.reader.clone(),
-                        interest: entry.interest.as_ref().map(TrackInterest::guard),
-                        upstream: entry.upstream.clone(),
-                    });
-                }
+        loop {
+            if let Some(hit) = self.retrieve_track_with_interest(scope, &full_name) {
+                return Some(hit);
             }
 
-            // Vacant slot (or a stale, closed reader): claim it with a fresh track.
-            let (writer, reader) = Track::new(namespace, track_name).produce();
-            let interest = TrackInterest::new();
+            let source = self.route_namespace(scope, &namespace)?;
 
-            // Take this caller's guard before the entry is visible to anyone
-            // else, so the entry can never be seen as idle while we are still
-            // setting up the upstream subscription.
-            let guard = interest.guard();
+            // Reserve the pull-through cache slot under a single lock so concurrent
+            // misses for the same track collapse onto one produced reader. The caller
+            // that finds no live entry claims the slot with a freshly produced track and
+            // owns requesting it from the source; concurrent callers share the reserved
+            // reader instead of racing to insert and failing with a spurious `None`.
+            let mut closing_generation = None;
+            let mut removed_published = false;
+            let created = {
+                let mut tracks = self.tracks.write().ok()?;
+                let bucket = tracks.entry(scope_key.clone()).or_default();
 
-            // Published alongside the entry so that a subscriber arriving while
-            // the upstream handshake is still in flight shares this gate rather
-            // than being served a reader nothing has subscribed to yet.
-            let (upstream_tx, upstream_rx) = watch::channel(UpstreamState::Pending);
-            let upstream = UpstreamReady { state: upstream_rx };
+                if let Some(entry) = bucket.get(&full_name) {
+                    if let Some(closing) = entry
+                        .interest
+                        .as_ref()
+                        .filter(|interest| interest.is_closing())
+                        .cloned()
+                    {
+                        closing_generation = Some(closing);
+                    } else if !entry.reader.is_closed() {
+                        return Some(LocalTrack {
+                            largest_location: entry.reader.largest_location(),
+                            reader: entry.reader.clone(),
+                            interest: entry.interest.as_ref().map(TrackInterest::guard),
+                            upstream: entry.upstream.clone(),
+                        });
+                    } else if let Some(interest) = &entry.interest {
+                        interest.mark_closing();
+                        closing_generation = Some(interest.clone());
+                    } else if entry.source == TrackSource::Published {
+                        removed_published = true;
+                    }
+                }
 
-            bucket.insert(
-                full_name.clone(),
-                TrackEntry {
-                    reader: reader.clone(),
-                    source: TrackSource::Cache,
-                    interest: Some(interest.clone()),
-                    upstream: Some(upstream.clone()),
-                },
-            );
-            (
-                writer,
+                if closing_generation.is_some() {
+                    None
+                } else {
+                    // Vacant slot (or a stale, closed reader): claim it with a fresh track.
+                    let (writer, reader) =
+                        Track::new(namespace.clone(), track_name.clone()).produce();
+                    let interest = TrackInterest::new();
+
+                    // Take this caller's guard before the entry is visible to anyone
+                    // else, so the entry can never be seen as idle while we are still
+                    // setting up the upstream subscription.
+                    let guard = interest.guard();
+
+                    // Published alongside the entry so that a subscriber arriving while
+                    // the upstream handshake is still in flight shares this gate rather
+                    // than being served a reader nothing has subscribed to yet.
+                    let (upstream_tx, upstream_rx) = watch::channel(UpstreamState::Pending);
+                    let upstream = UpstreamReady { state: upstream_rx };
+
+                    bucket.insert(
+                        full_name.clone(),
+                        TrackEntry {
+                            reader: reader.clone(),
+                            source: TrackSource::Cache,
+                            interest: Some(interest.clone()),
+                            upstream: Some(upstream.clone()),
+                        },
+                    );
+                    Some((
+                        writer,
+                        reader,
+                        interest,
+                        guard,
+                        UpstreamReadyTx { state: upstream_tx },
+                        upstream,
+                    ))
+                }
+            };
+
+            if removed_published {
+                let _ = self.track_changes.send(TrackChange::Removed {
+                    scope: scope_key_to_option(&scope_key),
+                    full_name: full_name.clone(),
+                });
+            }
+
+            if let Some(closing) = closing_generation {
+                closing.removed().await;
+                continue;
+            }
+            let (writer, reader, interest, guard, upstream_tx, upstream) = created?;
+
+            let lease = CacheLease {
+                locals: self.clone(),
+                scope_key: scope_key.clone(),
+                full_name: full_name.clone(),
+                interest: interest.clone(),
+                finished: false,
+            };
+            let cleanup = CacheGenerationCleanup {
+                locals: self.clone(),
+                scope_key: scope_key.clone(),
+                full_name: full_name.clone(),
+                interest: interest.clone(),
+                armed: true,
+            };
+
+            if source
+                .requests
+                .send(TrackRequest {
+                    writer,
+                    lease,
+                    upstream: upstream_tx,
+                })
+                .await
+                .is_err()
+            {
+                return None;
+            }
+
+            cleanup.disarm();
+
+            return Some(LocalTrack {
                 reader,
-                interest,
-                guard,
-                UpstreamReadyTx { state: upstream_tx },
-                upstream,
-            )
-        };
-
-        let lease = CacheLease {
-            locals: self.clone(),
-            scope_key: scope_key.clone(),
-            full_name: full_name.clone(),
-            interest: interest.clone(),
-        };
-        let cleanup = CacheGenerationCleanup {
-            locals: self.clone(),
-            scope_key: scope_key.clone(),
-            full_name: full_name.clone(),
-            interest: interest.clone(),
-            armed: true,
-        };
-
-        if source
-            .requests
-            .send(TrackRequest {
-                writer,
-                lease,
-                upstream: upstream_tx,
-            })
-            .await
-            .is_err()
-        {
-            return None;
+                largest_location: None,
+                interest: Some(guard),
+                upstream: Some(upstream),
+            });
         }
-
-        cleanup.disarm();
-
-        Some(LocalTrack {
-            reader,
-            largest_location: None,
-            interest: Some(guard),
-            upstream: Some(upstream),
-        })
     }
 
     /// Remove a cache entry if it is still the given generation, regardless of
@@ -935,6 +1134,8 @@ impl Locals {
         if bucket.is_empty() {
             tracks.remove(scope_key);
         }
+
+        interest.mark_removed();
     }
 
     /// Cache lookup that also registers interest, under a single lock.
@@ -942,16 +1143,23 @@ impl Locals {
     /// Interest must be registered while the lock is held: taking the guard after
     /// releasing it would leave a window where eviction sees an idle entry and
     /// removes the reader this caller is about to serve.
-    fn retrieve_track_with_interest(
+    pub(crate) fn retrieve_track_with_interest(
         &self,
-        scope_key: &str,
+        scope: Option<&str>,
         full_name: &FullTrackName,
     ) -> Option<LocalTrack> {
+        let scope_key = scope.unwrap_or(UNSCOPED);
         {
             let tracks = self.tracks.read().ok()?;
             let bucket = tracks.get(scope_key)?;
             match bucket.get(full_name) {
-                Some(entry) if !entry.reader.is_closed() => {
+                Some(entry)
+                    if !entry.reader.is_closed()
+                        && !entry
+                            .interest
+                            .as_ref()
+                            .is_some_and(TrackInterest::is_closing) =>
+                {
                     return Some(LocalTrack {
                         largest_location: entry.reader.largest_location(),
                         reader: entry.reader.clone(),
@@ -964,7 +1172,7 @@ impl Locals {
             }
         }
 
-        self.prune_closed_tracks(scope_key, std::slice::from_ref(full_name));
+        self.mark_closed_cache_tracks(scope_key, std::slice::from_ref(full_name));
         None
     }
 }
@@ -1063,6 +1271,7 @@ pub struct LocalTrackRegistration {
     locals: Locals,
     scope_key: ScopeKey,
     full_name: FullTrackName,
+    reader: TrackReader,
     _gauge_guard: GaugeGuard,
 }
 
@@ -1077,21 +1286,22 @@ impl Drop for LocalTrackRegistration {
         };
         tracing::debug!(namespace = %namespace, track = %track, scope = %scope, "deregistering track from locals");
 
-        let mut removed = false;
         if let Ok(mut tracks) = self.locals.tracks.write() {
             if let Some(bucket) = tracks.get_mut(self.scope_key.as_str()) {
-                removed = bucket.remove(&self.full_name).is_some();
+                let ours = bucket.get(&self.full_name).is_some_and(|entry| {
+                    entry.source == TrackSource::Published
+                        && Arc::ptr_eq(&entry.reader.info, &self.reader.info)
+                });
+                if ours && bucket.remove(&self.full_name).is_some() {
+                    let _ = self.locals.track_changes.send(TrackChange::Removed {
+                        scope: scope_key_to_option(&self.scope_key),
+                        full_name: self.full_name.clone(),
+                    });
+                }
                 if bucket.is_empty() {
                     tracks.remove(self.scope_key.as_str());
                 }
             }
-        }
-
-        if removed {
-            let _ = self.locals.track_changes.send(TrackChange::Removed {
-                scope: scope_key_to_option(&self.scope_key),
-                full_name: self.full_name.clone(),
-            });
         }
     }
 }
@@ -1327,6 +1537,92 @@ mod tests {
         assert!(locals.retrieve_track(None, &key).is_none());
 
         drop(writer);
+    }
+
+    #[tokio::test]
+    async fn closed_published_track_remains_owned_until_registration_drops() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (writer, reader) = Track::new(namespace.clone(), "audio").produce();
+        let registration = locals
+            .register_track(None, reader)
+            .await
+            .expect("track registration should succeed");
+        drop(writer);
+
+        assert!(locals
+            .retrieve_track(None, &full(&namespace, "audio"))
+            .is_none());
+        let (_replacement_writer, replacement_reader) =
+            Track::new(namespace.clone(), "audio").produce();
+        assert!(locals
+            .register_track(None, replacement_reader.clone())
+            .await
+            .is_err());
+
+        drop(registration);
+        let _replacement = locals
+            .register_track(None, replacement_reader)
+            .await
+            .expect("replacement should register after the old owner drops");
+    }
+
+    #[tokio::test]
+    async fn stale_published_registration_does_not_remove_cache_replacement() {
+        let mut locals = Locals::new();
+        let mut changes = locals.subscribe_track_changes();
+        let namespace = ns("room/123");
+        let (_namespace_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+        let (writer, reader) = Track::new(namespace.clone(), "audio").produce();
+        let published_registration = locals
+            .register_track(None, reader)
+            .await
+            .expect("published track should register");
+        assert!(matches!(
+            changes.recv().await.expect("published track added"),
+            TrackChange::Added { .. }
+        ));
+        drop(writer);
+
+        let cached = locals
+            .get_or_request_track(None, namespace.clone(), "audio")
+            .await
+            .expect("closed published track should be replaced from namespace source");
+        let request = requests.recv().await.expect("cache request");
+        assert!(matches!(
+            changes
+                .recv()
+                .await
+                .expect("closed published track removed"),
+            TrackChange::Removed { .. }
+        ));
+
+        drop(published_registration);
+        assert!(locals
+            .retrieve_track(None, &full(&namespace, "audio"))
+            .is_some());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), changes.recv())
+                .await
+                .is_err(),
+            "stale registration emitted a duplicate removal"
+        );
+
+        drop(cached);
+        request.lease.finish_release();
+        let (_replacement_writer, replacement_reader) =
+            Track::new(namespace.clone(), "audio").produce();
+        let _replacement = locals
+            .register_track(None, replacement_reader)
+            .await
+            .expect("published replacement should register");
+        assert!(matches!(
+            changes.recv().await.expect("replacement track added"),
+            TrackChange::Added { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1961,9 +2257,180 @@ mod tests {
             .established()
             .await
             .expect_err("an abandoned request must not leave subscribers waiting forever");
+        // The reason is spelled out rather than reported as an opaque internal
+        // error: abandonment used to be indistinguishable from any other
+        // internal fault once it reached the subscriber.
         assert!(
-            matches!(err, ServeError::InternalWithId(_, _)),
+            matches!(&err, ServeError::Internal(reason) if reason.contains("upstream publisher went away")),
             "unexpected error: {err}"
+        );
+    }
+
+    /// The production strand: the owning session gives up *before* it ever
+    /// drains its request queue, so the request is destroyed while still
+    /// buffered in the channel rather than after being received.
+    ///
+    /// This is `Consumer::serve` returning early after a failed coordinator
+    /// registration or session teardown, once
+    /// `register_namespace` has already published the route source. Distinct
+    /// from `abandoned_request_releases_waiting_subscribers`, which drops a
+    /// request that was successfully received.
+    #[tokio::test]
+    async fn requests_stranded_in_the_queue_release_waiting_subscribers() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let full_name = full(&namespace, "video");
+        let (_registration, requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        // A downstream SUBSCRIBE lands in the window between the route source
+        // being published and the owning session reaching its drain loop.
+        let upstream = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("missing track should be requested")
+            .upstream
+            .expect("cached track should hand back a gate");
+        assert!(locals.contains_track_entry(None, &full_name));
+
+        // The session aborts without ever calling `requests.recv()`.
+        drop(requests);
+        assert!(!locals.contains_track_entry(None, &full_name));
+
+        let err = tokio::time::timeout(Duration::from_secs(5), upstream.established())
+            .await
+            .expect("a stranded request must not leave subscribers waiting")
+            .expect_err("a stranded request is not an established subscription");
+        assert!(
+            matches!(&err, ServeError::Internal(reason) if reason.contains("upstream publisher went away")),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A resolved gate must survive the sender's drop.
+    ///
+    /// The sender outlives `established()` by the whole lifetime of the
+    /// upstream subscription, so if its `Drop` overwrote the outcome, every
+    /// subscriber arriving after a track stopped would be told the upstream
+    /// failed when it had in fact succeeded.
+    #[tokio::test]
+    async fn dropping_a_resolved_sender_does_not_overwrite_the_outcome() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let upstream = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("missing track should be requested")
+            .upstream
+            .expect("cached track should hand back a gate");
+
+        let request = requests.recv().await.expect("source should get a request");
+        request.upstream.established();
+        drop(request);
+
+        tokio::time::timeout(Duration::from_secs(5), upstream.established())
+            .await
+            .expect("a resolved gate must not block")
+            .expect("dropping the sender must not turn success into failure");
+    }
+
+    /// The same guarantee for an explicit failure: the reported reason must not
+    /// be replaced by the generic drop fallback.
+    #[tokio::test]
+    async fn dropping_a_failed_sender_preserves_the_reported_reason() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let upstream = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("missing track should be requested")
+            .upstream
+            .expect("cached track should hand back a gate");
+
+        let request = requests.recv().await.expect("source should get a request");
+        request.upstream.failed(ServeError::NotFound);
+        drop(request);
+
+        let err = tokio::time::timeout(Duration::from_secs(5), upstream.established())
+            .await
+            .expect("a resolved gate must not block")
+            .expect_err("the upstream failure should surface");
+        assert!(
+            matches!(err, ServeError::NotFound),
+            "drop fallback overwrote the real reason: {err}"
+        );
+    }
+
+    /// Resolving with every receiver already gone must still be recorded.
+    ///
+    /// `watch::Sender::send` refuses to update once the last receiver drops,
+    /// which would leave a successfully established subscription sitting on
+    /// `Pending`. The `Drop` fallback would treat that state as abandonment and report a
+    /// spurious failure by the `Drop` fallback.
+    ///
+    /// Driven against the sender directly: in the registry the cache entry
+    /// holds its own receiver, so the last-receiver case cannot be staged
+    /// through `get_or_request_track`.
+    #[test]
+    fn outcome_is_recorded_after_the_last_receiver_is_gone() {
+        let (state_tx, state_rx) = watch::channel(UpstreamState::Pending);
+        let tx = UpstreamReadyTx { state: state_tx };
+
+        drop(state_rx);
+        tx.established();
+
+        assert!(
+            matches!(&*tx.state.borrow(), UpstreamState::Established),
+            "the outcome must be recorded even with no receivers left"
+        );
+    }
+
+    /// With the outcome recorded, `Drop` must leave it alone. Otherwise the
+    /// fallback would rewrite a success into a failure.
+    #[test]
+    fn drop_does_not_rewrite_an_outcome_recorded_without_receivers() {
+        let (state_tx, state_rx) = watch::channel(UpstreamState::Pending);
+        let tx = UpstreamReadyTx { state: state_tx };
+
+        // Genuinely zero receivers at the moment the outcome is reported; the
+        // observer re-attaches only afterwards, standing in for a subscriber
+        // that arrives while the track is still cached.
+        drop(state_rx);
+        tx.established();
+        let observer = tx.state.subscribe();
+        drop(tx);
+
+        assert!(
+            matches!(&*observer.borrow(), UpstreamState::Established),
+            "drop must not overwrite a recorded success"
+        );
+    }
+
+    /// An unresolved sender must fail the gate on drop rather than leaving it
+    /// pending: that is what releases subscribers when a session is torn down
+    /// while parked on the upstream SUBSCRIBE.
+    #[test]
+    fn drop_resolves_an_unreported_outcome_as_failed() {
+        let (state_tx, state_rx) = watch::channel(UpstreamState::Pending);
+        let tx = UpstreamReadyTx { state: state_tx };
+
+        drop(tx);
+
+        assert!(
+            matches!(&*state_rx.borrow(), UpstreamState::Failed(_)),
+            "an unresolved sender must fail the gate on drop"
         );
     }
 
@@ -2017,27 +2484,30 @@ mod tests {
         let request = requests.recv().await.expect("source should get a request");
         let key = full(&namespace, "video");
 
-        // While a subscriber is being served the entry must stay put.
-        let released = request.lease.released();
-        tokio::pin!(released);
-        tokio::select! {
-            _ = &mut released => panic!("evicted a track that still has a subscriber"),
-            _ = tokio::time::sleep(idle * 4) => {}
-        }
-        assert!(locals.retrieve_track(None, &key).is_some());
+        {
+            // While a subscriber is being served the entry must stay put.
+            let released = request.lease.released();
+            tokio::pin!(released);
+            tokio::select! {
+                _ = &mut released => panic!("evicted a track that still has a subscriber"),
+                _ = tokio::time::sleep(idle * 4) => {}
+            }
+            assert!(locals.retrieve_track(None, &key).is_some());
 
-        // Last subscriber leaves: the entry lingers for the grace period, then goes.
-        drop(guard);
-        tokio::select! {
-            _ = &mut released => panic!("evicted before the grace period elapsed"),
-            _ = tokio::time::sleep(idle / 2) => {}
-        }
-        assert!(
-            locals.retrieve_track(None, &key).is_some(),
-            "a warm cache entry should survive a brief gap between subscribers"
-        );
+            // Last subscriber leaves: the entry lingers for the grace period, then goes.
+            drop(guard);
+            tokio::select! {
+                _ = &mut released => panic!("evicted before the grace period elapsed"),
+                _ = tokio::time::sleep(idle / 2) => {}
+            }
+            assert!(
+                locals.retrieve_track(None, &key).is_some(),
+                "a warm cache entry should survive a brief gap between subscribers"
+            );
 
-        released.await;
+            released.await;
+        }
+        request.lease.finish_release();
         assert!(
             locals.retrieve_track(None, &key).is_none(),
             "idle entry should be evicted so the next subscriber re-requests upstream"
@@ -2062,41 +2532,44 @@ mod tests {
             .expect("missing track should be requested");
         let request = requests.recv().await.expect("source should get a request");
 
-        let released = request.lease.released();
-        tokio::pin!(released);
+        {
+            let released = request.lease.released();
+            tokio::pin!(released);
 
-        drop(
-            local
+            drop(
+                local
+                    .interest
+                    .expect("cached track should hand back a guard"),
+            );
+
+            tokio::select! {
+                _ = &mut released => panic!("evicted before the grace period elapsed"),
+                _ = tokio::time::sleep(idle / 2) => {}
+            }
+
+            // New subscriber inside the grace period: served from cache, no new request.
+            let guard = locals
+                .get_or_request_track(None, namespace.clone(), "video")
+                .await
+                .expect("warm entry should still be served")
                 .interest
-                .expect("cached track should hand back a guard"),
-        );
+                .expect("cached track should hand back a guard");
 
-        tokio::select! {
-            _ = &mut released => panic!("evicted before the grace period elapsed"),
-            _ = tokio::time::sleep(idle / 2) => {}
+            tokio::select! {
+                _ = &mut released => panic!("evicted while a subscriber was present"),
+                _ = tokio::time::sleep(idle * 4) => {}
+            }
+
+            assert!(
+                requests.try_recv().is_err(),
+                "reusing the warm entry must not trigger a second upstream SUBSCRIBE"
+            );
+
+            // And it still gets evicted once that subscriber leaves too.
+            drop(guard);
+            released.await;
         }
-
-        // New subscriber inside the grace period: served from cache, no new request.
-        let guard = locals
-            .get_or_request_track(None, namespace.clone(), "video")
-            .await
-            .expect("warm entry should still be served")
-            .interest
-            .expect("cached track should hand back a guard");
-
-        tokio::select! {
-            _ = &mut released => panic!("evicted while a subscriber was present"),
-            _ = tokio::time::sleep(idle * 4) => {}
-        }
-
-        assert!(
-            requests.try_recv().is_err(),
-            "reusing the warm entry must not trigger a second upstream SUBSCRIBE"
-        );
-
-        // And it still gets evicted once that subscriber leaves too.
-        drop(guard);
-        released.await;
+        request.lease.finish_release();
         assert!(locals
             .retrieve_track(None, &full(&namespace, "video"))
             .is_none());
@@ -2125,6 +2598,7 @@ mod tests {
 
         let request = requests.recv().await.expect("source should get a request");
         request.lease.released().await;
+        request.lease.finish_release();
 
         assert!(
             locals
@@ -2132,6 +2606,75 @@ mod tests {
                 .is_none(),
             "an abandoned request must not leave a permanently leased entry"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_request_is_released_without_cache_grace() {
+        let idle = Duration::from_secs(30);
+        let mut locals = Locals::with_cache_idle_timeout(idle);
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let local = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("missing track should be requested");
+        let request = requests.recv().await.expect("source should get a request");
+        drop(local);
+
+        tokio::time::timeout(Duration::from_secs(1), request.lease.abandoned())
+            .await
+            .expect("pending request retained the cache grace period");
+        request.lease.finish_release();
+        assert!(locals
+            .retrieve_track(None, &full(&namespace, "video"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_cache_generation_blocks_replacement_until_lease_finishes() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+        let first = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("first request");
+        let TrackRequest {
+            writer,
+            lease,
+            upstream,
+        } = requests.recv().await.expect("first request received");
+
+        drop(writer);
+        drop(upstream);
+
+        let replacement = locals.get_or_request_track(None, namespace.clone(), "video");
+        tokio::pin!(replacement);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut replacement)
+                .await
+                .is_err(),
+            "a replacement overtook the closing cache generation"
+        );
+        assert!(requests.try_recv().is_err());
+
+        lease.finish_release();
+        let second = tokio::time::timeout(Duration::from_secs(1), &mut replacement)
+            .await
+            .expect("replacement remained blocked after teardown")
+            .expect("replacement request");
+        let second_request = requests.recv().await.expect("second request received");
+
+        drop(first);
+        drop(second);
+        second_request.lease.finish_release();
     }
 
     /// A zero timeout preserves the old behaviour: the upstream subscription is
@@ -2205,6 +2748,7 @@ mod tests {
         // entry look busy.
         let _ = &stale_guard;
         second_request.lease.released().await;
+        second_request.lease.finish_release();
 
         assert!(
             locals.retrieve_track(None, &key).is_none(),

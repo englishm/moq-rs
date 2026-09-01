@@ -24,8 +24,8 @@
 //! | `moq_relay_connections_closed_total` | - | Total connections that have closed (graceful or error) |
 //! | `moq_relay_connection_errors_total` | `stage` | Connection failures (stage: session_accept, session_run) |
 //! | `moq_relay_publishers_total` | - | Total publishers (PUBLISH_NAMESPACE requests) received |
-//! | `moq_relay_announce_ok_total` | - | Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE |
-//! | `moq_relay_announce_errors_total` | `phase` | PUBLISH_NAMESPACE failures (phase: coordinator_register, local_register, send_ok) |
+//! | `moq_relay_announce_ok_total` | `kind` | Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE (kind: client, proxied) |
+//! | `moq_relay_announce_errors_total` | `phase` | PUBLISH_NAMESPACE failures (phase: local_register, remote_register, coordinator_register, coordinator_lookup, send_ok, forward, peer_fanout) |
 //! | `moq_relay_subscribers_total` | - | Total subscribers (SUBSCRIBE requests) received |
 //! | `moq_relay_subscribe_not_found_total` | - | Track not found after checking all sources |
 //! | `moq_relay_subscribe_route_errors_total` | - | Infrastructure failure when routing to remote |
@@ -94,11 +94,14 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "moq_relay_announce_ok_total",
-        "Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE"
+        "Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE, by kind \
+         (client: published to this relay; proxied: forwarded by a peer relay \
+         and advertised for discovery only)"
     );
     describe_counter!(
         "moq_relay_announce_errors_total",
-        "PUBLISH_NAMESPACE failures by phase (coordinator_register, local_register, send_ok)"
+        "PUBLISH_NAMESPACE failures by phase (local_register, remote_register, \
+         coordinator_register, coordinator_lookup, send_ok, forward, peer_fanout)"
     );
     describe_counter!(
         "moq_relay_subscribers_total",

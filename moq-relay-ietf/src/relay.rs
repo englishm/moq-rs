@@ -13,7 +13,8 @@ use url::Url;
 use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
 use crate::{
     metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
-    RelayInfo, RemoteManager, Session, SessionContext, DEFAULT_CACHE_IDLE_TIMEOUT,
+    RelayInfo, RemoteManager, Session, SessionContext, SessionInterface,
+    DEFAULT_CACHE_IDLE_TIMEOUT,
 };
 
 // A type alias for boxed future
@@ -409,6 +410,31 @@ impl Relay {
                                 }
                                 None => SessionContext::public(scope),
                             };
+
+                            // The resolved interface controls whether an inbound
+                            // PUBLISH_NAMESPACE is owned here or advertised only
+                            // for peer discovery. Internal sessions are rare and
+                            // logged at info; public client sessions stay at
+                            // debug to avoid a per-connection info log.
+                            macro_rules! log_session_accepted {
+                                ($level:ident) => {
+                                    tracing::$level!(
+                                    interface = ?context.interface,
+                                    local_ip = ?local_ip,
+                                    remote_addr = %remote_addr,
+                                    tagger = connection_tagger.is_some(),
+                                    "session accepted"
+                                    )
+                                };
+                            }
+                            match context.interface {
+                                SessionInterface::Internal => {
+                                    log_session_accepted!(info)
+                                }
+                                SessionInterface::Public => {
+                                    log_session_accepted!(debug)
+                                }
+                            }
 
                             if let Some(ref info) = scope_info {
                                 tracing::debug!(
