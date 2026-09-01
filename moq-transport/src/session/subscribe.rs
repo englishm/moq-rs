@@ -274,7 +274,13 @@ impl Subscribe {
                 }
                 // RESET_STREAM is not ordered against a new QUIC stream. Retire
                 // this session before releasing a cache generation so a retry
-                // cannot overtake teardown on the same connection.
+                // cannot overtake teardown on the same connection. This also
+                // interrupts every other subscription multiplexed on the peer;
+                // they reconnect through normal upstream routing.
+                tracing::warn!(
+                    request_id = self.info.id,
+                    "retiring upstream session after stuck SUBSCRIBE teardown; all multiplexed subscriptions will reconnect"
+                );
                 self.subscriber.close_session(
                     super::CANCELLED_STREAM_CODE,
                     "SUBSCRIBE request stream teardown timed out",

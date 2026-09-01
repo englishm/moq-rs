@@ -45,6 +45,7 @@ use bytes::Buf;
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -55,7 +56,6 @@ use crate::watch::Queue;
 use crate::{message, setup};
 
 pub(super) const CANCELLED_STREAM_CODE: u32 = crate::data::DataStreamResetCode::Cancelled as u32;
-use std::path::PathBuf;
 
 pub(crate) struct BidiResponse {
     message: Message,
