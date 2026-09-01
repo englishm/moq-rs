@@ -22,9 +22,9 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    DoneOutcome, NameRegistry, PublishReceived, PublishReceivedRecv, PublishedNamespace,
-    PublishedNamespaceRecv, Reader, RequestId, Session, SessionError, Subscribe,
-    SubscribeNamespace, SubscribeNamespaceInfo, SubscribeRecv, Writer,
+    BidiResponse, BidiResponseMap, DoneOutcome, NameRegistry, PublishReceived, PublishReceivedRecv,
+    PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, Session, SessionError,
+    Subscribe, SubscribeNamespace, SubscribeNamespaceInfo, SubscribeRecv, Writer,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -182,6 +182,10 @@ pub struct Subscriber {
     /// will process the queue and send the message on the control stream.
     outgoing: Queue<Message>,
 
+    /// Response streams for peer-initiated requests. PUBLISH decisions use the
+    /// request-local channel so they cannot be overtaken by PUBLISH_DONE.
+    bidi_response_map: BidiResponseMap,
+
     /// WebTransport session, used to open bidi streams for requests (draft-18).
     webtransport: web_transport::Session,
 
@@ -245,6 +249,7 @@ impl Subscriber {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         bidi_task_tx: super::BidiTaskSender,
+        bidi_response_map: BidiResponseMap,
     ) -> Self {
         Self {
             published_namespaces: Default::default(),
@@ -262,6 +267,7 @@ impl Subscriber {
             publishes_received: Default::default(),
             publish_received_queue: Default::default(),
             bidi_task_tx,
+            bidi_response_map,
         }
     }
 
@@ -320,6 +326,36 @@ impl Subscriber {
     pub(super) fn send_request_error(&mut self, request_kind: &str, msg: message::RequestError) {
         self.log_request_error_created(request_kind, &msg);
         self.send_message(msg);
+    }
+
+    pub(super) fn send_publish_response(&mut self, message: Message) -> Result<(), ServeError> {
+        let request_id = message
+            .response_target_id()
+            .ok_or_else(|| ServeError::internal_ctx("PUBLISH response has no request ID"))?;
+        match &message {
+            Message::RequestOk(msg) => self.add_mlog_event(|time| {
+                mlog::events::request_ok_created(time, request_id, "publish", msg)
+            }),
+            Message::RequestError(msg) => self.add_mlog_event(|time| {
+                mlog::events::request_error_created(time, request_id, "publish", msg)
+            }),
+            _ => {
+                return Err(ServeError::internal_ctx(
+                    "invalid response type for inbound PUBLISH",
+                ))
+            }
+        }
+        Session::log_control_message(&message, "sent");
+        let stream = self
+            .bidi_response_map
+            .lock()
+            .map_err(|_| ServeError::internal_ctx("bidi response map lock poisoned"))?
+            .get(&request_id)
+            .cloned()
+            .ok_or(ServeError::Cancel)?;
+        stream
+            .send(BidiResponse::new(message))
+            .map_err(|_| ServeError::Cancel)
     }
 
     /// Allocate the next outbound request ID.
@@ -1278,6 +1314,14 @@ impl Subscriber {
         self.publish_received_queue.pop().await
     }
 
+    #[cfg(test)]
+    pub(super) fn has_subscriber_name(&self, name: &FullTrackName) -> bool {
+        self.subscriber_names
+            .lock()
+            .map(|names| names.contains_name(name))
+            .unwrap_or(false)
+    }
+
     /// Abandon an inbound PUBLISH whose request stream closed without
     /// PUBLISH_DONE.
     ///
@@ -1327,7 +1371,7 @@ impl Subscriber {
 
     /// Remove all subscriber-side state for an inbound PUBLISH.
     ///
-    /// Called by `PublishReceived::drop` when the app did not call `ok()`.
+    /// Used when an inbound PUBLISH cannot be queued for the application.
     pub(super) fn remove_publish_received(&self, request_id: u64) {
         if let Err(err) = self.remove_publish_received_state(request_id) {
             tracing::error!(request_id, error = %err, "failed to remove inbound PUBLISH state");
@@ -1999,6 +2043,7 @@ mod tests {
             None,
             RequestId::new(0, 1),
             bidi_task_tx,
+            Default::default(),
         )
     }
 
@@ -2157,6 +2202,7 @@ mod tests {
                 None,
                 RequestId::new(0, 1),
                 bidi_task_tx,
+                Default::default(),
             ),
             bidi_task_rx,
         )

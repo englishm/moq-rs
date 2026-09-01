@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::io;
+use std::{io, ops};
 
 use crate::coding::{Encode, EncodeError};
 
@@ -101,5 +101,57 @@ impl Writer {
     /// Used to tear down a single request stream without closing the session.
     pub fn reset(&mut self, code: u32) {
         self.stream.reset(code);
+    }
+
+    /// Wait until the peer stops receiving this stream or it is closed.
+    pub async fn closed(&mut self) -> Result<Option<u8>, SessionError> {
+        Ok(self.stream.closed().await?)
+    }
+}
+
+pub(super) struct ResetOnDropWriter {
+    writer: Writer,
+    closed: bool,
+}
+
+impl ResetOnDropWriter {
+    pub fn new(writer: Writer) -> Self {
+        Self {
+            writer,
+            closed: false,
+        }
+    }
+
+    pub fn finish(&mut self) -> Result<(), SessionError> {
+        self.writer.finish()?;
+        self.closed = true;
+        Ok(())
+    }
+
+    pub fn reset(&mut self, code: u32) {
+        self.writer.reset(code);
+        self.closed = true;
+    }
+}
+
+impl ops::Deref for ResetOnDropWriter {
+    type Target = Writer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.writer
+    }
+}
+
+impl ops::DerefMut for ResetOnDropWriter {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.writer
+    }
+}
+
+impl Drop for ResetOnDropWriter {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.writer.reset(0);
+        }
     }
 }

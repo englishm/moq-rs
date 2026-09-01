@@ -136,10 +136,13 @@ impl PublishReceived {
         let mut params = KeyValuePairs::default();
         params.set_forward(forward);
 
-        self.session.send_message(message::RequestOk {
-            id: self.request_id,
-            params,
-        });
+        self.session.send_publish_response(
+            message::RequestOk {
+                id: self.request_id,
+                params,
+            }
+            .into(),
+        )?;
         self.ok = true;
 
         Ok(())
@@ -227,18 +230,21 @@ impl Drop for PublishReceived {
             _ => RequestErrorCode::InternalError as u64,
         };
 
-        self.session.send_request_error(
-            "publish",
+        if let Err(err) = self.session.send_publish_response(
             message::RequestError {
                 id: self.request_id,
                 error_code,
                 retry_interval: 0,
                 reason: ReasonPhrase("uninterested".to_string()),
-            },
-        );
-
-        // Clean up subscriber-side state for this PUBLISH.
-        self.session.remove_publish_received(self.request_id);
+            }
+            .into(),
+        ) {
+            tracing::debug!(
+                request_id = self.request_id,
+                error = %err,
+                "failed to send inbound PUBLISH rejection"
+            );
+        }
     }
 }
 
@@ -508,7 +514,7 @@ mod tests {
         PublishReceivedRecv,
         crate::session::Subscriber,
     ) {
-        let (pr, recv, subscriber, _outgoing) = make_pair_with_outgoing(request_id).await;
+        let (pr, recv, subscriber, _responses) = make_pair_with_outgoing(request_id).await;
         (pr, recv, subscriber)
     }
 
@@ -520,10 +526,11 @@ mod tests {
         PublishReceived,
         PublishReceivedRecv,
         crate::session::Subscriber,
-        Queue<message::Message>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::session::BidiResponse>,
     ) {
         let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
         let outgoing = Queue::default();
+        let response_map: crate::session::BidiResponseMap = Default::default();
         let subscriber = crate::session::Subscriber::new(
             outgoing.clone(),
             loopback_session().await,
@@ -531,7 +538,10 @@ mod tests {
             None,
             RequestId::new(0, 1),
             bidi_task_tx,
+            response_map.clone(),
         );
+        let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
+        response_map.lock().unwrap().insert(request_id, response_tx);
         let (writer, reader) =
             Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4").produce();
         let (pr, recv) = PublishReceivedRecv::produce(
@@ -546,7 +556,7 @@ mod tests {
             writer,
             reader,
         );
-        (pr, recv, subscriber, outgoing)
+        (pr, recv, subscriber, response_rx)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -870,19 +880,20 @@ mod tests {
     /// never resolved.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn accept_answers_with_request_ok() {
-        let (mut pr, _recv, _sub, mut outgoing) = make_pair_with_outgoing(6).await;
+        let (mut pr, _recv, _sub, mut responses) = make_pair_with_outgoing(6).await;
 
         pr.accept(false).expect("accept a fresh PUBLISH");
 
-        let sent = outgoing
-            .pop()
+        let sent = responses
+            .recv()
             .await
             .expect("acceptance is sent to the peer");
-        let message::Message::RequestOk(msg) = sent else {
-            panic!(
+        let msg = match sent.message {
+            message::Message::RequestOk(msg) => msg,
+            other => panic!(
                 "PUBLISH must be accepted with REQUEST_OK, got {}",
-                sent.name()
-            );
+                other.name()
+            ),
         };
         assert_eq!(msg.id, 6, "the response carries the request it answers");
         assert_eq!(

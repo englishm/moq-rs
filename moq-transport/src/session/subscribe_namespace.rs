@@ -443,6 +443,7 @@ mod tests {
             None,
             RequestId::new(0, 1),
             bidi_task_tx,
+            Default::default(),
         )
     }
 
