@@ -1292,13 +1292,11 @@ impl Drop for LocalTrackRegistration {
                     entry.source == TrackSource::Published
                         && Arc::ptr_eq(&entry.reader.info, &self.reader.info)
                 });
-                if ours {
-                    if bucket.remove(&self.full_name).is_some() {
-                        let _ = self.locals.track_changes.send(TrackChange::Removed {
-                            scope: scope_key_to_option(&self.scope_key),
-                            full_name: self.full_name.clone(),
-                        });
-                    }
+                if ours && bucket.remove(&self.full_name).is_some() {
+                    let _ = self.locals.track_changes.send(TrackChange::Removed {
+                        scope: scope_key_to_option(&self.scope_key),
+                        full_name: self.full_name.clone(),
+                    });
                 }
                 if bucket.is_empty() {
                     tracks.remove(self.scope_key.as_str());
