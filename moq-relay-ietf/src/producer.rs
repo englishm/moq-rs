@@ -481,19 +481,14 @@ impl Producer {
                 return self.reject_unresolved_overload(subscribed, &mut timing_guard);
             }
 
+            let remote_lookup = self.remotes.subscribe_with_lookup_status(
+                self.context.scope(),
+                &namespace,
+                &track_name,
+                &mut coordinator_lookup_succeeded,
+            );
             let remote = if let Some(deadline) = deadline {
-                match Self::await_rendezvous_work(
-                    &subscribed,
-                    deadline,
-                    self.remotes.subscribe_with_lookup_status(
-                        self.context.scope(),
-                        &namespace,
-                        &track_name,
-                        &mut coordinator_lookup_succeeded,
-                    ),
-                )
-                .await
-                {
+                match Self::await_rendezvous_work(&subscribed, deadline, remote_lookup).await {
                     RendezvousWork::Completed(result) => result,
                     RendezvousWork::TimedOut => {
                         return Self::finish_unresolved_rendezvous(
@@ -515,14 +510,18 @@ impl Producer {
                     }
                 }
             } else {
-                self.remotes
-                    .subscribe_with_lookup_status(
-                        self.context.scope(),
-                        &namespace,
-                        &track_name,
-                        &mut coordinator_lookup_succeeded,
-                    )
-                    .await
+                tokio::select! {
+                    result = remote_lookup => result,
+                    _ = subscribed.closed() => {
+                        tracing::debug!(
+                            namespace = %namespace.to_utf8_path(),
+                            track = %track_name,
+                            "subscriber left during a route lookup"
+                        );
+                        timing_guard.set_label("source", "downstream_left");
+                        return Ok(());
+                    }
+                }
             };
 
             match remote {
@@ -1682,8 +1681,7 @@ mod tests {
         upstream_client_task.abort();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn cancelled_remote_subscribe_tears_down_before_same_track_retry() {
+    async fn assert_cancelled_remote_subscribe_orders_retry(rendezvous: bool) {
         let (upstream_server_transport, upstream_client_transport) =
             loopback_webtransport_pair().await;
         let (upstream_server, upstream_client) = tokio::join!(
@@ -1713,11 +1711,15 @@ mod tests {
         let (first_writer, _first_reader) = Track::new(namespace.clone(), "retry").produce();
         let mut first_subscriber = subscriber.clone();
         let first = tokio::spawn(async move {
-            let mut params = KeyValuePairs::default();
-            params.set_rendezvous_timeout(30_000);
-            first_subscriber
-                .subscribe_open_with_params(first_writer, params)
-                .await
+            if rendezvous {
+                let mut params = KeyValuePairs::default();
+                params.set_rendezvous_timeout(30_000);
+                first_subscriber
+                    .subscribe_open_with_params(first_writer, params)
+                    .await
+            } else {
+                first_subscriber.subscribe_open(first_writer).await
+            }
         });
         let first_upstream = tokio::time::timeout(
             Duration::from_secs(2),
@@ -1740,11 +1742,15 @@ mod tests {
         let retry_namespace = namespace.clone();
         let retry = tokio::spawn(async move {
             let (writer, _reader) = Track::new(retry_namespace, "retry").produce();
-            let mut params = KeyValuePairs::default();
-            params.set_rendezvous_timeout(30_000);
-            retry_subscriber
-                .subscribe_open_with_params(writer, params)
-                .await
+            if rendezvous {
+                let mut params = KeyValuePairs::default();
+                params.set_rendezvous_timeout(30_000);
+                retry_subscriber
+                    .subscribe_open_with_params(writer, params)
+                    .await
+            } else {
+                retry_subscriber.subscribe_open(writer).await
+            }
         });
 
         let publisher = upstream_publisher
@@ -1780,6 +1786,16 @@ mod tests {
 
         upstream_server_task.abort();
         upstream_client_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_remote_subscribe_tears_down_before_same_track_retry() {
+        assert_cancelled_remote_subscribe_orders_retry(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_remote_subscribe_without_rendezvous_releases_the_slot() {
+        assert_cancelled_remote_subscribe_orders_retry(false).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
