@@ -48,6 +48,7 @@ impl CacheSubscriptionCleanup {
     fn finish(mut self) -> Option<tokio::task::JoinHandle<()>> {
         let subscribe = self.subscribe.take();
         let lease = self.lease.take()?;
+        lease.begin_release();
         Some(tokio::spawn(async move {
             if let Some(subscribe) = subscribe {
                 subscribe.unsubscribe().await;
@@ -62,6 +63,7 @@ impl Drop for CacheSubscriptionCleanup {
         let Some(lease) = self.lease.take() else {
             return;
         };
+        lease.begin_release();
         let subscribe = self.subscribe.take();
 
         if let Some(subscribe) = subscribe {
@@ -449,6 +451,8 @@ impl Consumer {
                         cleanup.attach(subscribe);
                         let (subscribe, lease) = cleanup.handles()?;
 
+                        // Opening wins a tied wake above, so recheck abandonment
+                        // before accepting the upstream subscription.
                         let accepted = tokio::select! {
                             result = subscribe.ok() => Some(result),
                             _ = lease.abandoned() => None,

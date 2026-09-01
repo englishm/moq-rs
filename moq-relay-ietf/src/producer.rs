@@ -1683,6 +1683,106 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_remote_subscribe_tears_down_before_same_track_retry() {
+        let (upstream_server_transport, upstream_client_transport) =
+            loopback_webtransport_pair().await;
+        let (upstream_server, upstream_client) = tokio::join!(
+            TransportSession::accept(upstream_server_transport, None, Transport::WebTransport),
+            TransportSession::connect(upstream_client_transport, None, Transport::WebTransport),
+        );
+        let (upstream_server, mut upstream_publisher, _) =
+            upstream_server.expect("accept upstream MoQT session");
+        let (upstream_client, remote_publisher, remote_subscriber) =
+            upstream_client.expect("connect upstream MoQT session");
+        let remote_url = url::Url::parse("https://relay.example.com/live").unwrap();
+        let coordinator = Arc::new(RemoteCoordinator {
+            url: remote_url.clone(),
+        });
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        remotes
+            .insert_test_remote(remote_url, remote_publisher, remote_subscriber)
+            .await;
+
+        let upstream_server_task = tokio::spawn(upstream_server.run());
+        let upstream_client_task = tokio::spawn(upstream_client.run());
+        let locals = Locals::new();
+        let subscriber =
+            spawn_relay_session(locals, remotes, coordinator as Arc<dyn Coordinator>).await;
+        let namespace = TrackNamespace::from_utf8_path("admission");
+
+        let (first_writer, _first_reader) = Track::new(namespace.clone(), "retry").produce();
+        let mut first_subscriber = subscriber.clone();
+        let first = tokio::spawn(async move {
+            let mut params = KeyValuePairs::default();
+            params.set_rendezvous_timeout(30_000);
+            first_subscriber
+                .subscribe_open_with_params(first_writer, params)
+                .await
+        });
+        let first_upstream = tokio::time::timeout(
+            Duration::from_secs(2),
+            upstream_publisher
+                .as_mut()
+                .expect("upstream server publisher")
+                .subscribed(),
+        )
+        .await
+        .expect("first upstream subscribe timed out")
+        .expect("first upstream subscribe");
+
+        first.abort();
+        match first.await {
+            Err(err) => assert!(err.is_cancelled()),
+            Ok(_) => panic!("first subscribe was not cancelled"),
+        }
+
+        let mut retry_subscriber = subscriber.clone();
+        let retry_namespace = namespace.clone();
+        let retry = tokio::spawn(async move {
+            let (writer, _reader) = Track::new(retry_namespace, "retry").produce();
+            let mut params = KeyValuePairs::default();
+            params.set_rendezvous_timeout(30_000);
+            retry_subscriber
+                .subscribe_open_with_params(writer, params)
+                .await
+        });
+
+        let publisher = upstream_publisher
+            .as_mut()
+            .expect("upstream server publisher");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                biased;
+                _ = first_upstream.closed() => {}
+                _ = publisher.subscribed() => {
+                    panic!("same-track retry overtook the first upstream teardown")
+                }
+            }
+        })
+        .await
+        .expect("first upstream teardown did not complete");
+        drop(first_upstream);
+
+        let second_upstream = tokio::time::timeout(Duration::from_secs(2), publisher.subscribed())
+            .await
+            .expect("second upstream subscribe timed out")
+            .expect("second upstream subscribe");
+        second_upstream
+            .close(ServeError::Closed(RequestErrorCode::Uninterested as u64))
+            .expect("reject second upstream subscribe");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), retry)
+                .await
+                .expect("downstream retry timed out")
+                .expect("join downstream retry"),
+            Err(ServeError::Closed(code)) if code == RequestErrorCode::Uninterested as u64
+        ));
+
+        upstream_server_task.abort();
+        upstream_client_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn one_session_cannot_monopolize_relay_capacity() {
         let locals = Locals::new();
         let coordinator = Arc::new(CountingCoordinator::default());

@@ -18,7 +18,7 @@ use super::Subscriber;
 use super::{DoneOutcome, StreamDrain};
 
 const SUBSCRIBE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-type SubscribeRequestSink = tokio::sync::mpsc::UnboundedSender<message::Message>;
+type SubscribeRequestSink = tokio::sync::mpsc::Sender<message::Message>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryFilter {
@@ -272,6 +272,13 @@ impl Subscribe {
                 if let Some(cancel) = self.request_cancel.take() {
                     let _ = cancel.send(super::CANCELLED_STREAM_CODE);
                 }
+                // RESET_STREAM is not ordered against a new QUIC stream. Retire
+                // this session before releasing a cache generation so a retry
+                // cannot overtake teardown on the same connection.
+                self.subscriber.close_session(
+                    super::CANCELLED_STREAM_CODE,
+                    "SUBSCRIBE request stream teardown timed out",
+                );
                 if tokio::time::timeout(timeout, &mut request_done)
                     .await
                     .is_err()
@@ -290,7 +297,7 @@ impl Subscribe {
         let stream = self.stream.take();
         if self.state.lock().closed.is_ok() {
             if let Some(stream) = &stream {
-                let _ = stream.send(message::Unsubscribe { id: self.info.id }.into());
+                let _ = stream.try_send(message::Unsubscribe { id: self.info.id }.into());
             }
         }
     }

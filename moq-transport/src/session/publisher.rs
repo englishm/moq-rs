@@ -144,13 +144,19 @@ struct PublishNamespaceCleanup {
 /// Resets both halves when opening a request is cancelled before its response
 /// pump takes ownership of the stream.
 struct OpeningPublishNamespaceStream {
+    session: web_transport::Session,
     writer: Option<Writer>,
     reader: Option<Reader>,
 }
 
 impl OpeningPublishNamespaceStream {
-    fn new(send: web_transport::SendStream, recv: web_transport::RecvStream) -> Self {
+    fn new(
+        session: web_transport::Session,
+        send: web_transport::SendStream,
+        recv: web_transport::RecvStream,
+    ) -> Self {
         Self {
+            session,
             writer: Some(Writer::new(send)),
             reader: Some(Reader::new(recv)),
         }
@@ -165,11 +171,18 @@ impl OpeningPublishNamespaceStream {
 
 impl Drop for OpeningPublishNamespaceStream {
     fn drop(&mut self) {
+        let cancelled = self.writer.is_some() || self.reader.is_some();
         if let Some(writer) = &mut self.writer {
             writer.reset(super::CANCELLED_STREAM_CODE);
         }
         if let Some(reader) = &mut self.reader {
             reader.stop(super::CANCELLED_STREAM_CODE);
+        }
+        if cancelled {
+            self.session.close(
+                super::CANCELLED_STREAM_CODE,
+                "PUBLISH_NAMESPACE stream opening cancelled",
+            );
         }
     }
 }
@@ -323,9 +336,10 @@ impl Publisher {
         };
         let frame = super::encode_request_frame(&Message::PublishNamespace(msg))?;
         let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
-        let mut opening = OpeningPublishNamespaceStream::new(send_stream, recv_stream);
+        let mut opening =
+            OpeningPublishNamespaceStream::new(self.webtransport.clone(), send_stream, recv_stream);
 
-        let OpeningPublishNamespaceStream { writer, reader } = &mut opening;
+        let OpeningPublishNamespaceStream { writer, reader, .. } = &mut opening;
         let writer = writer.as_mut().ok_or(SessionError::Internal)?;
         let reader = reader.as_mut().ok_or(SessionError::Internal)?;
 
@@ -1727,8 +1741,8 @@ mod tests {
         assert!(matches!(
             data_reader.done().await,
             Err(crate::session::SessionError::WebTransport(
-                web_transport::Error::Read(web_transport::quinn::ReadError::Reset(0))
-            ))
+                web_transport::Error::Read(web_transport::quinn::ReadError::Reset(code))
+            )) if code == u32::from(data::DataStreamResetCode::Cancelled)
         ));
         let mut request_reader = request.await.unwrap();
         assert!(request_reader.done().await.unwrap());

@@ -286,6 +286,11 @@ impl CacheLease {
         self.release();
     }
 
+    pub(crate) fn begin_release(&self) {
+        self.locals
+            .mark_cache_entry_closing(&self.scope_key, &self.full_name, &self.interest);
+    }
+
     fn release(&mut self) {
         if self.finished {
             return;
@@ -577,7 +582,7 @@ impl Locals {
 
         // Collect matching readers under a shared read lock so concurrent
         // SUBSCRIBE_NAMESPACE fan-outs don't serialize against each other. Note any
-        // closed entries and prune them afterwards under a brief write lock, keeping
+        // closed entries and handle them afterwards under a brief write lock, keeping
         // the common (no-stale) path read-only.
         let mut matches = Vec::new();
         let mut stale = Vec::new();
@@ -600,38 +605,33 @@ impl Locals {
         }
 
         if !stale.is_empty() {
-            self.prune_closed_tracks(scope_key, &stale);
+            self.mark_closed_cache_tracks(scope_key, &stale);
         }
 
         matches
     }
 
-    /// Remove the given tracks from a scope bucket if they are still closed.
+    /// Mark closed cache entries as closing without removing published generations.
     ///
     /// Invoked off the read path (e.g. by [`Locals::list_tracks_matching`]) so that
-    /// closed-entry cleanup takes the write lock only briefly and only when a closed
-    /// entry was actually observed. The re-check guards against removing an entry
-    /// that a concurrent writer replaced with a live reader.
-    fn prune_closed_tracks(&self, scope_key: &str, keys: &[FullTrackName]) {
-        let Ok(mut tracks) = self.tracks.write() else {
+    /// the transition takes the write lock only briefly. The re-check avoids marking
+    /// an entry that a concurrent writer replaced with a live reader.
+    fn mark_closed_cache_tracks(&self, scope_key: &str, keys: &[FullTrackName]) {
+        let Ok(tracks) = self.tracks.write() else {
             return;
         };
-        let Some(bucket) = tracks.get_mut(scope_key) else {
+        let Some(bucket) = tracks.get(scope_key) else {
             return;
         };
         for key in keys {
-            if bucket.get(key).is_some_and(|entry| {
-                entry.reader.is_closed()
-                    && !entry
-                        .interest
-                        .as_ref()
-                        .is_some_and(TrackInterest::is_closing)
-            }) {
-                bucket.remove(key);
+            if let Some(entry) = bucket.get(key).filter(|entry| entry.reader.is_closed()) {
+                // Cache entries remain as a closing generation until their
+                // upstream request stream is torn down. Published entries are
+                // removed only by their generation-owning registration.
+                if let Some(interest) = &entry.interest {
+                    interest.mark_closing();
+                }
             }
-        }
-        if bucket.is_empty() {
-            tracks.remove(scope_key);
         }
     }
 
@@ -787,13 +787,14 @@ impl Locals {
 
         let _ = self.track_changes.send(TrackChange::Added {
             scope: scope_key_to_option(&scope_key),
-            track,
+            track: track.clone(),
         });
 
         Ok(LocalTrackRegistration {
             locals: self.clone(),
             scope_key,
             full_name,
+            reader: track,
             _gauge_guard: GaugeGuard::new("moq_relay_active_published_tracks"),
         })
     }
@@ -817,9 +818,9 @@ impl Locals {
             }
         }
 
-        // The entry was closed; remove it under a brief write lock (re-checking in
-        // case a concurrent writer replaced it with a live reader).
-        self.prune_closed_tracks(scope_key, std::slice::from_ref(full_name));
+        // A closed cache entry must remain visible as a closing generation until
+        // its upstream request stream is torn down.
+        self.mark_closed_cache_tracks(scope_key, std::slice::from_ref(full_name));
         None
     }
 
@@ -885,6 +886,27 @@ impl Locals {
         );
 
         true
+    }
+
+    fn mark_cache_entry_closing(
+        &self,
+        scope_key: &str,
+        full_name: &FullTrackName,
+        interest: &TrackInterest,
+    ) {
+        let Ok(tracks) = self.tracks.write() else {
+            return;
+        };
+        let ours = tracks
+            .get(scope_key)
+            .and_then(|bucket| bucket.get(full_name))
+            .and_then(|entry| entry.interest.as_ref())
+            .is_some_and(|current| current.same_generation(interest));
+        if ours {
+            interest.mark_closing();
+        } else {
+            interest.mark_removed();
+        }
     }
 
     /// Return the best namespace route source for a requested namespace.
@@ -964,6 +986,7 @@ impl Locals {
             // owns requesting it from the source; concurrent callers share the reserved
             // reader instead of racing to insert and failing with a spurious `None`.
             let mut closing_generation = None;
+            let mut removed_published = false;
             let created = {
                 let mut tracks = self.tracks.write().ok()?;
                 let bucket = tracks.entry(scope_key.clone()).or_default();
@@ -983,6 +1006,11 @@ impl Locals {
                             interest: entry.interest.as_ref().map(TrackInterest::guard),
                             upstream: entry.upstream.clone(),
                         });
+                    } else if let Some(interest) = &entry.interest {
+                        interest.mark_closing();
+                        closing_generation = Some(interest.clone());
+                    } else if entry.source == TrackSource::Published {
+                        removed_published = true;
                     }
                 }
 
@@ -1024,6 +1052,13 @@ impl Locals {
                     ))
                 }
             };
+
+            if removed_published {
+                let _ = self.track_changes.send(TrackChange::Removed {
+                    scope: scope_key_to_option(&scope_key),
+                    full_name: full_name.clone(),
+                });
+            }
 
             if let Some(closing) = closing_generation {
                 closing.removed().await;
@@ -1137,7 +1172,7 @@ impl Locals {
             }
         }
 
-        self.prune_closed_tracks(scope_key, std::slice::from_ref(full_name));
+        self.mark_closed_cache_tracks(scope_key, std::slice::from_ref(full_name));
         None
     }
 }
@@ -1236,6 +1271,7 @@ pub struct LocalTrackRegistration {
     locals: Locals,
     scope_key: ScopeKey,
     full_name: FullTrackName,
+    reader: TrackReader,
     _gauge_guard: GaugeGuard,
 }
 
@@ -1250,21 +1286,24 @@ impl Drop for LocalTrackRegistration {
         };
         tracing::debug!(namespace = %namespace, track = %track, scope = %scope, "deregistering track from locals");
 
-        let mut removed = false;
         if let Ok(mut tracks) = self.locals.tracks.write() {
             if let Some(bucket) = tracks.get_mut(self.scope_key.as_str()) {
-                removed = bucket.remove(&self.full_name).is_some();
+                let ours = bucket.get(&self.full_name).is_some_and(|entry| {
+                    entry.source == TrackSource::Published
+                        && Arc::ptr_eq(&entry.reader.info, &self.reader.info)
+                });
+                if ours {
+                    if bucket.remove(&self.full_name).is_some() {
+                        let _ = self.locals.track_changes.send(TrackChange::Removed {
+                            scope: scope_key_to_option(&self.scope_key),
+                            full_name: self.full_name.clone(),
+                        });
+                    }
+                }
                 if bucket.is_empty() {
                     tracks.remove(self.scope_key.as_str());
                 }
             }
-        }
-
-        if removed {
-            let _ = self.locals.track_changes.send(TrackChange::Removed {
-                scope: scope_key_to_option(&self.scope_key),
-                full_name: self.full_name.clone(),
-            });
         }
     }
 }
@@ -1500,6 +1539,92 @@ mod tests {
         assert!(locals.retrieve_track(None, &key).is_none());
 
         drop(writer);
+    }
+
+    #[tokio::test]
+    async fn closed_published_track_remains_owned_until_registration_drops() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (writer, reader) = Track::new(namespace.clone(), "audio").produce();
+        let registration = locals
+            .register_track(None, reader)
+            .await
+            .expect("track registration should succeed");
+        drop(writer);
+
+        assert!(locals
+            .retrieve_track(None, &full(&namespace, "audio"))
+            .is_none());
+        let (_replacement_writer, replacement_reader) =
+            Track::new(namespace.clone(), "audio").produce();
+        assert!(locals
+            .register_track(None, replacement_reader.clone())
+            .await
+            .is_err());
+
+        drop(registration);
+        let _replacement = locals
+            .register_track(None, replacement_reader)
+            .await
+            .expect("replacement should register after the old owner drops");
+    }
+
+    #[tokio::test]
+    async fn stale_published_registration_does_not_remove_cache_replacement() {
+        let mut locals = Locals::new();
+        let mut changes = locals.subscribe_track_changes();
+        let namespace = ns("room/123");
+        let (_namespace_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+        let (writer, reader) = Track::new(namespace.clone(), "audio").produce();
+        let published_registration = locals
+            .register_track(None, reader)
+            .await
+            .expect("published track should register");
+        assert!(matches!(
+            changes.recv().await.expect("published track added"),
+            TrackChange::Added { .. }
+        ));
+        drop(writer);
+
+        let cached = locals
+            .get_or_request_track(None, namespace.clone(), "audio")
+            .await
+            .expect("closed published track should be replaced from namespace source");
+        let request = requests.recv().await.expect("cache request");
+        assert!(matches!(
+            changes
+                .recv()
+                .await
+                .expect("closed published track removed"),
+            TrackChange::Removed { .. }
+        ));
+
+        drop(published_registration);
+        assert!(locals
+            .retrieve_track(None, &full(&namespace, "audio"))
+            .is_some());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), changes.recv())
+                .await
+                .is_err(),
+            "stale registration emitted a duplicate removal"
+        );
+
+        drop(cached);
+        request.lease.finish_release();
+        let (_replacement_writer, replacement_reader) =
+            Track::new(namespace.clone(), "audio").produce();
+        let _replacement = locals
+            .register_track(None, replacement_reader)
+            .await
+            .expect("published replacement should register");
+        assert!(matches!(
+            changes.recv().await.expect("replacement track added"),
+            TrackChange::Added { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2509,6 +2634,49 @@ mod tests {
         assert!(locals
             .retrieve_track(None, &full(&namespace, "video"))
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_cache_generation_blocks_replacement_until_lease_finishes() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+        let first = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("first request");
+        let TrackRequest {
+            writer,
+            lease,
+            upstream,
+        } = requests.recv().await.expect("first request received");
+
+        drop(writer);
+        drop(upstream);
+
+        let replacement = locals.get_or_request_track(None, namespace.clone(), "video");
+        tokio::pin!(replacement);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut replacement)
+                .await
+                .is_err(),
+            "a replacement overtook the closing cache generation"
+        );
+        assert!(requests.try_recv().is_err());
+
+        lease.finish_release();
+        let second = tokio::time::timeout(Duration::from_secs(1), &mut replacement)
+            .await
+            .expect("replacement remained blocked after teardown")
+            .expect("replacement request");
+        let second_request = requests.recv().await.expect("second request received");
+
+        drop(first);
+        drop(second);
+        second_request.lease.finish_release();
     }
 
     /// A zero timeout preserves the old behaviour: the upstream subscription is

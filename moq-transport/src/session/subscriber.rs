@@ -84,6 +84,7 @@ struct SubscribeStreamCleanup {
 /// Resets both halves when opening a request is cancelled before its response
 /// pump takes ownership of the stream.
 struct OpeningRequestStream {
+    session: web_transport::Session,
     writer: Option<Writer>,
     reader: Option<Reader>,
 }
@@ -131,8 +132,13 @@ impl SubscribeStreamCleanup {
 }
 
 impl OpeningRequestStream {
-    fn new(send: web_transport::SendStream, recv: web_transport::RecvStream) -> Self {
+    fn new(
+        session: web_transport::Session,
+        send: web_transport::SendStream,
+        recv: web_transport::RecvStream,
+    ) -> Self {
         Self {
+            session,
             writer: Some(Writer::new(send)),
             reader: Some(Reader::new(recv)),
         }
@@ -147,11 +153,18 @@ impl OpeningRequestStream {
 
 impl Drop for OpeningRequestStream {
     fn drop(&mut self) {
+        let cancelled = self.writer.is_some() || self.reader.is_some();
         if let Some(writer) = &mut self.writer {
             writer.reset(super::CANCELLED_STREAM_CODE);
         }
         if let Some(reader) = &mut self.reader {
             reader.stop(super::CANCELLED_STREAM_CODE);
+        }
+        if cancelled {
+            self.session.close(
+                super::CANCELLED_STREAM_CODE,
+                "request stream opening cancelled",
+            );
         }
     }
 }
@@ -416,6 +429,10 @@ impl Subscriber {
         Ok((session, subscriber))
     }
 
+    pub(super) fn close_session(&self, code: u32, reason: &str) {
+        self.webtransport.close(code, reason);
+    }
+
     /// Wait for the next inbound PUBLISH_NAMESPACE from the peer, if any.
     pub async fn published_namespace(&mut self) -> Option<PublishedNamespace> {
         self.published_namespace_queue.pop().await
@@ -501,7 +518,8 @@ impl Subscriber {
         let frame = super::encode_request_frame(msg)?;
 
         let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
-        let mut opening = OpeningRequestStream::new(send_stream, recv_stream);
+        let mut opening =
+            OpeningRequestStream::new(self.webtransport.clone(), send_stream, recv_stream);
         let writer = opening.writer.as_mut().ok_or(SessionError::Internal)?;
         writer.write(&frame).await?;
         opening.into_parts()
@@ -655,7 +673,7 @@ impl Subscriber {
             }
         }
 
-        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<Message>(2);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
 
@@ -2738,7 +2756,7 @@ mod tests {
     async fn dropping_an_opening_request_resets_a_partial_frame() {
         let (client, server) = loopback_session_pair().await;
         let (send, recv) = client.open_bi().await.unwrap();
-        let mut opening = OpeningRequestStream::new(send, recv);
+        let mut opening = OpeningRequestStream::new(client.clone(), send, recv);
         opening
             .writer
             .as_mut()

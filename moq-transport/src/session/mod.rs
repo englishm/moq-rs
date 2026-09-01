@@ -2112,8 +2112,8 @@ mod tests {
         assert!(matches!(
             data_reader.done().await,
             Err(SessionError::WebTransport(web_transport::Error::Read(
-                web_transport::quinn::ReadError::Reset(0)
-            )))
+                web_transport::quinn::ReadError::Reset(code)
+            ))) if code == u32::from(crate::data::DataStreamResetCode::Cancelled)
         ));
         handler.await.unwrap().unwrap();
         drop(subgroup);
@@ -2157,8 +2157,8 @@ mod tests {
         assert!(matches!(
             data_reader.done().await,
             Err(SessionError::WebTransport(web_transport::Error::Read(
-                web_transport::quinn::ReadError::Reset(0)
-            )))
+                web_transport::quinn::ReadError::Reset(code)
+            ))) if code == u32::from(crate::data::DataStreamResetCode::Cancelled)
         ));
         drop(subgroup);
         drop(subgroups);

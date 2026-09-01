@@ -416,21 +416,24 @@ impl Relay {
                             // for peer discovery. Internal sessions are rare and
                             // logged at info; public client sessions stay at
                             // debug to avoid a per-connection info log.
+                            macro_rules! log_session_accepted {
+                                ($level:ident) => {
+                                    tracing::$level!(
+                                    interface = ?context.interface,
+                                    local_ip = ?local_ip,
+                                    remote_addr = %remote_addr,
+                                    tagger = connection_tagger.is_some(),
+                                    "session accepted"
+                                    )
+                                };
+                            }
                             match context.interface {
-                                SessionInterface::Internal => tracing::info!(
-                                    interface = ?context.interface,
-                                    local_ip = ?local_ip,
-                                    remote_addr = %remote_addr,
-                                    tagger = connection_tagger.is_some(),
-                                    "session accepted"
-                                ),
-                                SessionInterface::Public => tracing::debug!(
-                                    interface = ?context.interface,
-                                    local_ip = ?local_ip,
-                                    remote_addr = %remote_addr,
-                                    tagger = connection_tagger.is_some(),
-                                    "session accepted"
-                                ),
+                                SessionInterface::Internal => {
+                                    log_session_accepted!(info)
+                                }
+                                SessionInterface::Public => {
+                                    log_session_accepted!(debug)
+                                }
                             }
 
                             if let Some(ref info) = scope_info {
