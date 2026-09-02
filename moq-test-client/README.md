@@ -9,7 +9,7 @@ This tool enables automated interoperability testing between MoQT implementation
 **Key Features:**
 - Test scenarios for basic MoQT operations
 - Human-readable output with timing information
-- Machine-parseable result format (`MOQT_TEST_RESULT: SUCCESS/FAILURE`)
+- Machine-parseable TAP version 14 output with YAML diagnostics
 - Designed to be implementation-agnostic (interface can be reproduced by other implementations)
 
 ## Usage
@@ -52,6 +52,7 @@ moq-test-client --relay https://localhost:4443 --tls-disable-verify
 | `publish-namespace-done` | Send PUBLISH_NAMESPACE, then send PUBLISH_NAMESPACE_DONE |
 | `publish-track-only` | Publisher sends direct PUBLISH, receives PUBLISH_OK, then sends PUBLISH_DONE |
 | `publish-track-subscribe` | Publisher sends direct PUBLISH, subscriber subscribes to the exact track |
+| `rendezvous-timeout` | Subscribe with RENDEZVOUS_TIMEOUT and expect REQUEST_ERROR TIMEOUT |
 
 ## Running with moq-relay
 
@@ -72,26 +73,8 @@ cargo run --bin moq-test-client -- --relay https://localhost:4443 --tls-disable-
 
 ## Output Format
 
-The tool outputs human-readable results during execution and ends with a machine-parseable line:
-
-```
-MoQT Interop Test Client
-========================
-Relay: https://localhost:4443
-
-✓ setup-only (42 ms)
-✓ publish-namespace-only (38 ms)
-✓ subscribe-error (51 ms)
-✓ publish-namespace-subscribe (127 ms)
-✓ subscribe-before-publish-namespace (89 ms)
-✓ publish-namespace-done (45 ms)
-✓ publish-track-only (42 ms)
-✓ publish-track-subscribe (76 ms)
-
-Results: 8 passed, 0 failed
-
-MOQT_TEST_RESULT: SUCCESS
-```
+The client writes TAP version 14 to stdout and logs to stderr. Each test point
+includes its duration and available connection IDs in a YAML diagnostic block.
 
 ## Environment Variable Interface
 
@@ -117,12 +100,13 @@ The test cases implemented here correspond to the specifications in [moq-interop
 |-----------|---------------------|
 | `setup-only` | MoQT §3.3, §9.3 |
 | `publish-namespace-only` | MoQT §6.2, §9.23-9.24 |
-| `publish-namespace-done` | MoQT §6.2, §9.26 |
-| `publish-track-only` | MoQT §9.13-9.15 |
-| `publish-track-subscribe` | MoQT §5.1, §9.9-9.15 |
 | `subscribe-error` | MoQT §5.1, §9.7, §9.9 |
 | `publish-namespace-subscribe` | MoQT §5.1, §6.2, §9.7-9.8, §9.23-9.24 |
 | `subscribe-before-publish-namespace` | MoQT §5.1, §6.2 |
+| `publish-namespace-done` | MoQT §6.2, §9.26 |
+| `publish-track-only` | MoQT §9.13-9.15 |
+| `publish-track-subscribe` | MoQT §5.1, §9.9-9.15 |
+| `rendezvous-timeout` | MoQT §10.2.6, §10.6 |
 
 Protocol references are to [draft-ietf-moq-transport-18](https://www.ietf.org/archive/id/draft-ietf-moq-transport-18.html).
 
