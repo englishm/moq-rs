@@ -665,6 +665,7 @@ impl ObjectForwarder {
         mut subgroups: serve::SubgroupsReader,
         delivery_filter: DeliveryFilter,
     ) -> Result<(), SessionError> {
+        let lag_watcher = subgroups.lag_watcher();
         let mut tasks = FuturesUnordered::new();
         let mut done: Option<Result<(), ServeError>> = None;
         // A subgroup that could not be sent means the peer did not receive
@@ -679,6 +680,11 @@ impl ObjectForwarder {
 
         loop {
             tokio::select! {
+                _ = lag_watcher.lagged(), if done.is_none() => {
+                    return Err(ServeError::Internal(
+                        "subgroup reader exceeded its pending stream limit".into(),
+                    ).into());
+                },
                 res = subgroups.next(), if done.is_none() && tasks.len() < MAX_CONCURRENT_SUBGROUPS => match res {
                     Ok(Some(subgroup)) => {
                         let publisher = self.publisher.clone();
@@ -1445,7 +1451,11 @@ mod tests {
             },
         );
 
-        let (send, received) = tokio::join!(send, receive);
+        let (send, received) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(send, receive)
+        })
+        .await
+        .unwrap();
         send.unwrap();
         assert_eq!(forwarder.stream_count.get(), 2);
         assert_eq!(received, [(0, 0, 4), (0, 0, 6), (0, 1, 3), (0, 1, 5),]);
@@ -1554,7 +1564,100 @@ mod tests {
         );
 
         drop(blocked);
-        send.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), send)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lagged_forwarder_is_cancelled_without_disrupting_a_healthy_reader() {
+        let (publisher_session, _peer_session) = loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (mut forwarder, _recv) = ObjectForwarder::new(publisher, 42, None);
+        let (track_writer, track_reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "isolated",
+        )
+        .produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let serve::TrackReaderMode::Subgroups(subgroups_reader) =
+            track_reader.mode().await.unwrap()
+        else {
+            panic!("expected subgroup delivery");
+        };
+        let mut healthy = subgroups_reader.clone();
+
+        let mut blocked = Vec::new();
+        for group_id in 0..MAX_CONCURRENT_SUBGROUPS as u64 {
+            blocked.push(
+                subgroups_writer
+                    .create(serve::Subgroup {
+                        group_id,
+                        subgroup_id: 0,
+                        priority: 128,
+                    })
+                    .unwrap(),
+            );
+            let delivered = healthy.next().await.unwrap().unwrap();
+            assert_eq!(delivered.group_id, group_id);
+        }
+
+        let send = tokio::spawn(async move {
+            forwarder
+                .serve_subgroups(
+                    subgroups_reader,
+                    DeliveryFilter {
+                        forward: true,
+                        start_location: None,
+                        end_group_id: None,
+                    },
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        for offset in 0..=serve::MAX_PENDING_SUBGROUPS as u64 {
+            let group_id = MAX_CONCURRENT_SUBGROUPS as u64 + offset;
+            let subgroup = subgroups_writer
+                .create(serve::Subgroup {
+                    group_id,
+                    subgroup_id: 0,
+                    priority: 128,
+                })
+                .unwrap();
+            drop(subgroup);
+            let delivered = healthy.next().await.unwrap().unwrap();
+            assert_eq!(delivered.group_id, group_id);
+        }
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), send)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(err, SessionError::Serve(ServeError::Internal(_))));
+
+        let next_group = MAX_CONCURRENT_SUBGROUPS as u64 + serve::MAX_PENDING_SUBGROUPS as u64 + 1;
+        let _next = subgroups_writer
+            .create(serve::Subgroup {
+                group_id: next_group,
+                subgroup_id: 0,
+                priority: 128,
+            })
+            .unwrap();
+        let delivered = healthy.next().await.unwrap().unwrap();
+        assert_eq!(delivered.group_id, next_group);
+        drop(blocked);
     }
 
     fn assert_payload_datagram((received, largest): (data::Datagram, Option<Location>)) {

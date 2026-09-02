@@ -2640,13 +2640,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receives_mixed_reverse_order_subgroups_over_webtransport() {
         let (receiver, peer) = loopback_session_pair().await;
-        assert_mixed_subgroups_ingress(receiver, peer, super::super::Transport::WebTransport).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            assert_mixed_subgroups_ingress(receiver, peer, super::super::Transport::WebTransport),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receives_mixed_reverse_order_subgroups_over_raw_quic() {
         let (receiver, peer) = loopback_raw_session_pair().await;
-        assert_mixed_subgroups_ingress(receiver, peer, super::super::Transport::RawQuic).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            assert_mixed_subgroups_ingress(receiver, peer, super::super::Transport::RawQuic),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
