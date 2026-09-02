@@ -21,6 +21,7 @@ use super::{
 
 // Immediate cancellation can queue after REQUEST_OK before the stream task runs.
 const RESPONSE_QUEUE_CAPACITY: usize = 2;
+pub(super) const ACTIVE_NAMESPACE_REASON: &str = "namespace already has an active publisher";
 
 enum StreamAction {
     Response(Message),
@@ -49,7 +50,7 @@ pub struct PublishedNamespace {
     pub info: PublishNamespaceInfo,
 
     ok: bool,
-    error: Option<ServeError>,
+    error: Option<message::RequestError>,
 }
 
 impl PublishedNamespace {
@@ -79,6 +80,22 @@ impl PublishedNamespace {
         };
 
         (send, recv)
+    }
+
+    pub(super) fn reject_active_namespace(
+        subscriber: Subscriber,
+        request_id: u64,
+        namespace: TrackNamespace,
+    ) -> PublishedNamespaceRecv {
+        let (mut published, recv) = Self::new(subscriber, request_id, namespace);
+        published.error = Some(message::RequestError {
+            id: request_id,
+            error_code: RequestErrorCode::ExcessiveLoad as u64,
+            retry_interval: 0,
+            reason: ReasonPhrase(ACTIVE_NAMESPACE_REASON.to_string()),
+        });
+        drop(published);
+        recv
     }
 
     /// Accept the PUBLISH_NAMESPACE by sending REQUEST_OK.
@@ -114,7 +131,12 @@ impl PublishedNamespace {
 
     /// Reject the PUBLISH_NAMESPACE; the error is sent on drop.
     pub fn close(mut self, err: ServeError) -> Result<(), ServeError> {
-        self.error = Some(err);
+        self.error = Some(message::RequestError {
+            id: self.info.request_id,
+            error_code: RequestErrorCode::Uninterested as u64,
+            retry_interval: 0,
+            reason: ReasonPhrase(err.to_string()),
+        });
         Ok(())
     }
 }
@@ -140,16 +162,13 @@ impl Drop for PublishedNamespace {
             return;
         }
 
-        let err = self.error.clone().unwrap_or(ServeError::Done);
-        let _ = self.outgoing.try_send(StreamAction::Response(
-            message::RequestError {
-                id: self.info.request_id,
-                error_code: RequestErrorCode::Uninterested as u64,
-                retry_interval: 0,
-                reason: ReasonPhrase(err.to_string()),
-            }
-            .into(),
-        ));
+        let error = self.error.clone().unwrap_or_else(|| message::RequestError {
+            id: self.info.request_id,
+            error_code: RequestErrorCode::Uninterested as u64,
+            retry_interval: 0,
+            reason: ReasonPhrase(ServeError::Done.to_string()),
+        });
+        let _ = self.outgoing.try_send(StreamAction::Response(error.into()));
     }
 }
 
@@ -202,7 +221,24 @@ impl PublishedNamespaceRecv {
                     };
                     self.emit_mlog(&mlog, &response);
                     let terminal = matches!(response, Message::RequestError(_));
-                    match Session::encode_bidi_response(&mut writer, &response).await {
+                    let encoded = if terminal {
+                        match tokio::time::timeout(
+                            Session::BIDI_REQUEST_TIMEOUT,
+                            Session::encode_bidi_response(&mut writer, &response),
+                        )
+                        .await
+                        {
+                            Ok(encoded) => encoded,
+                            Err(_) => {
+                                writer.reset(CANCELLED_STREAM_CODE);
+                                reader.stop(CANCELLED_STREAM_CODE);
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        Session::encode_bidi_response(&mut writer, &response).await
+                    };
+                    match encoded {
                         Ok(()) => {}
                         Err(err) if err.is_stream_error() => return Ok(()),
                         Err(err) => return Err(err),
@@ -269,10 +305,10 @@ impl PublishedNamespaceRecv {
 
 impl Drop for PublishedNamespaceRecv {
     fn drop(&mut self) {
+        self.subscriber.remove_published_namespace(self.request_id);
         if let Some(mut state) = self.state.lock_mut() {
             state.done = true;
         }
-        self.subscriber.remove_published_namespace(self.request_id);
     }
 }
 
@@ -375,6 +411,48 @@ mod tests {
         run.await.unwrap().unwrap();
         let reset = response_reader.done().await.unwrap_err();
         assert!(reset.is_stream_error());
+    }
+
+    #[tokio::test]
+    async fn publisher_reset_closes_namespace_and_resets_response_direction() {
+        let (client, server) = loopback_session_pair().await;
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = Subscriber::new(
+            Queue::default(),
+            server.clone(),
+            Transport::WebTransport,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+            Default::default(),
+        );
+        let (mut published, recv) =
+            PublishedNamespace::new(subscriber, 0, TrackNamespace::from_utf8_path("test"));
+
+        let (mut request_send, response_recv) = client.open_bi().await.unwrap();
+        request_send.write(b"request").await.unwrap();
+        let (response_send, mut request_recv) = server.accept_bi().await.unwrap();
+        assert_eq!(
+            request_recv.read(7).await.unwrap().unwrap().as_ref(),
+            b"request"
+        );
+
+        published.ok().unwrap();
+        let run =
+            tokio::spawn(recv.run(Writer::new(response_send), Reader::new(request_recv), None));
+        let mut response_reader = Reader::new(response_recv);
+        assert!(matches!(
+            Session::decode_bidi_response(&mut response_reader, 0)
+                .await
+                .unwrap(),
+            Message::RequestOk(_)
+        ));
+
+        request_send.reset(CANCELLED_STREAM_CODE);
+
+        published.closed().await.unwrap();
+        run.await.unwrap().unwrap();
+        assert!(response_reader.done().await.unwrap_err().is_stream_error());
     }
 
     #[tokio::test]

@@ -1900,6 +1900,34 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
 
+    async fn open_publish_namespace_request(
+        peer: &web_transport::Session,
+        request_id: u64,
+        namespace: &str,
+    ) -> (Writer, Reader) {
+        let (send, recv) = peer.open_bi().await.unwrap();
+        let mut writer = Writer::new(send);
+        writer
+            .encode(&Message::PublishNamespace(message::PublishNamespace {
+                id: request_id,
+                track_namespace: crate::coding::TrackNamespace::from_utf8_path(namespace),
+                params: Default::default(),
+            }))
+            .await
+            .unwrap();
+        (writer, Reader::new(recv))
+    }
+
+    async fn next_published_namespace(subscriber: &mut Subscriber) -> PublishedNamespace {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            subscriber.published_namespace(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
     async fn open_inbound_subscribe() -> (
         web_transport::Session,
         Publisher,
@@ -2540,6 +2568,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn encode_active_namespace_rejection_has_exact_draft18_wire_image() {
+        use message::wire_id;
+
+        let reason = published_namespace::ACTIVE_NAMESPACE_REASON;
+        let msg = Message::RequestError(message::RequestError {
+            id: 99,
+            error_code: message::RequestErrorCode::ExcessiveLoad as u64,
+            retry_interval: 0,
+            reason: crate::coding::ReasonPhrase(reason.to_string()),
+        });
+        let bytes = encode_bidi_response_bytes(&msg);
+        let mut expected = vec![
+            wire_id::RequestError as u8,
+            0,
+            44,
+            message::RequestErrorCode::ExcessiveLoad as u8,
+            0,
+            41,
+        ];
+        expected.extend_from_slice(reason.as_bytes());
+
+        assert_eq!(bytes, expected);
+    }
+
     /// NAMESPACE and NAMESPACE_DONE carry no Request ID field, so their bidi
     /// framing must be byte-identical to the ordinary message encoding.
     #[test]
@@ -2791,6 +2844,127 @@ mod tests {
             panic!("expected raw QUIC application close, got {close_error:?}");
         };
         assert_eq!(close.error_code.into_inner(), 0x3);
+        drop(client_session);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_publish_namespace_is_request_local_and_reannounceable() {
+        let (client_transport, server_transport) = test_support::loopback_session_pair().await;
+        let client_peer = client_transport.clone();
+        let (client, server) = tokio::join!(
+            Session::connect(client_transport, None, Transport::WebTransport),
+            Session::accept(server_transport, None, Transport::WebTransport),
+        );
+        let (client_session, _client_publisher, _client_subscriber) = client.unwrap();
+        let (server_session, _server_publisher, server_subscriber) = server.unwrap();
+        let mut server_subscriber = server_subscriber.unwrap();
+        let server_run = tokio::spawn(server_session.run());
+
+        let (mut first_request, mut first_response) =
+            open_publish_namespace_request(&client_peer, 0, "ping").await;
+        let mut first = next_published_namespace(&mut server_subscriber).await;
+        assert_eq!(first.info.request_id, 0);
+        first.ok().unwrap();
+        assert!(matches!(
+            Session::decode_bidi_response(&mut first_response, 0)
+                .await
+                .unwrap(),
+            Message::RequestOk(_)
+        ));
+
+        first_request.finish().unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), first.closed())
+                .await
+                .is_err(),
+            "requester FIN must not withdraw the accepted namespace"
+        );
+
+        let (mut duplicate_request, mut duplicate_response) =
+            open_publish_namespace_request(&client_peer, 2, "ping").await;
+        let Message::RequestError(error) =
+            Session::decode_bidi_response(&mut duplicate_response, 2)
+                .await
+                .unwrap()
+        else {
+            panic!("expected duplicate request rejection");
+        };
+        assert_eq!(
+            error.error_code,
+            message::RequestErrorCode::ExcessiveLoad as u64
+        );
+        assert_eq!(error.retry_interval, 0);
+        assert_eq!(error.reason.0, published_namespace::ACTIVE_NAMESPACE_REASON);
+        assert!(error.reason.0.len() <= 1024);
+        assert!(duplicate_response.done().await.unwrap());
+        assert_eq!(
+            duplicate_request.closed().await.unwrap(),
+            Some(u8::try_from(CANCELLED_STREAM_CODE).unwrap())
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                server_subscriber.published_namespace(),
+            )
+            .await
+            .is_err(),
+            "the rejected request must not reach the application"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), first.closed())
+                .await
+                .is_err(),
+            "rejected-request cleanup must not remove the original owner"
+        );
+        assert!(
+            !server_run.is_finished(),
+            "duplicate must not end the session"
+        );
+
+        let (mut unrelated_request, mut unrelated_response) =
+            open_publish_namespace_request(&client_peer, 4, "unrelated").await;
+        let mut unrelated = next_published_namespace(&mut server_subscriber).await;
+        assert_eq!(unrelated.info.request_id, 4);
+        unrelated.ok().unwrap();
+        assert!(matches!(
+            Session::decode_bidi_response(&mut unrelated_response, 4)
+                .await
+                .unwrap(),
+            Message::RequestOk(_)
+        ));
+        unrelated_request.reset(CANCELLED_STREAM_CODE);
+        unrelated_response.stop(CANCELLED_STREAM_CODE);
+        unrelated.closed().await.unwrap();
+        assert!(
+            !server_run.is_finished(),
+            "unrelated request must remain usable"
+        );
+
+        first_response.stop(CANCELLED_STREAM_CODE);
+        first.closed().await.unwrap();
+
+        let (mut reannounce_request, mut reannounce_response) =
+            open_publish_namespace_request(&client_peer, 6, "ping").await;
+        let mut reannounced = next_published_namespace(&mut server_subscriber).await;
+        assert_eq!(reannounced.info.request_id, 6);
+        reannounced.ok().unwrap();
+        assert!(matches!(
+            Session::decode_bidi_response(&mut reannounce_response, 6)
+                .await
+                .unwrap(),
+            Message::RequestOk(_)
+        ));
+
+        drop(reannounced);
+        assert_eq!(
+            reannounce_request.closed().await.unwrap(),
+            Some(u8::try_from(CANCELLED_STREAM_CODE).unwrap())
+        );
+        assert!(reannounce_response.done().await.unwrap());
+        assert!(!server_run.is_finished());
+
+        server_run.abort();
+        assert!(server_run.await.unwrap_err().is_cancelled());
         drop(client_session);
     }
 }
