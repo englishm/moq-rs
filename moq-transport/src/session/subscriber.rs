@@ -924,9 +924,18 @@ impl Subscriber {
             .lock()
             .map_err(|_| SessionError::Internal)?;
 
-        // Duplicate PUBLISH_NAMESPACE for the same namespace within a session is invalid.
+        // Routing currently supports one publisher per namespace. Reject only
+        // the additional request so multi-publisher support can later replace
+        // this policy without changing request-stream ownership.
         match published_namespaces.entry(msg.track_namespace.clone()) {
-            hash_map::Entry::Occupied(_) => return Err(SessionError::Duplicate),
+            hash_map::Entry::Occupied(_) => {
+                drop(published_namespaces);
+                return Ok(PublishedNamespace::reject_active_namespace(
+                    self.clone(),
+                    msg.id,
+                    msg.track_namespace.clone(),
+                ));
+            }
             hash_map::Entry::Vacant(entry) => entry.insert(msg.id),
         };
         drop(published_namespaces);
@@ -2438,6 +2447,44 @@ mod tests {
         let (writer, _reader) =
             serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), name).produce();
         writer
+    }
+
+    #[tokio::test]
+    async fn namespace_close_is_observed_after_ownership_is_removed() {
+        let mut subscriber = test_subscriber(loopback_session().await);
+        let namespace = TrackNamespace::from_utf8_path("test/ns");
+        let first = message::PublishNamespace {
+            id: 1,
+            track_namespace: namespace.clone(),
+            params: Default::default(),
+        };
+        let recv = subscriber.recv_publish_namespace(&first).unwrap();
+        let published = subscriber.published_namespace().await.unwrap();
+
+        drop(recv);
+        published.closed().await.unwrap();
+        assert!(!subscriber
+            .published_namespaces
+            .lock()
+            .unwrap()
+            .contains_key(&namespace));
+
+        let second = message::PublishNamespace {
+            id: 3,
+            track_namespace: namespace,
+            params: Default::default(),
+        };
+        let replacement = subscriber.recv_publish_namespace(&second).unwrap();
+        assert_eq!(
+            subscriber
+                .published_namespace()
+                .await
+                .unwrap()
+                .info
+                .request_id,
+            3
+        );
+        drop(replacement);
     }
 
     fn register_test_subscribe(

@@ -1884,6 +1884,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_namespace_cancel_resets_request_and_stops_response() {
+        let (client, server) = loopback_session_pair().await;
+        let (bidi_task_tx, mut bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut publisher = Publisher::new(
+            Queue::default(),
+            client,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let namespace = TrackNamespace::from_utf8_path("test");
+        let (publish, recv, cancel) = PublishNamespace::new(0, namespace.clone());
+        publisher
+            .publish_namespaces
+            .lock()
+            .unwrap()
+            .insert(namespace, recv);
+        publisher
+            .open_publish_namespace_stream(0, publish.wire_message(), cancel)
+            .await
+            .unwrap();
+
+        let pump = tokio::spawn(bidi_task_rx.recv().await.unwrap());
+        let (mut peer_send, peer_recv) = server.accept_bi().await.unwrap();
+        let mut peer_reader = Reader::new(peer_recv);
+        assert!(matches!(
+            peer_reader.decode::<Message>().await.unwrap(),
+            Message::PublishNamespace(_)
+        ));
+
+        drop(publish);
+
+        assert!(peer_reader.done().await.unwrap_err().is_stream_error());
+        assert_eq!(
+            peer_send.closed().await.unwrap(),
+            Some(u8::try_from(super::super::CANCELLED_STREAM_CODE).unwrap())
+        );
+        pump.await.unwrap().unwrap();
+        assert!(publisher.publish_namespaces.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn response_reset_closes_accepted_namespace() {
         let (client, server) = loopback_session_pair().await;
         let (bidi_task_tx, mut bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
