@@ -41,6 +41,12 @@ const PUBLISH_TRACK: &str = "published-track";
 /// Payload carried by the single Object the direct PUBLISH tests send
 const PUBLISH_PAYLOAD: &[u8] = b"publish-track-subscribe";
 
+/// Wait requested by the rendezvous timeout scenario, in milliseconds.
+const RENDEZVOUS_TIMEOUT_MS: u64 = 500;
+
+/// Allows transport scheduling slack beyond the requested rendezvous window.
+const RENDEZVOUS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Helper to connect to a relay and establish a session
 /// Returns (session, connection_id, transport) so we can report CIDs for mlog correlation
 async fn connect(
@@ -221,6 +227,69 @@ pub async fn test_subscribe_error(args: &Args) -> Result<TestConnectionIds> {
                 }
                 Ok(cids)
             }
+        }
+    })
+    .await
+    .context("test timed out")?
+}
+
+/// T0.9: Rendezvous Timeout
+///
+/// Subscribe to a track with no publisher and verify the relay reports TIMEOUT
+/// after processing a nonzero RENDEZVOUS_TIMEOUT.
+pub async fn test_rendezvous_timeout(args: &Args) -> Result<TestConnectionIds> {
+    timeout(TEST_TIMEOUT, async {
+        let (session, cid, transport) =
+            connect(args).await.context("failed to connect to relay")?;
+        let mut cids = TestConnectionIds::default();
+        cids.add(cid);
+
+        let (session, _publisher, mut subscriber) = Session::connect(session, None, transport)
+            .await
+            .context("SETUP exchange failed")?;
+
+        let namespace = TrackNamespace::from_utf8_path("nonexistent/rendezvous");
+        let (mut writer, _, _reader) = Tracks::new(namespace).produce();
+        let track = writer
+            .create(TEST_TRACK)
+            .ok_or_else(|| anyhow::anyhow!("failed to create subscriber track"))?;
+
+        let mut params = KeyValuePairs::default();
+        params.set_rendezvous_timeout(RENDEZVOUS_TIMEOUT_MS);
+
+        tracing::info!(
+            timeout_ms = RENDEZVOUS_TIMEOUT_MS,
+            "Subscribing with RENDEZVOUS_TIMEOUT to a track with no publisher"
+        );
+
+        let result = timeout(RENDEZVOUS_RESPONSE_TIMEOUT, async {
+            tokio::select! {
+                res = subscriber.subscribe_open_with_params(track, params) => res,
+                res = session.run() => {
+                    match res {
+                        Ok(()) => Err(ServeError::Internal(
+                            "session ended before subscribe completed".to_string(),
+                        )),
+                        Err(err) => Err(ServeError::Internal(format!("session error: {}", err))),
+                    }
+                }
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "relay did not answer rendezvous subscribe within {:?}",
+                RENDEZVOUS_RESPONSE_TIMEOUT
+            )
+        })?;
+
+        match result {
+            Err(ServeError::Timeout) => {
+                tracing::info!("Received expected REQUEST_ERROR TIMEOUT");
+                Ok(cids)
+            }
+            Err(err) => anyhow::bail!("expected REQUEST_ERROR TIMEOUT, got: {}", err),
+            Ok(_) => anyhow::bail!("subscribe succeeded but no publisher serves the track"),
         }
     })
     .await
