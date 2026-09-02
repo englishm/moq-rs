@@ -936,13 +936,15 @@ impl ObjectForwarder {
 
             // Check cancellation before the object header commits us to its
             // payload length.
-            state
-                .lock_mut()
-                .ok_or(ServeError::Done)?
-                .update_largest_location(
-                    subgroup_reader.group_id,
-                    subgroup_object_reader.object_id,
-                )?;
+            {
+                let mut forwarder_state = state.lock_mut().ok_or(ServeError::Done)?;
+                if subgroup_object_reader.status == data::ObjectStatus::NormalObject {
+                    forwarder_state.update_largest_location(
+                        subgroup_reader.group_id,
+                        subgroup_object_reader.object_id,
+                    )?;
+                }
+            }
 
             if header.header_type.has_properties() {
                 let subgroup_object = data::SubgroupObjectExt {
@@ -1461,6 +1463,142 @@ mod tests {
         assert_eq!(received, [(0, 0, 4), (0, 0, 6), (0, 1, 3), (0, 1, 5),]);
     }
 
+    async fn forward_subgroup_statuses(
+        publisher_session: web_transport::Session,
+        peer_session: web_transport::Session,
+    ) {
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let (mut forwarder, _recv) = ObjectForwarder::new(publisher, 42, None);
+        let (track_writer, track_reader) = serve::Track::new(
+            crate::coding::TrackNamespace::from_utf8_path("test"),
+            "status",
+        )
+        .produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let serve::TrackReaderMode::Subgroups(subgroups_reader) =
+            track_reader.mode().await.unwrap()
+        else {
+            panic!("expected subgroup delivery");
+        };
+
+        for (group_id, object_id, status, has_properties) in [
+            (0, 6, data::ObjectStatus::EndOfGroup, false),
+            (1, 7, data::ObjectStatus::EndOfTrack, true),
+        ] {
+            let mut subgroup = subgroups_writer
+                .create_with_metadata(
+                    serve::Subgroup {
+                        group_id,
+                        subgroup_id: 0,
+                        priority: 200,
+                    },
+                    serve::SubgroupStreamMetadata {
+                        has_properties,
+                        end_of_group: true,
+                        first_object: true,
+                    },
+                )
+                .unwrap();
+            if group_id == 0 {
+                for normal_object_id in [3, 5] {
+                    let mut object = subgroup.create_with_id(normal_object_id, 1, None).unwrap();
+                    object
+                        .write(Bytes::from(vec![normal_object_id as u8]))
+                        .unwrap();
+                }
+            }
+            drop(
+                subgroup
+                    .create_with_id_and_status(object_id, 0, status, None)
+                    .unwrap(),
+            );
+        }
+        drop(subgroups_writer);
+
+        let receive = async move {
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let stream = peer_session.accept_uni().await.unwrap();
+                let mut reader = Reader::new(stream);
+                let stream_header: data::StreamHeader = reader.decode().await.unwrap();
+                let header = stream_header.subgroup_header.unwrap();
+                assert_eq!(header.subgroup_id, Some(0));
+                let (normal_objects, expected_object, expected_status, expected_properties) =
+                    match header.group_id {
+                        0 => (&[3, 5][..], 6, data::ObjectStatus::EndOfGroup, false),
+                        1 => (&[][..], 7, data::ObjectStatus::EndOfTrack, true),
+                        group_id => panic!("unexpected group {group_id}"),
+                    };
+                assert_eq!(header.header_type.has_properties(), expected_properties);
+                let mut previous = None;
+
+                for &expected in normal_objects {
+                    let object: data::SubgroupObject = reader.decode().await.unwrap();
+                    let object_id =
+                        data::decode_object_id_delta(&mut previous, object.object_id_delta)
+                            .unwrap();
+                    assert_eq!(object_id, expected);
+                    assert_eq!(object.payload_length, 1);
+                    assert_eq!(object.status, None);
+                    assert_eq!(
+                        reader.read_chunk(1).await.unwrap().unwrap().as_ref(),
+                        &[expected as u8]
+                    );
+                }
+
+                if expected_properties {
+                    let object: data::SubgroupObjectExt = reader.decode().await.unwrap();
+                    let object_id =
+                        data::decode_object_id_delta(&mut previous, object.object_id_delta)
+                            .unwrap();
+                    assert_eq!(object_id, expected_object);
+                    assert_eq!(object.payload_length, 0);
+                    assert_eq!(object.status, Some(expected_status));
+                    assert!(object.extension_headers.is_empty());
+                } else {
+                    let object: data::SubgroupObject = reader.decode().await.unwrap();
+                    let object_id =
+                        data::decode_object_id_delta(&mut previous, object.object_id_delta)
+                            .unwrap();
+                    assert_eq!(object_id, expected_object);
+                    assert_eq!(object.payload_length, 0);
+                    assert_eq!(object.status, Some(expected_status));
+                }
+                assert!(reader.done().await.unwrap());
+                received.push(header.group_id);
+            }
+            received.sort_unstable();
+            assert_eq!(received, [0, 1]);
+        };
+        let send = forwarder.serve_subgroups(
+            subgroups_reader,
+            DeliveryFilter {
+                forward: true,
+                start_location: None,
+                end_group_id: None,
+            },
+        );
+
+        let (send, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(send, receive)
+        })
+        .await
+        .unwrap();
+        send.unwrap();
+        assert_eq!(
+            forwarder.state.lock().largest_location,
+            Some(Location::new(0, 5))
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn subgroup_forwarding_limits_blocked_tasks() {
         let (publisher_session, peer_session) = loopback_session_pair().await;
@@ -1697,6 +1835,18 @@ mod tests {
     async fn forwards_mixed_reverse_order_subgroups_over_raw_quic() {
         let (publisher, peer) = loopback_raw_session_pair().await;
         forward_mixed_subgroups(publisher, peer).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwards_subgroup_statuses_over_webtransport() {
+        let (publisher, peer) = loopback_session_pair().await;
+        forward_subgroup_statuses(publisher, peer).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwards_subgroup_statuses_over_raw_quic() {
+        let (publisher, peer) = loopback_raw_session_pair().await;
+        forward_subgroup_statuses(publisher, peer).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

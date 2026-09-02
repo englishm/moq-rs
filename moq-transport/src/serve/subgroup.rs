@@ -729,28 +729,50 @@ impl SubgroupWriter {
         size: usize,
         extension_headers: Option<crate::data::ExtensionHeaders>,
     ) -> Result<SubgroupObjectWriter, ServeError> {
+        self.create_with_id_and_status(
+            object_id,
+            size,
+            ObjectStatus::NormalObject,
+            extension_headers,
+        )
+    }
+
+    pub(crate) fn create_with_id_and_status(
+        &mut self,
+        object_id: u64,
+        size: usize,
+        status: ObjectStatus,
+        extension_headers: Option<crate::data::ExtensionHeaders>,
+    ) -> Result<SubgroupObjectWriter, ServeError> {
         let next_object_id = self.next_object_id.ok_or(ServeError::Duplicate)?;
         if object_id < next_object_id {
             return Err(ServeError::Duplicate);
         }
 
+        let extension_headers = extension_headers.unwrap_or_default();
+        if status != ObjectStatus::NormalObject && (size != 0 || !extension_headers.is_empty()) {
+            return Err(ServeError::Size);
+        }
+
         let group_id = self.group_id;
-        if let Some(parent) = &self.parent {
-            let mut state = parent.state.lock().into_mut_closed();
-            let location = (group_id, object_id);
-            state.largest_location = Some(
-                state
-                    .largest_location
-                    .map_or(location, |largest| largest.max(location)),
-            );
+        if status == ObjectStatus::NormalObject {
+            if let Some(parent) = &self.parent {
+                let mut state = parent.state.lock().into_mut_closed();
+                let location = (group_id, object_id);
+                state.largest_location = Some(
+                    state
+                        .largest_location
+                        .map_or(location, |largest| largest.max(location)),
+                );
+            }
         }
 
         let (writer, reader) = SubgroupObject {
             group: self.info.clone(),
             object_id,
-            status: ObjectStatus::NormalObject,
+            status,
             size,
-            extension_headers: extension_headers.unwrap_or_default(),
+            extension_headers,
         }
         .produce();
 
@@ -1657,6 +1679,58 @@ mod tests {
         drop(low_subgroup.create_with_id(100, 0, None).unwrap());
 
         assert_eq!(reader.latest(), Some((0, 100)));
+    }
+
+    #[tokio::test]
+    async fn status_aware_creation_preserves_status_and_largest_location() {
+        let (mut writer, template) = subgroups();
+        let mut reader = template.clone();
+        let mut subgroup = create_subgroup(&mut writer, 0, 0);
+        drop(subgroup.create_with_id(5, 0, None).unwrap());
+        drop(
+            subgroup
+                .create_with_id_and_status(6, 0, ObjectStatus::EndOfGroup, None)
+                .unwrap(),
+        );
+        let mut end_track = create_subgroup(&mut writer, 1, 0);
+        drop(
+            end_track
+                .create_with_id_and_status(7, 0, ObjectStatus::EndOfTrack, None)
+                .unwrap(),
+        );
+
+        let mut subgroup = reader.next().await.unwrap().unwrap();
+        for (object_id, status) in [
+            (5, ObjectStatus::NormalObject),
+            (6, ObjectStatus::EndOfGroup),
+        ] {
+            let object = subgroup.next().await.unwrap().unwrap();
+            assert_eq!(object.object_id, object_id);
+            assert_eq!(object.status, status);
+            assert_eq!(object.size, 0);
+        }
+        let mut end_track = reader.next().await.unwrap().unwrap();
+        let object = end_track.next().await.unwrap().unwrap();
+        assert_eq!(object.object_id, 7);
+        assert_eq!(object.status, ObjectStatus::EndOfTrack);
+        assert_eq!(object.size, 0);
+        assert_eq!(reader.latest(), Some((0, 5)));
+    }
+
+    #[test]
+    fn status_aware_creation_rejects_payload_and_properties() {
+        let (mut writer, _reader) = subgroup();
+        assert!(matches!(
+            writer.create_with_id_and_status(0, 1, ObjectStatus::EndOfGroup, None),
+            Err(ServeError::Size)
+        ));
+
+        let mut properties = crate::data::ExtensionHeaders::new();
+        properties.set_intvalue(2, 1);
+        assert!(matches!(
+            writer.create_with_id_and_status(0, 0, ObjectStatus::EndOfGroup, Some(properties),),
+            Err(ServeError::Size)
+        ));
     }
 
     #[tokio::test]

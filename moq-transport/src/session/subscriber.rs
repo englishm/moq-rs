@@ -2073,13 +2073,11 @@ impl Subscriber {
                 }
             }
 
-            // Pass the absolute Object ID and extension headers through to the serve layer.
-            // TODO SLG - object status is still being ignored.
-
             let subgroup_writer = subgroup.as_mut().ok_or(SessionError::Internal)?;
-            let mut object_writer = subgroup_writer.create_with_id(
+            let mut object_writer = subgroup_writer.create_with_id_and_status(
                 current_object_id,
                 remaining_bytes,
+                status.unwrap_or(data::ObjectStatus::NormalObject),
                 extension_headers,
             )?;
             tracing::trace!(
@@ -2537,6 +2535,67 @@ mod tests {
         writer.finish().unwrap();
     }
 
+    async fn send_subgroup_status(
+        session: &web_transport::Session,
+        header: data::SubgroupHeader,
+        normal_object_ids: &[u64],
+        object_id: u64,
+        status: data::ObjectStatus,
+    ) {
+        let has_properties = header.header_type.has_properties();
+        let stream = session.open_uni().await.unwrap();
+        let mut writer = Writer::new(stream);
+        writer.encode(&header).await.unwrap();
+        let mut previous = None;
+        for &normal_object_id in normal_object_ids {
+            let object_id_delta =
+                data::encode_object_id_delta(&mut previous, normal_object_id).unwrap();
+            if has_properties {
+                writer
+                    .encode(&data::SubgroupObjectExt {
+                        object_id_delta,
+                        extension_headers: Default::default(),
+                        payload_length: 1,
+                        status: None,
+                    })
+                    .await
+                    .unwrap();
+            } else {
+                writer
+                    .encode(&data::SubgroupObject {
+                        object_id_delta,
+                        payload_length: 1,
+                        status: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            writer.write(&[normal_object_id as u8]).await.unwrap();
+        }
+        let object_id_delta = data::encode_object_id_delta(&mut previous, object_id).unwrap();
+        if has_properties {
+            writer
+                .encode(&data::SubgroupObjectExt {
+                    object_id_delta,
+                    extension_headers: Default::default(),
+                    payload_length: 0,
+                    status: Some(status),
+                })
+                .await
+                .unwrap();
+        } else {
+            writer
+                .encode(&data::SubgroupObject {
+                    object_id_delta,
+                    payload_length: 0,
+                    status: Some(status),
+                })
+                .await
+                .unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
     async fn receive_subgroup_stream(
         receiver_session: &web_transport::Session,
         subscriber: &Subscriber,
@@ -2610,6 +2669,89 @@ mod tests {
         }
     }
 
+    async fn assert_subgroup_status_ingress(
+        receiver_session: web_transport::Session,
+        peer_session: web_transport::Session,
+        transport: super::super::Transport,
+    ) {
+        let subscriber = test_subscriber_for_transport(receiver_session.clone(), transport);
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), "status").produce();
+        let _subscribe =
+            register_test_subscribe_with_priority(&subscriber, track_writer, 0, 42, 200);
+        let cases = [
+            (
+                data::SubgroupHeader {
+                    header_type: data::StreamHeaderType::SubgroupIdEndOfGroupFirstObject,
+                    track_alias: 42,
+                    group_id: 0,
+                    subgroup_id: Some(0),
+                    publisher_priority: 128,
+                },
+                &[3, 5][..],
+                6,
+                data::ObjectStatus::EndOfGroup,
+                false,
+            ),
+            (
+                data::SubgroupHeader {
+                    header_type: data::StreamHeaderType::SubgroupIdExtEndOfGroupFirstObject,
+                    track_alias: 42,
+                    group_id: 1,
+                    subgroup_id: Some(0),
+                    publisher_priority: 128,
+                },
+                &[][..],
+                7,
+                data::ObjectStatus::EndOfTrack,
+                true,
+            ),
+        ];
+
+        for (header, normal_object_ids, object_id, status, _) in &cases {
+            tokio::join!(
+                send_subgroup_status(
+                    &peer_session,
+                    header.clone(),
+                    normal_object_ids,
+                    *object_id,
+                    *status,
+                ),
+                receive_subgroup_stream(&receiver_session, &subscriber),
+            );
+        }
+
+        let serve::TrackReaderMode::Subgroups(mut subgroups) = track_reader.mode().await.unwrap()
+        else {
+            panic!("expected subgroup delivery");
+        };
+        for (header, normal_object_ids, object_id, status, has_properties) in cases {
+            let mut subgroup = subgroups.next().await.unwrap().unwrap();
+            assert_eq!(subgroup.group_id, header.group_id);
+            assert_eq!(subgroup.subgroup_id, 0);
+            assert_eq!(subgroup.metadata().has_properties, has_properties);
+            for &normal_object_id in normal_object_ids {
+                let mut object = subgroup.next().await.unwrap().unwrap();
+                assert_eq!(object.object_id, normal_object_id);
+                assert_eq!(object.status, data::ObjectStatus::NormalObject);
+                assert_eq!(
+                    object.read_all().await.unwrap().as_ref(),
+                    &[normal_object_id as u8]
+                );
+            }
+            let mut object = subgroup.next().await.unwrap().unwrap();
+            assert_eq!(object.object_id, object_id);
+            assert_eq!(object.status, status);
+            assert_eq!(object.size, 0);
+            assert!(object.extension_headers.is_empty());
+            assert!(object.read_all().await.unwrap().is_empty());
+        }
+        assert_eq!(
+            track_reader.largest_location(),
+            Some(crate::coding::Location::new(0, 5))
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn decoded_subgroup_object_ids_are_preserved() {
         let (receiver_session, peer_session) = loopback_session_pair().await;
@@ -2654,6 +2796,28 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             assert_mixed_subgroups_ingress(receiver, peer, super::super::Transport::RawQuic),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receives_subgroup_statuses_over_webtransport() {
+        let (receiver, peer) = loopback_session_pair().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            assert_subgroup_status_ingress(receiver, peer, super::super::Transport::WebTransport),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receives_subgroup_statuses_over_raw_quic() {
+        let (receiver, peer) = loopback_raw_session_pair().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            assert_subgroup_status_ingress(receiver, peer, super::super::Transport::RawQuic),
         )
         .await
         .unwrap();
