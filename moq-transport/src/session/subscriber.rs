@@ -2513,6 +2513,103 @@ mod tests {
         writer.finish().unwrap();
     }
 
+    async fn send_subgroup_objects(
+        session: &web_transport::Session,
+        header: data::SubgroupHeader,
+        object_ids: &[u64],
+    ) {
+        let stream = session.open_uni().await.unwrap();
+        let mut writer = Writer::new(stream);
+        writer.encode(&header).await.unwrap();
+        let mut previous = None;
+        for &object_id in object_ids {
+            writer
+                .encode(&data::SubgroupObject {
+                    object_id_delta: data::encode_object_id_delta(&mut previous, object_id)
+                        .unwrap(),
+                    payload_length: 1,
+                    status: None,
+                })
+                .await
+                .unwrap();
+            writer.write(&[object_id as u8]).await.unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    async fn receive_subgroup_stream(
+        receiver_session: &web_transport::Session,
+        subscriber: &Subscriber,
+    ) {
+        let stream = receiver_session.accept_uni().await.unwrap();
+        Subscriber::recv_stream(subscriber.clone(), stream)
+            .await
+            .unwrap();
+    }
+
+    async fn assert_mixed_subgroups_ingress(
+        receiver_session: web_transport::Session,
+        peer_session: web_transport::Session,
+        transport: super::super::Transport,
+    ) {
+        let subscriber = test_subscriber_for_transport(receiver_session.clone(), transport);
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), "mixed").produce();
+        let _subscribe =
+            register_test_subscribe_with_priority(&subscriber, track_writer, 0, 42, 200);
+
+        let send_one = send_subgroup_objects(
+            &peer_session,
+            data::SubgroupHeader {
+                header_type: data::StreamHeaderType::SubgroupIdDefaultPriorityFirstObject,
+                track_alias: 42,
+                group_id: 0,
+                subgroup_id: Some(1),
+                publisher_priority: 128,
+            },
+            &[3, 5],
+        );
+        let receive_one = receive_subgroup_stream(&receiver_session, &subscriber);
+        tokio::join!(send_one, receive_one);
+
+        let serve::TrackReaderMode::Subgroups(mut subgroups) = track_reader.mode().await.unwrap()
+        else {
+            panic!("expected subgroup delivery");
+        };
+        let mut one = subgroups.next().await.unwrap().unwrap();
+        assert_eq!(one.subgroup_id, 1);
+        for expected in [3, 5] {
+            let mut object = one.next().await.unwrap().unwrap();
+            assert_eq!(object.object_id, expected);
+            assert_eq!(object.read_all().await.unwrap().as_ref(), &[expected as u8]);
+        }
+
+        let send_zero = send_subgroup_objects(
+            &peer_session,
+            data::SubgroupHeader {
+                header_type:
+                    data::StreamHeaderType::SubgroupZeroIdEndOfGroupDefaultPriorityFirstObject,
+                track_alias: 42,
+                group_id: 0,
+                subgroup_id: None,
+                publisher_priority: 128,
+            },
+            &[4, 6],
+        );
+        let receive_zero = receive_subgroup_stream(&receiver_session, &subscriber);
+        tokio::join!(send_zero, receive_zero);
+
+        let mut zero = subgroups.next().await.unwrap().unwrap();
+        assert_eq!(zero.subgroup_id, 0);
+        assert!(zero.metadata().first_object);
+        assert!(zero.metadata().end_of_group);
+        for expected in [4, 6] {
+            let mut object = zero.next().await.unwrap().unwrap();
+            assert_eq!(object.object_id, expected);
+            assert_eq!(object.read_all().await.unwrap().as_ref(), &[expected as u8]);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn decoded_subgroup_object_ids_are_preserved() {
         let (receiver_session, peer_session) = loopback_session_pair().await;
@@ -2538,6 +2635,28 @@ mod tests {
             assert_eq!(object.object_id, expected_object_id);
             assert_eq!(object.read_all().await.unwrap().as_ref(), &[0]);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receives_mixed_reverse_order_subgroups_over_webtransport() {
+        let (receiver, peer) = loopback_session_pair().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            assert_mixed_subgroups_ingress(receiver, peer, super::super::Transport::WebTransport),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receives_mixed_reverse_order_subgroups_over_raw_quic() {
+        let (receiver, peer) = loopback_raw_session_pair().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            assert_mixed_subgroups_ingress(receiver, peer, super::super::Transport::RawQuic),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
