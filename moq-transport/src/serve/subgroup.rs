@@ -10,7 +10,14 @@
 //! The reader can be cloned, in which case each reader receives a copy of each object. (fanout)
 //!
 //! The stream is closed with [ServeError::Closed] when all writers or readers are dropped.
-use std::{cmp, ops::Deref, sync::Arc};
+use std::{
+    collections::VecDeque,
+    ops::Deref,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Weak,
+    },
+};
 
 use bytes::Bytes;
 
@@ -45,16 +52,49 @@ impl Deref for Subgroups {
 // State shared between the writer and reader.
 struct SubgroupsState {
     latest_subgroup_reader: Option<SubgroupReader>,
-    epoch: u64, // Updated each time latest changes
+    pending_subgroups: VecDeque<(usize, SubgroupReader)>,
+    reader_cursors: Vec<Weak<AtomicUsize>>,
+    active_subgroups: Vec<((u64, u64), Weak<SubgroupInfo>)>,
+    next_sequence: usize,
     closed: Result<(), ServeError>,
 }
+
+const MAX_PENDING_SUBGROUPS: usize = 1024;
 
 impl Default for SubgroupsState {
     fn default() -> Self {
         Self {
             latest_subgroup_reader: None,
-            epoch: 0,
+            pending_subgroups: VecDeque::new(),
+            reader_cursors: Vec::new(),
+            active_subgroups: Vec::new(),
+            next_sequence: 0,
             closed: Ok(()),
+        }
+    }
+}
+
+impl SubgroupsState {
+    fn prune_consumed(&mut self) {
+        self.reader_cursors
+            .retain(|reader| reader.strong_count() > 0);
+        let oldest_unread = self
+            .reader_cursors
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|cursor| cursor.load(Ordering::Relaxed))
+            .min()
+            .unwrap_or(self.next_sequence);
+
+        // Preserve the current latest subgroup for a reader activated after an
+        // idle period, even when every active reader has advanced past it.
+        while self.pending_subgroups.len() > 1
+            && self
+                .pending_subgroups
+                .front()
+                .is_some_and(|(sequence, _)| *sequence < oldest_unread)
+        {
+            self.pending_subgroups.pop_front();
         }
     }
 }
@@ -120,28 +160,52 @@ impl SubgroupsWriter {
         let (writer, reader) = subgroup.produce_with_metadata(metadata);
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+        state.closed.clone()?;
 
-        if let Some(latest) = &state.latest_subgroup_reader {
-            // TODO: Check this logic again
-            if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Equal {
-                match writer.subgroup_id.cmp(&latest.subgroup_id) {
-                    cmp::Ordering::Less => return Ok(writer), // dropped immediately, lul
-                    cmp::Ordering::Equal => return Err(ServeError::Duplicate),
-                    cmp::Ordering::Greater => state.latest_subgroup_reader = Some(reader),
-                }
-            } else if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Greater {
-                state.latest_subgroup_reader = Some(reader);
-            } else {
-                return Ok(writer); // drop here as well
-            }
-        } else {
-            state.latest_subgroup_reader = Some(reader);
+        state
+            .active_subgroups
+            .retain(|(_, subgroup)| subgroup.strong_count() > 0);
+        let key = (writer.group_id, writer.subgroup_id);
+        if state
+            .active_subgroups
+            .iter()
+            .any(|(active, _)| *active == key)
+        {
+            return Err(ServeError::Duplicate);
         }
 
-        self.next_subgroup_id = state.latest_subgroup_reader.as_ref().unwrap().subgroup_id + 1;
-        self.next_group_id = state.latest_subgroup_reader.as_ref().unwrap().group_id + 1;
-        self.last_group_id = state.latest_subgroup_reader.as_ref().unwrap().group_id;
-        state.epoch += 1;
+        state.prune_consumed();
+        if state.pending_subgroups.len() >= MAX_PENDING_SUBGROUPS {
+            let err =
+                ServeError::Internal("subgroup reader exceeded its pending stream limit".into());
+            state.closed = Err(err.clone());
+            return Err(err);
+        }
+
+        let sequence = state.next_sequence;
+        let Some(next_sequence) = state.next_sequence.checked_add(1) else {
+            let err = ServeError::Internal("subgroup delivery sequence exhausted".into());
+            state.closed = Err(err.clone());
+            return Err(err);
+        };
+        state.next_sequence = next_sequence;
+        state
+            .pending_subgroups
+            .push_back((sequence, reader.clone()));
+        state
+            .active_subgroups
+            .push((key, Arc::downgrade(&reader.info)));
+
+        let advances_latest = state
+            .latest_subgroup_reader
+            .as_ref()
+            .is_none_or(|latest| key > (latest.group_id, latest.subgroup_id));
+        if advances_latest {
+            self.next_subgroup_id = writer.subgroup_id.saturating_add(1);
+            self.next_group_id = writer.group_id.saturating_add(1);
+            self.last_group_id = writer.group_id;
+            state.latest_subgroup_reader = Some(reader);
+        }
 
         Ok(writer)
     }
@@ -166,11 +230,10 @@ impl Deref for SubgroupsWriter {
     }
 }
 
-#[derive(Clone)]
 pub struct SubgroupsReader {
     pub info: Arc<Track>,
     state: State<SubgroupsState>,
-    epoch: u64,
+    cursor: Option<Arc<AtomicUsize>>,
 }
 
 impl SubgroupsReader {
@@ -178,18 +241,52 @@ impl SubgroupsReader {
         Self {
             info: track_info,
             state,
-            epoch: 0,
+            cursor: None,
         }
     }
 
+    fn register(&mut self) {
+        if self.cursor.is_some() {
+            return;
+        }
+
+        let state = self.state.lock();
+        let sequence = state
+            .pending_subgroups
+            .back()
+            .map_or(state.next_sequence, |(sequence, _)| *sequence);
+        let cursor = Arc::new(AtomicUsize::new(sequence));
+        let mut state = state.into_mut_closed();
+        state
+            .reader_cursors
+            .retain(|reader| reader.strong_count() > 0);
+        state.reader_cursors.push(Arc::downgrade(&cursor));
+        self.cursor = Some(cursor);
+    }
+
     pub async fn next(&mut self) -> Result<Option<SubgroupReader>, ServeError> {
+        self.register();
+
         loop {
             {
                 let state = self.state.lock();
-
-                if self.epoch != state.epoch {
-                    self.epoch = state.epoch;
-                    return Ok(state.latest_subgroup_reader.clone());
+                if let (Some(cursor), Some((first_sequence, _))) =
+                    (&self.cursor, state.pending_subgroups.front())
+                {
+                    let sequence = cursor.load(Ordering::Relaxed);
+                    let index = sequence.checked_sub(*first_sequence).ok_or_else(|| {
+                        ServeError::Internal("subgroup reader fell behind retained history".into())
+                    })?;
+                    if let Some(subgroup) = state
+                        .pending_subgroups
+                        .get(index)
+                        .map(|(_, subgroup)| subgroup.clone())
+                    {
+                        cursor.store(sequence + 1, Ordering::Relaxed);
+                        let mut state = state.into_mut_closed();
+                        state.prune_consumed();
+                        return Ok(Some(subgroup));
+                    }
                 }
 
                 state.closed.clone()?;
@@ -200,6 +297,12 @@ impl SubgroupsReader {
             }
             .await; // Try again when the state changes
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delivery_cursor(&mut self) -> Arc<AtomicUsize> {
+        self.register();
+        self.cursor.as_ref().cloned().unwrap()
     }
 
     // Returns the largest group/sequence
@@ -215,6 +318,41 @@ impl SubgroupsReader {
     pub fn is_closed(&self) -> bool {
         let state = self.state.lock();
         state.closed.is_err() || state.modified().is_none()
+    }
+}
+
+impl Clone for SubgroupsReader {
+    fn clone(&self) -> Self {
+        let state = self.state.lock();
+        let sequence = self.cursor.as_ref().map_or_else(
+            || {
+                state
+                    .pending_subgroups
+                    .back()
+                    .map_or(state.next_sequence, |(sequence, _)| *sequence)
+            },
+            |cursor| cursor.load(Ordering::Relaxed),
+        );
+        let cursor = Arc::new(AtomicUsize::new(sequence));
+        let mut state = state.into_mut_closed();
+        state
+            .reader_cursors
+            .retain(|reader| reader.strong_count() > 0);
+        state.reader_cursors.push(Arc::downgrade(&cursor));
+
+        Self {
+            info: self.info.clone(),
+            state: self.state.clone(),
+            cursor: Some(cursor),
+        }
+    }
+}
+
+impl Drop for SubgroupsReader {
+    fn drop(&mut self) {
+        self.cursor = None;
+        let mut state = self.state.lock().into_mut_closed();
+        state.prune_consumed();
     }
 }
 
@@ -706,10 +844,234 @@ mod tests {
         .produce()
     }
 
+    fn subgroups() -> (SubgroupsWriter, SubgroupsReader) {
+        Subgroups {
+            track: Arc::new(Track::new(TrackNamespace::from_utf8_path("test"), "track")),
+        }
+        .produce()
+    }
+
+    fn create_subgroup(
+        writer: &mut SubgroupsWriter,
+        group_id: u64,
+        subgroup_id: u64,
+    ) -> SubgroupWriter {
+        writer
+            .create(Subgroup {
+                group_id,
+                subgroup_id,
+                priority: 128,
+            })
+            .unwrap()
+    }
+
+    async fn assert_subgroups(reader: &mut SubgroupsReader, expected: &[(u64, u64)]) {
+        for &(group_id, subgroup_id) in expected {
+            let subgroup = reader.next().await.unwrap().unwrap();
+            assert_eq!(
+                (subgroup.group_id, subgroup.subgroup_id),
+                (group_id, subgroup_id)
+            );
+        }
+    }
+
     #[test]
     fn locally_created_subgroup_begins_with_first_object() {
         let (_writer, reader) = subgroup();
         assert!(reader.metadata().first_object);
+    }
+
+    #[tokio::test]
+    async fn delivers_reverse_order_subgroups() {
+        let (mut writer, template) = subgroups();
+        let mut reader = template.clone();
+
+        let _one = create_subgroup(&mut writer, 0, 1);
+        let _zero = create_subgroup(&mut writer, 0, 0);
+
+        assert_subgroups(&mut reader, &[(0, 1), (0, 0)]).await;
+    }
+
+    #[tokio::test]
+    async fn delivers_burst_without_coalescing() {
+        let (mut writer, template) = subgroups();
+        let mut reader = template.clone();
+
+        let _zero = create_subgroup(&mut writer, 0, 0);
+        let _one = create_subgroup(&mut writer, 0, 1);
+
+        assert_subgroups(&mut reader, &[(0, 0), (0, 1)]).await;
+    }
+
+    #[tokio::test]
+    async fn delivers_two_groups_in_arrival_order() {
+        let (mut writer, template) = subgroups();
+        let mut reader = template.clone();
+        let mut subgroups = Vec::new();
+        let expected = [(0, 1), (0, 0), (1, 1), (1, 0)];
+
+        for &(group_id, subgroup_id) in &expected {
+            subgroups.push(create_subgroup(&mut writer, group_id, subgroup_id));
+        }
+
+        assert_subgroups(&mut reader, &expected).await;
+    }
+
+    #[tokio::test]
+    async fn cloned_reader_inherits_pending_and_future_subgroups() {
+        let (mut writer, template) = subgroups();
+        let mut first = template.clone();
+        let _zero = create_subgroup(&mut writer, 0, 0);
+        let mut second = first.clone();
+        let _one = create_subgroup(&mut writer, 0, 1);
+
+        assert_subgroups(&mut first, &[(0, 0), (0, 1)]).await;
+        assert_subgroups(&mut second, &[(0, 0), (0, 1)]).await;
+    }
+
+    #[tokio::test]
+    async fn cloned_readers_receive_subgroups_independently() {
+        let (mut writer, template) = subgroups();
+        let mut first = template.clone();
+        let mut second = template.clone();
+        let _zero = create_subgroup(&mut writer, 0, 0);
+        let _one = create_subgroup(&mut writer, 0, 1);
+
+        assert_subgroups(&mut second, &[(0, 0), (0, 1)]).await;
+        assert_subgroups(&mut first, &[(0, 0), (0, 1)]).await;
+    }
+
+    #[test]
+    fn rejects_active_duplicate_after_out_of_order_delivery() {
+        let (mut writer, template) = subgroups();
+        let _reader = template.clone();
+        let _one = create_subgroup(&mut writer, 0, 1);
+        let _zero = create_subgroup(&mut writer, 0, 0);
+
+        assert!(matches!(
+            writer.create(Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 128,
+            }),
+            Err(ServeError::Duplicate)
+        ));
+    }
+
+    #[tokio::test]
+    async fn backlog_overflow_closes_the_subgroup_source() {
+        let (mut writer, template) = subgroups();
+        let mut reader = template.clone();
+        let mut open = Vec::new();
+        for group_id in 0..MAX_PENDING_SUBGROUPS as u64 {
+            open.push(create_subgroup(&mut writer, group_id, 0));
+        }
+
+        assert!(matches!(
+            writer.create(Subgroup {
+                group_id: MAX_PENDING_SUBGROUPS as u64,
+                subgroup_id: 0,
+                priority: 128,
+            }),
+            Err(ServeError::Internal(_))
+        ));
+
+        for group_id in 0..MAX_PENDING_SUBGROUPS as u64 {
+            assert_subgroups(&mut reader, &[(group_id, 0)]).await;
+        }
+        assert!(matches!(reader.next().await, Err(ServeError::Internal(_))));
+        assert!(matches!(
+            writer.create(Subgroup {
+                group_id: MAX_PENDING_SUBGROUPS as u64,
+                subgroup_id: 0,
+                priority: 128,
+            }),
+            Err(ServeError::Internal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn consumed_history_does_not_exhaust_the_bound() {
+        let (mut writer, template) = subgroups();
+        let mut reader = template.clone();
+
+        for group_id in 0..(MAX_PENDING_SUBGROUPS as u64 * 2) {
+            let _subgroup = create_subgroup(&mut writer, group_id, 0);
+            assert_subgroups(&mut reader, &[(group_id, 0)]).await;
+        }
+
+        assert_eq!(writer.state.lock().pending_subgroups.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_history_is_pruned_as_the_reader_advances() {
+        let (mut writer, template) = subgroups();
+        let mut reader = template.clone();
+
+        for group_id in 0..8 {
+            let _subgroup = create_subgroup(&mut writer, group_id, 0);
+        }
+        drop(writer);
+
+        for group_id in 0..8 {
+            assert_subgroups(&mut reader, &[(group_id, 0)]).await;
+        }
+        assert_eq!(reader.state.lock().pending_subgroups.len(), 1);
+        assert!(reader.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_slowest_reader_prunes_terminal_history() {
+        let (mut writer, template) = subgroups();
+        let mut fast = template.clone();
+        let slow = fast.clone();
+
+        for group_id in 0..8 {
+            let _subgroup = create_subgroup(&mut writer, group_id, 0);
+        }
+        drop(writer);
+        for group_id in 0..8 {
+            assert_subgroups(&mut fast, &[(group_id, 0)]).await;
+        }
+        assert_eq!(fast.state.lock().pending_subgroups.len(), 8);
+
+        drop(slow);
+        assert_eq!(fast.state.lock().pending_subgroups.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delivery_sequence_exhaustion_closes_the_source() {
+        let (mut writer, template) = subgroups();
+        let mut reader = template.clone();
+        writer.state.lock_mut().unwrap().next_sequence = usize::MAX;
+
+        assert!(matches!(
+            writer.create(Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 128,
+            }),
+            Err(ServeError::Internal(_))
+        ));
+        assert!(matches!(reader.next().await, Err(ServeError::Internal(_))));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_slow_reader_releases_backlog_capacity() {
+        let (mut writer, template) = subgroups();
+        let mut fast = template.clone();
+        let slow = fast.clone();
+
+        for group_id in 0..(MAX_PENDING_SUBGROUPS as u64 - 1) {
+            let _subgroup = create_subgroup(&mut writer, group_id, 0);
+            assert_subgroups(&mut fast, &[(group_id, 0)]).await;
+        }
+
+        drop(slow);
+        for group_id in (MAX_PENDING_SUBGROUPS as u64 - 1)..=(MAX_PENDING_SUBGROUPS as u64) {
+            let _subgroup = create_subgroup(&mut writer, group_id, 0);
+            assert_subgroups(&mut fast, &[(group_id, 0)]).await;
+        }
     }
 
     #[tokio::test]

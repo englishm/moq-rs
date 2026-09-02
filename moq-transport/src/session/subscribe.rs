@@ -644,6 +644,69 @@ mod tests {
         assert!(datagram.extension_headers.has(2));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_done_drain_preserves_reverse_order_subgroups() {
+        let (_send, mut recv, reader) = test_recv_with_reader().await;
+        recv.ok(42, 200).unwrap();
+        assert_eq!(recv.recv_done(ServeError::Done, 2), DoneOutcome::DrainArmed);
+
+        recv.note_stream_received();
+        let mut one = recv
+            .subgroup(data::SubgroupHeader {
+                header_type: data::StreamHeaderType::SubgroupIdDefaultPriorityFirstObject,
+                track_alias: 42,
+                group_id: 0,
+                subgroup_id: Some(1),
+                publisher_priority: 128,
+            })
+            .unwrap();
+        for object_id in [3, 5] {
+            let mut object = one.create_with_id(object_id, 1, None).unwrap();
+            object
+                .write(bytes::Bytes::from(vec![object_id as u8]))
+                .unwrap();
+        }
+        drop(one);
+        assert!(!recv.note_stream_finished());
+
+        let serve::TrackReaderMode::Subgroups(mut subgroups) = reader.mode().await.unwrap() else {
+            panic!("expected subgroup delivery");
+        };
+
+        recv.note_stream_received();
+        let mut zero = recv
+            .subgroup(data::SubgroupHeader {
+                header_type:
+                    data::StreamHeaderType::SubgroupZeroIdEndOfGroupDefaultPriorityFirstObject,
+                track_alias: 42,
+                group_id: 0,
+                subgroup_id: None,
+                publisher_priority: 128,
+            })
+            .unwrap();
+        for object_id in [4, 6] {
+            let mut object = zero.create_with_id(object_id, 1, None).unwrap();
+            object
+                .write(bytes::Bytes::from(vec![object_id as u8]))
+                .unwrap();
+        }
+        drop(zero);
+        assert!(recv.note_stream_finished());
+
+        for (subgroup_id, object_ids) in [(1, [3, 5]), (0, [4, 6])] {
+            let mut subgroup = subgroups.next().await.unwrap().unwrap();
+            assert_eq!(subgroup.subgroup_id, subgroup_id);
+            for object_id in object_ids {
+                let mut object = subgroup.next().await.unwrap().unwrap();
+                assert_eq!(object.object_id, object_id);
+                assert_eq!(
+                    object.read_all().await.unwrap().as_ref(),
+                    &[object_id as u8]
+                );
+            }
+        }
+    }
+
     /// §10.11: the request stream can die while a data stream is still being
     /// read. Tearing down here discards Objects already in flight — the same
     /// loss the drain exists to prevent.
