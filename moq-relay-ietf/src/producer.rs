@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ use moq_transport::{
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{
         Publisher, ServeWithDeadlineError, SessionError, Subscribed, SubscribedNamespace,
-        TrackStatusRequested,
+        SubscribedTracks, TrackStatusRequested,
     },
 };
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
@@ -22,8 +22,8 @@ use crate::{
     metrics::{GaugeGuard, TimingGuard},
     remote::RemoteSubscribeError,
     upstream_namespaces::UpstreamNamespaces,
-    Coordinator, Locals, NamespaceChange, RemoteManager, SessionContext, TrackChange,
-    UpstreamReady,
+    Coordinator, Locals, NamespaceChange, PublishedTrackChange, RemoteManager, SessionContext,
+    TrackChange, TrackSnapshot, UpstreamReady,
 };
 
 /// Ceiling on how long a SUBSCRIBE is held waiting for a publisher to appear.
@@ -41,6 +41,82 @@ const MAX_RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Keep one session from consuming the relay's entire rendezvous budget. Half
 /// the relay-wide capacity remains available to other sessions.
 const MAX_CONCURRENT_RENDEZVOUS_HOLDS_PER_SESSION: usize = MAX_CONCURRENT_RENDEZVOUS_HOLDS / 2;
+const MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION: usize = 1024;
+const MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION: usize = 128;
+
+type ProducerTask = futures::future::BoxFuture<'static, ()>;
+
+struct SubscribeTracksSlot {
+    desired: Option<TrackReader>,
+    active: Option<TrackReader>,
+    /// draft-18 section 6.1 forbids a later PUBLISH for this track after
+    /// PUBLISH_BLOCKED. The parent SUBSCRIBE_TRACKS owns this tombstone until
+    /// it is cancelled, which drops its slot map and releases the permit.
+    publish_blocked_tombstone: bool,
+    _session_slot_permit: OwnedSemaphorePermit,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SubscribeTracksSlotAction {
+    None,
+    Publish,
+    Remove,
+}
+
+impl SubscribeTracksSlot {
+    fn set_desired(&mut self, track: TrackReader) -> bool {
+        if self.publish_blocked_tombstone
+            || self
+                .active
+                .as_ref()
+                .is_some_and(|active| same_track_generation(active, &track))
+        {
+            return false;
+        }
+        self.desired = Some(track);
+        true
+    }
+
+    fn complete(&mut self, generation: &TrackReader) -> SubscribeTracksSlotAction {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| same_track_generation(active, generation))
+        {
+            self.active = None;
+        }
+        if self
+            .desired
+            .as_ref()
+            .is_some_and(|desired| same_track_generation(desired, generation))
+        {
+            self.desired = None;
+        }
+        if self.active.is_some() || self.publish_blocked_tombstone {
+            SubscribeTracksSlotAction::None
+        } else if self.desired.is_some() {
+            SubscribeTracksSlotAction::Publish
+        } else {
+            SubscribeTracksSlotAction::Remove
+        }
+    }
+
+    fn remove_desired(&mut self, generation: &TrackReader) -> bool {
+        if self
+            .desired
+            .as_ref()
+            .is_some_and(|desired| same_track_generation(desired, generation))
+        {
+            self.desired = None;
+        }
+        self.active.is_none() && self.desired.is_none() && !self.publish_blocked_tombstone
+    }
+}
+
+struct PublishCompletion {
+    full_name: FullTrackName,
+    generation: TrackReader,
+}
 
 /// How often a held SUBSCRIBE asks the coordinator again whether a publisher has
 /// turned up.
@@ -123,6 +199,11 @@ pub struct Producer {
     rendezvous_hold_permits: Arc<Semaphore>,
     /// Relay-level context for this MoQT session.
     context: SessionContext,
+    /// Shared only by SUBSCRIBE_TRACKS requests on this transport session. Its
+    /// bound must match the child-task channel capacity in [`Self::run`].
+    subscribe_tracks_session_child_permits: Arc<Semaphore>,
+    /// Shared only by SUBSCRIBE_TRACKS requests on this transport session.
+    subscribe_tracks_session_slot_permits: Arc<Semaphore>,
 }
 
 /// Why the wait for upstream readiness ended without the subscription being
@@ -174,6 +255,12 @@ impl Producer {
                 MAX_CONCURRENT_RENDEZVOUS_HOLDS_PER_SESSION,
             )),
             context,
+            subscribe_tracks_session_child_permits: Arc::new(Semaphore::new(
+                MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION,
+            )),
+            subscribe_tracks_session_slot_permits: Arc::new(Semaphore::new(
+                MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
+            )),
         }
     }
 
@@ -224,13 +311,17 @@ impl Producer {
 
     /// Run the producer to serve subscribe requests.
     pub async fn run(self) -> Result<(), SessionError> {
-        let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
-            FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<ProducerTask> = FuturesUnordered::new();
+        // A SUBSCRIBE_TRACKS child acquires a permit from the semaphore with
+        // this same bound before sending, so the parent cannot stall here.
+        let (child_tasks, mut child_task_rx) =
+            tokio::sync::mpsc::channel(MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION);
 
         loop {
             let mut publisher_subscribed = self.publisher.clone();
             let mut publisher_track_status = self.publisher.clone();
             let mut publisher_subscribed_namespace = self.publisher.clone();
+            let mut publisher_subscribed_tracks = self.publisher.clone();
 
             tokio::select! {
                 // Handle a new subscribe request
@@ -290,6 +381,22 @@ impl Producer {
                         }
                     }.boxed())
                 },
+                Some(subscribed_tracks) = publisher_subscribed_tracks.subscribed_tracks() => {
+                    let this = self.clone();
+                    let child_tasks = child_tasks.clone();
+                    tasks.push(async move {
+                        let prefix = subscribed_tracks.namespace_prefix.to_utf8_path();
+                        tracing::info!(namespace_prefix = %prefix, "serving subscribe tracks");
+                        if let Err(err) = this.serve_subscribe_tracks(subscribed_tracks, child_tasks).await {
+                            if Self::is_expected_serve_shutdown(&err) {
+                                tracing::debug!(namespace_prefix = %prefix, error = %err, "stopped serving subscribe tracks");
+                            } else {
+                                tracing::warn!(namespace_prefix = %prefix, error = %err, "failed serving subscribe tracks");
+                            }
+                        }
+                    }.boxed())
+                },
+                Some(task) = child_task_rx.recv() => tasks.push(task),
                 _= tasks.next(), if !tasks.is_empty() => {},
                 else => return Ok(()),
             };
@@ -821,7 +928,7 @@ impl Producer {
 
                 change = track_changes.recv() => {
                     match change {
-                        Ok(TrackChange::Added { scope: change_scope, track })
+                        Ok(TrackChange::Added { scope: change_scope, track, .. })
                             if change_scope.as_deref() == scope
                                 && track.info.namespace == *namespace
                                 && track.info.name == *track_name =>
@@ -1067,7 +1174,7 @@ impl Producer {
         change: TrackChange,
     ) -> Result<(), anyhow::Error> {
         match change {
-            TrackChange::Added { scope, track } => {
+            TrackChange::Added { scope, track, .. } => {
                 if scope.as_deref() != self.context.scope()
                     || !subscribed_namespace
                         .namespace_prefix
@@ -1079,7 +1186,9 @@ impl Producer {
                 self.publish_track_for_namespace(subscribed_namespace, known, publish_tasks, track)
                     .await
             }
-            TrackChange::Removed { scope, full_name } => {
+            TrackChange::Removed {
+                scope, full_name, ..
+            } => {
                 if scope.as_deref() == self.context.scope() {
                     known.remove(&full_name);
                 }
@@ -1148,6 +1257,363 @@ impl Producer {
             .boxed(),
         );
 
+        Ok(())
+    }
+
+    async fn serve_subscribe_tracks(
+        self,
+        mut request: SubscribedTracks,
+        child_tasks: tokio::sync::mpsc::Sender<ProducerTask>,
+    ) -> Result<(), anyhow::Error> {
+        let mut changes = self.locals.subscribe_published_track_changes();
+        let snapshot = match self.locals.list_tracks_matching_for_session(
+            self.context.scope(),
+            &request.namespace_prefix,
+            self.context.identity(),
+            MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
+        ) {
+            Ok(TrackSnapshot::Tracks(snapshot)) => snapshot,
+            Ok(TrackSnapshot::TooLarge) => {
+                request.reject(
+                    RequestErrorCode::NamespaceTooLarge as u64,
+                    "too many matching tracks",
+                )?;
+                return Ok(());
+            }
+            Err(error) => {
+                let prefix = request.namespace_prefix.to_utf8_path();
+                request.reject(RequestErrorCode::InternalError as u64, "internal error")?;
+                return Err(anyhow::Error::new(error)
+                    .context(format!("failed to snapshot tracks for prefix {prefix}")));
+            }
+        };
+
+        // This map belongs to one parent SUBSCRIBE_TRACKS. Every cancellation
+        // path returns from this function, dropping the map and its session
+        // slot permits without affecting other sessions.
+        let mut slots = HashMap::with_capacity(snapshot.len());
+        for track in snapshot {
+            let permit = match self
+                .subscribe_tracks_session_slot_permits
+                .clone()
+                .try_acquire_owned()
+            {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject(
+                        RequestErrorCode::ExcessiveLoad as u64,
+                        "subscribe tracks session limit exceeded",
+                    )?;
+                    return Ok(());
+                }
+            };
+            slots.insert(
+                full_name_for_track(&track),
+                SubscribeTracksSlot {
+                    desired: Some(track),
+                    active: None,
+                    publish_blocked_tombstone: false,
+                    _session_slot_permit: permit,
+                },
+            );
+        }
+
+        request.ok()?;
+        let (completed, mut completions) =
+            tokio::sync::mpsc::channel(MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION);
+        let initial: Vec<_> = slots.keys().cloned().collect();
+        for full_name in initial {
+            self.start_subscribe_tracks_publish(
+                &mut request,
+                &mut slots,
+                &full_name,
+                &child_tasks,
+                &completed,
+            )
+            .await?;
+        }
+
+        loop {
+            tokio::select! {
+                biased;
+                result = request.closed() => {
+                    result?;
+                    return Ok(());
+                }
+                Some(completion) = completions.recv() => {
+                    let action = slots
+                        .get_mut(&completion.full_name)
+                        .map(|slot| slot.complete(&completion.generation));
+                    match action {
+                        Some(SubscribeTracksSlotAction::Remove) => {
+                            slots.remove(&completion.full_name);
+                        }
+                        Some(SubscribeTracksSlotAction::Publish) => {
+                            self.start_subscribe_tracks_publish(
+                                &mut request,
+                                &mut slots,
+                                &completion.full_name,
+                                &child_tasks,
+                                &completed,
+                            ).await?;
+                        }
+                        Some(SubscribeTracksSlotAction::None) | None => {}
+                    }
+                }
+                change = changes.recv() => {
+                    match change {
+                        Ok(PublishedTrackChange::Added { scope, track, origin }) => {
+                            if scope.as_deref() != self.context.scope()
+                                || !request.namespace_prefix.is_prefix_of(&track.namespace)
+                                || origin.as_ref().is_some_and(|origin| origin.same_as(self.context.identity()))
+                            {
+                                continue;
+                            }
+                            let full_name = full_name_for_track(&track);
+                            if let Some(slot) = slots.get_mut(&full_name) {
+                                if !slot.set_desired(track) {
+                                    continue;
+                                }
+                            } else {
+                                if slots.len() == MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION {
+                                    request.terminate(RequestErrorCode::ExcessiveLoad as u32)?;
+                                    return Ok(());
+                                }
+                                let permit = match self.subscribe_tracks_session_slot_permits.clone().try_acquire_owned() {
+                                    Ok(permit) => permit,
+                                    Err(_) => {
+                                        request.terminate(RequestErrorCode::ExcessiveLoad as u32)?;
+                                        return Ok(());
+                                    }
+                                };
+                                slots.insert(full_name.clone(), SubscribeTracksSlot {
+                                    desired: Some(track),
+                                    active: None,
+                                    publish_blocked_tombstone: false,
+                                    _session_slot_permit: permit,
+                                });
+                            }
+                            self.start_subscribe_tracks_publish(
+                                &mut request,
+                                &mut slots,
+                                &full_name,
+                                &child_tasks,
+                                &completed,
+                            ).await?;
+                        }
+                        Ok(PublishedTrackChange::Removed { scope, full_name, track }) => {
+                            if scope.as_deref() != self.context.scope() {
+                                continue;
+                            }
+                            let remove = slots
+                                .get_mut(&full_name)
+                                .is_some_and(|slot| slot.remove_desired(&track));
+                            if remove {
+                                slots.remove(&full_name);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            metrics::counter!("moq_relay_change_channel_lagged_total", "channel" => "subscribe_tracks")
+                                .increment(skipped);
+                            self.resync_subscribe_tracks(
+                                &mut request,
+                                &mut slots,
+                                &child_tasks,
+                                &completed,
+                            ).await?;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn resync_subscribe_tracks(
+        &self,
+        request: &mut SubscribedTracks,
+        slots: &mut HashMap<FullTrackName, SubscribeTracksSlot>,
+        child_tasks: &tokio::sync::mpsc::Sender<ProducerTask>,
+        completed: &tokio::sync::mpsc::Sender<PublishCompletion>,
+    ) -> Result<(), anyhow::Error> {
+        let snapshot = match self.locals.list_tracks_matching_for_session(
+            self.context.scope(),
+            &request.namespace_prefix,
+            self.context.identity(),
+            MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
+        ) {
+            Ok(TrackSnapshot::Tracks(snapshot)) => snapshot,
+            Ok(TrackSnapshot::TooLarge) => {
+                request.terminate(RequestErrorCode::ExcessiveLoad as u32)?;
+                return Ok(());
+            }
+            Err(error) => {
+                request.terminate(RequestErrorCode::InternalError as u32)?;
+                return Err(anyhow::Error::new(error).context(format!(
+                    "failed to resync tracks for prefix {}",
+                    request.namespace_prefix.to_utf8_path()
+                )));
+            }
+        };
+
+        let current: HashMap<_, _> = snapshot
+            .into_iter()
+            .map(|track| (full_name_for_track(&track), track))
+            .collect();
+        for (full_name, slot) in slots.iter_mut() {
+            if slot.publish_blocked_tombstone {
+                continue;
+            }
+            slot.desired = current.get(full_name).cloned();
+        }
+        for (full_name, track) in current {
+            if slots.contains_key(&full_name) {
+                continue;
+            }
+            let permit = match self
+                .subscribe_tracks_session_slot_permits
+                .clone()
+                .try_acquire_owned()
+            {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.terminate(RequestErrorCode::ExcessiveLoad as u32)?;
+                    return Ok(());
+                }
+            };
+            slots.insert(
+                full_name,
+                SubscribeTracksSlot {
+                    desired: Some(track),
+                    active: None,
+                    publish_blocked_tombstone: false,
+                    _session_slot_permit: permit,
+                },
+            );
+        }
+        let pending: Vec<_> = slots
+            .iter()
+            .filter(|(_, slot)| {
+                slot.desired.is_some() && slot.active.is_none() && !slot.publish_blocked_tombstone
+            })
+            .map(|(full_name, _)| full_name.clone())
+            .collect();
+        for full_name in pending {
+            self.start_subscribe_tracks_publish(request, slots, &full_name, child_tasks, completed)
+                .await?;
+        }
+        slots.retain(|_, slot| {
+            slot.desired.is_some() || slot.active.is_some() || slot.publish_blocked_tombstone
+        });
+        Ok(())
+    }
+
+    async fn start_subscribe_tracks_publish(
+        &self,
+        request: &mut SubscribedTracks,
+        slots: &mut HashMap<FullTrackName, SubscribeTracksSlot>,
+        full_name: &FullTrackName,
+        child_tasks: &tokio::sync::mpsc::Sender<ProducerTask>,
+        completed: &tokio::sync::mpsc::Sender<PublishCompletion>,
+    ) -> Result<(), anyhow::Error> {
+        let Some(slot) = slots.get(full_name) else {
+            return Ok(());
+        };
+        if slot.active.is_some() || slot.publish_blocked_tombstone {
+            return Ok(());
+        }
+        let Some(track) = slot.desired.clone() else {
+            return Ok(());
+        };
+
+        let permit = match self
+            .subscribe_tracks_session_child_permits
+            .clone()
+            .try_acquire_owned()
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                request.publish_blocked(&full_name.namespace, &full_name.name)?;
+                if let Some(slot) = slots.get_mut(full_name) {
+                    // This terminal marker is retained only until this parent
+                    // SUBSCRIBE_TRACKS ends; draft-18 section 6.1 forbids a
+                    // later generated PUBLISH for the same track.
+                    slot.publish_blocked_tombstone = true;
+                    slot.desired = None;
+                }
+                return Ok(());
+            }
+        };
+
+        let mut params = KeyValuePairs::default();
+        if !request.forward {
+            params.set_forward(false);
+        }
+        let mut publisher = self.publisher.clone();
+        let publish = publisher.publish(track.clone(), params);
+        let published = match tokio::select! {
+            biased;
+            closed = request.closed() => {
+                let error = match closed {
+                    Ok(()) => ServeError::Done,
+                    Err(error) => error,
+                };
+                return Err(anyhow::Error::new(error).context(format!(
+                    "parent SUBSCRIBE_TRACKS ended while starting generated PUBLISH for {}--{}",
+                    full_name.namespace.to_utf8_path(),
+                    full_name.name
+                )));
+            }
+            published = publish => published,
+        } {
+            Ok(published) => published,
+            Err(SessionError::Serve(ServeError::Duplicate)) => {
+                slots.remove(full_name);
+                return Ok(());
+            }
+            Err(error) if !error.is_session_fatal() => {
+                tracing::warn!(
+                    namespace = %full_name.namespace.to_utf8_path(),
+                    track = %full_name.name,
+                    error = %error,
+                    "failed to start generated PUBLISH; keeping SUBSCRIBE_TRACKS active"
+                );
+                slots.remove(full_name);
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "failed to start generated PUBLISH for {}--{}",
+                    full_name.namespace.to_utf8_path(),
+                    full_name.name
+                )));
+            }
+        };
+        if let Some(slot) = slots.get_mut(full_name) {
+            slot.active = Some(track.clone());
+        }
+
+        let completion = PublishCompletion {
+            full_name: full_name.clone(),
+            generation: track,
+        };
+        let completed = completed.clone();
+        let namespace = full_name.namespace.to_utf8_path();
+        let track_name = full_name.name.to_string();
+        child_tasks
+            .send(
+                async move {
+                    let _permit = permit;
+                    match published.serve().await {
+                        Ok(()) => tracing::debug!(namespace = %namespace, track = %track_name, "finished serving PUBLISH for SUBSCRIBE_TRACKS"),
+                        Err(error) => tracing::warn!(namespace = %namespace, track = %track_name, error = %error, "failed serving PUBLISH for SUBSCRIBE_TRACKS"),
+                    }
+                    let _ = completed.send(completion).await;
+                }
+                .boxed(),
+            )
+            .await
+            .map_err(|_| ServeError::Cancel)?;
         Ok(())
     }
 
@@ -1233,23 +1699,35 @@ fn full_name_for_track(track: &TrackReader) -> FullTrackName {
     }
 }
 
+fn same_track_generation(left: &TrackReader, right: &TrackReader) -> bool {
+    Arc::ptr_eq(&left.info, &right.info)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
+        io::Cursor,
         sync::{Arc, Mutex},
         time::Duration,
     };
 
     use async_trait::async_trait;
     use moq_transport::{
-        coding::{KeyValuePairs, TrackNamespace},
-        message::RequestErrorCode,
+        coding::{
+            Decode, DecodeError, Encode, KeyValuePairs, TrackName, TrackNamespace,
+            TrackNamespacePrefix,
+        },
+        message::{wire_id, Message, PublishBlocked, RequestErrorCode, SubscribeTracks},
         serve::{ServeError, Track},
         session::{Session as TransportSession, SessionError, Subscriber, Transport},
     };
+    use tokio::sync::Semaphore;
 
     use super::{
-        namespace_covers, rendezvous_hold, Producer, MAX_CONCURRENT_RENDEZVOUS_HOLDS_PER_SESSION,
+        full_name_for_track, namespace_covers, rendezvous_hold, Producer, SubscribeTracksSlot,
+        SubscribeTracksSlotAction, MAX_CONCURRENT_RENDEZVOUS_HOLDS_PER_SESSION,
+        MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION, MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
     };
     use crate::{
         Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, Locals,
@@ -1411,7 +1889,26 @@ mod tests {
         remotes: RemoteManager,
         coordinator: Arc<dyn Coordinator>,
     ) -> Subscriber {
+        let (_, subscriber, _) = spawn_relay_session_with_limits(
+            locals,
+            remotes,
+            coordinator,
+            MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION,
+            MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
+        )
+        .await;
+        subscriber
+    }
+
+    async fn spawn_relay_session_with_limits(
+        locals: Locals,
+        remotes: RemoteManager,
+        coordinator: Arc<dyn Coordinator>,
+        child_limit: usize,
+        slot_limit: usize,
+    ) -> (web_transport::Session, Subscriber, Arc<Semaphore>) {
         let (server_transport, client_transport) = loopback_webtransport_pair().await;
+        let request_transport = client_transport.clone();
         let (server, client) = tokio::time::timeout(Duration::from_secs(10), async {
             tokio::join!(
                 TransportSession::accept(server_transport, None, Transport::WebTransport),
@@ -1422,19 +1919,63 @@ mod tests {
         .expect("MoQT setup timed out");
         let (server, publisher, _server_subscriber) = server.expect("accept MoQT session");
         let (client, _client_publisher, subscriber) = client.expect("connect MoQT session");
-        let producer = Producer::new(
+        let mut producer = Producer::new(
             publisher.expect("server publisher"),
             locals,
             remotes,
             coordinator,
             SessionContext::public(None),
         );
+        producer.subscribe_tracks_session_child_permits = Arc::new(Semaphore::new(child_limit));
+        producer.subscribe_tracks_session_slot_permits = Arc::new(Semaphore::new(slot_limit));
+        let slot_permits = producer.subscribe_tracks_session_slot_permits.clone();
 
         tokio::spawn(async move { server.run().await });
         tokio::spawn(async move { client.run().await });
         tokio::spawn(async move { producer.run().await });
 
-        subscriber
+        (request_transport, subscriber, slot_permits)
+    }
+
+    async fn read_bidi_response_frame(
+        recv: &mut web_transport::RecvStream,
+        buffer: &mut Vec<u8>,
+    ) -> (u64, Vec<u8>) {
+        loop {
+            let mut cursor = Cursor::new(buffer.as_slice());
+            let message_type = match u64::decode(&mut cursor) {
+                Ok(message_type) => Some(message_type),
+                Err(DecodeError::More(_)) => None,
+                Err(error) => panic!("invalid response message type: {error}"),
+            };
+            let message_length = if message_type.is_some() {
+                match u16::decode(&mut cursor) {
+                    Ok(message_length) => Some(message_length as usize),
+                    Err(DecodeError::More(_)) => None,
+                    Err(error) => panic!("invalid response message length: {error}"),
+                }
+            } else {
+                None
+            };
+            if let (Some(message_type), Some(message_length)) = (message_type, message_length) {
+                let header_length = cursor.position() as usize;
+                let frame_length = header_length + message_length;
+                if buffer.len() >= frame_length {
+                    let payload = buffer[header_length..frame_length].to_vec();
+                    buffer.drain(..frame_length);
+                    return (message_type, payload);
+                }
+            }
+
+            if recv
+                .read_buf(buffer)
+                .await
+                .expect("read response frame")
+                .is_none()
+            {
+                panic!("response stream ended before a complete frame");
+            }
+        }
     }
 
     async fn subscribe_result(
@@ -1460,6 +2001,207 @@ mod tests {
             Ok(_) => panic!("expected {track_name} subscription to be rejected"),
             Err(err) => err,
         }
+    }
+
+    fn test_track(name: &str) -> moq_transport::serve::TrackReader {
+        let (_writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("subscribe-tracks"), name).produce();
+        reader
+    }
+
+    #[test]
+    fn cancelling_parent_releases_blocked_session_slot() {
+        let permits = Arc::new(Semaphore::new(1));
+        let generation = test_track("blocked");
+        let full_name = full_name_for_track(&generation);
+        let permit = permits
+            .clone()
+            .try_acquire_owned()
+            .expect("acquire slot permit");
+        let mut slots = HashMap::from([(
+            full_name.clone(),
+            SubscribeTracksSlot {
+                desired: None,
+                active: None,
+                publish_blocked_tombstone: true,
+                _session_slot_permit: permit,
+            },
+        )]);
+
+        let replacement = test_track("blocked");
+        assert!(!slots
+            .get_mut(&full_name)
+            .expect("blocked slot")
+            .set_desired(replacement));
+        assert_eq!(permits.available_permits(), 0);
+
+        // Cancelling the parent returns from serve_subscribe_tracks and drops
+        // this request-owned slot map.
+        drop(slots);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn subscribe_tracks_resyncs_after_lag_and_releases_blocked_slots_on_cancellation() {
+        let locals = Locals::new();
+        let namespace = TrackNamespace::from_utf8_path("subscribe-tracks");
+        let (_writer, reader) = Track::new(namespace.clone(), "blocked").produce();
+        let mut registering_locals = locals.clone();
+        let _registration = registering_locals
+            .register_track(None, reader)
+            .await
+            .expect("register matching track");
+        let coordinator = Arc::new(CountingCoordinator::default());
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let (request_transport, _subscriber, slot_permits) =
+            spawn_relay_session_with_limits(locals, remotes, coordinator, 0, 2).await;
+        let (mut request_send, mut response_recv) = request_transport
+            .open_bi()
+            .await
+            .expect("open SUBSCRIBE_TRACKS stream");
+        let request = Message::SubscribeTracks(SubscribeTracks {
+            id: 0,
+            track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("subscribe-tracks"),
+            params: KeyValuePairs::default(),
+        });
+        let mut frame = Vec::new();
+        request.encode(&mut frame).expect("encode SUBSCRIBE_TRACKS");
+        let mut frame = Cursor::new(frame);
+        while frame.position() < frame.get_ref().len() as u64 {
+            request_send
+                .write_buf(&mut frame)
+                .await
+                .expect("write SUBSCRIBE_TRACKS");
+        }
+
+        let mut response_buffer = Vec::new();
+        let (message_type, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_bidi_response_frame(&mut response_recv, &mut response_buffer),
+        )
+        .await
+        .expect("REQUEST_OK timed out");
+        assert_eq!(message_type, wire_id::RequestOk);
+
+        let (message_type, payload) = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_bidi_response_frame(&mut response_recv, &mut response_buffer),
+        )
+        .await
+        .expect("PUBLISH_BLOCKED timed out");
+        assert_eq!(message_type, wire_id::PublishBlocked);
+        let blocked = PublishBlocked::decode(&mut Cursor::new(payload))
+            .expect("decode PUBLISH_BLOCKED payload");
+        assert_eq!(blocked.track_name, TrackName::from("blocked"));
+        assert_eq!(slot_permits.available_permits(), 1);
+
+        // Keep this task scheduled while overflowing the 1024-entry broadcast
+        // channel, with the matching change outside the retained tail.
+        const CHANGE_BURST: usize = 1025;
+        let mut registrations = Vec::with_capacity(CHANGE_BURST * 2 + 1);
+        for index in 0..CHANGE_BURST {
+            let (_writer, reader) = Track::new(
+                TrackNamespace::from_utf8_path(&format!("unrelated/before/{index}")),
+                "noise",
+            )
+            .produce();
+            registrations.push(
+                registering_locals
+                    .register_track(None, reader)
+                    .await
+                    .expect("register leading unrelated track"),
+            );
+        }
+        let (_writer, reader) = Track::new(namespace, "resynced").produce();
+        registrations.push(
+            registering_locals
+                .register_track(None, reader)
+                .await
+                .expect("register matching track for resync"),
+        );
+        for index in 0..CHANGE_BURST {
+            let (_writer, reader) = Track::new(
+                TrackNamespace::from_utf8_path(&format!("unrelated/after/{index}")),
+                "noise",
+            )
+            .produce();
+            registrations.push(
+                registering_locals
+                    .register_track(None, reader)
+                    .await
+                    .expect("register trailing unrelated track"),
+            );
+        }
+
+        let (message_type, payload) = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_bidi_response_frame(&mut response_recv, &mut response_buffer),
+        )
+        .await
+        .expect("resynced PUBLISH_BLOCKED timed out");
+        assert_eq!(message_type, wire_id::PublishBlocked);
+        let blocked = PublishBlocked::decode(&mut Cursor::new(payload))
+            .expect("decode resynced PUBLISH_BLOCKED payload");
+        assert_eq!(blocked.track_name, TrackName::from("resynced"));
+        assert_eq!(slot_permits.available_permits(), 0);
+
+        request_send
+            .finish()
+            .expect("finish SUBSCRIBE_TRACKS request");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while slot_permits.available_permits() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request cancellation did not release slot permit");
+        assert_eq!(slot_permits.available_permits(), 2);
+    }
+
+    #[test]
+    fn subscribe_tracks_generation_replacement_waits_for_completion() {
+        let permits = Arc::new(Semaphore::new(1));
+        let first = test_track("replacement");
+        let replacement = test_track("replacement");
+        let mut slot = SubscribeTracksSlot {
+            desired: Some(first.clone()),
+            active: Some(first.clone()),
+            publish_blocked_tombstone: false,
+            _session_slot_permit: permits.try_acquire_owned().expect("acquire slot permit"),
+        };
+
+        assert!(slot.set_desired(replacement.clone()));
+        assert_eq!(slot.complete(&first), SubscribeTracksSlotAction::Publish);
+        assert!(slot.active.is_none());
+        assert!(slot
+            .desired
+            .as_ref()
+            .is_some_and(|desired| super::same_track_generation(desired, &replacement)));
+
+        slot.active = Some(replacement.clone());
+        assert_eq!(
+            slot.complete(&replacement),
+            SubscribeTracksSlotAction::Remove
+        );
+    }
+
+    #[test]
+    fn stale_subscribe_tracks_removal_preserves_replacement() {
+        let permits = Arc::new(Semaphore::new(1));
+        let first = test_track("stale-removal");
+        let replacement = test_track("stale-removal");
+        let mut slot = SubscribeTracksSlot {
+            desired: Some(replacement.clone()),
+            active: Some(first.clone()),
+            publish_blocked_tombstone: false,
+            _session_slot_permit: permits.try_acquire_owned().expect("acquire slot permit"),
+        };
+
+        assert!(!slot.remove_desired(&first));
+        assert!(slot
+            .desired
+            .as_ref()
+            .is_some_and(|desired| super::same_track_generation(desired, &replacement)));
     }
 
     /// draft-18 §10.2.6: absent and 0 both mean answer immediately, so neither

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::session::{Publisher, SessionError, Subscriber};
@@ -251,6 +252,19 @@ pub trait ConnectionTagger: Send + Sync {
 
 /// Context carried by relay-side producer and consumer tasks for one MoQT session.
 #[derive(Debug, Clone)]
+pub(crate) struct SessionIdentity(Arc<()>);
+
+impl SessionIdentity {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionContext {
     /// The resolved scope identity for this session, if any.
     pub scope: Option<String>,
@@ -264,6 +278,8 @@ pub struct SessionContext {
     /// destination URL is known. Inbound connections leave this `None` even
     /// when classified internal, since only the remote socket address is known.
     pub peer: Option<RelayInfo>,
+
+    identity: SessionIdentity,
 }
 
 impl SessionContext {
@@ -273,6 +289,7 @@ impl SessionContext {
             scope,
             interface: SessionInterface::Public,
             peer: None,
+            identity: SessionIdentity::new(),
         }
     }
 
@@ -282,6 +299,7 @@ impl SessionContext {
             scope,
             interface: SessionInterface::Internal,
             peer,
+            identity: SessionIdentity::new(),
         }
     }
 
@@ -308,12 +326,17 @@ impl SessionContext {
             scope,
             interface,
             peer,
+            identity: SessionIdentity::new(),
         }
     }
 
     /// The resolved scope identity, if any.
     pub fn scope(&self) -> Option<&str> {
         self.scope.as_deref()
+    }
+
+    pub(crate) fn identity(&self) -> &SessionIdentity {
+        &self.identity
     }
 
     /// Build the [`CoordinatorContext`] for coordinator calls made on behalf
@@ -409,7 +432,7 @@ impl Session {
         }
     }
 
-    /// Drain incoming SUBSCRIBE and SUBSCRIBE_NAMESPACE requests and reject each one.
+    /// Drain incoming subscribe requests and reject each one.
     ///
     /// The transport `Publisher` queues incoming SUBSCRIBE messages as
     /// `Subscribed` events. Dropping a `Subscribed` without calling `ok()`
@@ -418,6 +441,7 @@ impl Session {
     async fn drain_and_reject_subscribes(mut publisher: Publisher) -> Result<(), SessionError> {
         loop {
             let mut namespace_publisher = publisher.clone();
+            let mut tracks_publisher = publisher.clone();
             tokio::select! {
                 Some(subscribed) = publisher.subscribed() => {
                     tracing::debug!(
@@ -433,6 +457,16 @@ impl Session {
                         "rejecting SUBSCRIBE_NAMESPACE: subscribe not permitted for this session"
                     );
                     drop(subscribed_namespace);
+                }
+                Some(subscribed_tracks) = tracks_publisher.subscribed_tracks() => {
+                    tracing::debug!(
+                        namespace_prefix = %subscribed_tracks.namespace_prefix,
+                        "rejecting SUBSCRIBE_TRACKS: subscribe not permitted for this session"
+                    );
+                    subscribed_tracks.reject(
+                        moq_transport::message::RequestErrorCode::Unauthorized as u64,
+                        "subscribe not permitted",
+                    )?;
                 }
                 else => return Ok(()),
             }
