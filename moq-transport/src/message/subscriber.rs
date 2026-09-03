@@ -62,6 +62,7 @@ subscriber_msgs! {
     FetchCancel,
     TrackStatus,
     SubscribeNamespace,
+    SubscribeTracks,
     // Responses/control for publisher-initiated requests.
     PublishNamespaceCancel,
     PublishOk,

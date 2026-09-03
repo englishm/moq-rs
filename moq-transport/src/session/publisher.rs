@@ -22,7 +22,8 @@ use super::{
     split_published_state, BidiResponse, BidiResponseMap, DeliveryError, NameRegistry,
     ObjectForwarderRecv, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
     PublishedRecv, Reader, RequestId, Session, SessionError, Subscribed, SubscribedNamespace,
-    SubscribedNamespaceInfo, SubscribedNamespaceRecv, TrackStatusRequested, Writer,
+    SubscribedNamespaceInfo, SubscribedNamespaceRecv, SubscribedTracks, SubscribedTracksInfo,
+    SubscribedTracksRecv, TrackStatusRequested, Writer,
 };
 use crate::message::RequestErrorCode;
 
@@ -112,6 +113,12 @@ pub struct Publisher {
 
     /// SUBSCRIBE_NAMESPACE requests surfaced to the application.
     unknown_subscribed_namespace: Queue<SubscribedNamespace>,
+
+    /// Active inbound SUBSCRIBE_TRACKS prefixes, including pending requests.
+    subscribed_tracks_prefixes: Arc<Mutex<HashMap<u64, TrackNamespacePrefix>>>,
+
+    /// SUBSCRIBE_TRACKS requests surfaced to the application.
+    unknown_subscribed_tracks: Queue<SubscribedTracks>,
 
     /// Queue for outbound control messages; processed by the session run_send task.
     outgoing: Queue<Message>,
@@ -218,6 +225,8 @@ impl Publisher {
             unknown_track_status_requested: Default::default(),
             subscribed_namespace_prefixes: Default::default(),
             unknown_subscribed_namespace: Default::default(),
+            subscribed_tracks_prefixes: Default::default(),
+            unknown_subscribed_tracks: Default::default(),
             outgoing,
             request_id,
             mlog,
@@ -843,6 +852,11 @@ impl Publisher {
         self.unknown_subscribed_namespace.pop().await
     }
 
+    /// Returns the next inbound SUBSCRIBE_TRACKS request.
+    pub async fn subscribed_tracks(&mut self) -> Option<SubscribedTracks> {
+        self.unknown_subscribed_tracks.pop().await
+    }
+
     /// Accept an inbound SUBSCRIBE_NAMESPACE and surface it to the application.
     ///
     /// Returns the transport-side half, which the caller drives with the
@@ -887,6 +901,48 @@ impl Publisher {
     }
 
     fn has_subscribed_namespace_overlap(
+        prefixes: &HashMap<u64, TrackNamespacePrefix>,
+        prefix: &TrackNamespacePrefix,
+    ) -> bool {
+        prefixes.values().any(|existing| existing.overlaps(prefix))
+    }
+
+    pub(super) fn recv_subscribe_tracks(
+        &mut self,
+        msg: message::SubscribeTracks,
+    ) -> Result<SubscribedTracksRecv, SessionError> {
+        let forward = msg.params.forward()?.unwrap_or(true);
+        {
+            let mut prefixes = self
+                .subscribed_tracks_prefixes
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            if Self::has_subscribed_tracks_overlap(&prefixes, &msg.track_namespace_prefix) {
+                return Ok(SubscribedTracksRecv::rejected(
+                    msg.id,
+                    RequestErrorCode::PrefixOverlap as u64,
+                    "prefix overlap",
+                ));
+            }
+            prefixes.insert(msg.id, msg.track_namespace_prefix.clone());
+        }
+
+        let info = SubscribedTracksInfo {
+            request_id: msg.id,
+            namespace_prefix: msg.track_namespace_prefix,
+            forward,
+            params: msg.params,
+        };
+        let (mut request, recv) =
+            SubscribedTracks::new(info, self.subscribed_tracks_prefixes.clone());
+        if let Err(returned) = self.unknown_subscribed_tracks.push(request) {
+            request = returned;
+            request.reject(RequestErrorCode::InternalError as u64, "internal error")?;
+        }
+        Ok(recv)
+    }
+
+    fn has_subscribed_tracks_overlap(
         prefixes: &HashMap<u64, TrackNamespacePrefix>,
         prefix: &TrackNamespacePrefix,
     ) -> bool {
@@ -957,6 +1013,11 @@ impl Publisher {
             // SUBSCRIBE_NAMESPACE not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
             message::Subscriber::SubscribeNamespace(msg) => {
                 self.send_not_supported(msg.id, "subscribe_namespace");
+            }
+            message::Subscriber::SubscribeTracks(_) => {
+                return Err(SessionError::ProtocolViolation(
+                    "SUBSCRIBE_TRACKS must start a request stream".to_string(),
+                ));
             }
             message::Subscriber::PublishNamespaceCancel(_) => {
                 return Err(SessionError::ProtocolViolation(
@@ -1161,8 +1222,15 @@ impl Publisher {
                 .subscribed_names
                 .lock()
                 .map_err(|_| SessionError::Internal)?;
-            if subscribed_names.contains_name(&full_name) {
+            let published_names = self
+                .published_names
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            if subscribed_names.contains_name(&full_name)
+                || published_names.contains_name(&full_name)
+            {
                 let id = msg.id;
+                drop(published_names);
                 drop(subscribed_names);
                 drop(subscribeds);
                 self.send_request_error(
@@ -1176,6 +1244,7 @@ impl Publisher {
                 );
                 return Ok(());
             }
+            drop(published_names);
 
             let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone())?;
             subscribed_names.insert(full_name, send.info.id);
@@ -1361,10 +1430,13 @@ impl Publisher {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
     use crate::{
-        coding::{KeyValuePairs, ReasonPhrase, TrackName, TrackNamespace},
+        coding::{KeyValuePairs, ReasonPhrase, TrackName, TrackNamespace, TrackNamespacePrefix},
         data,
         message::{self, Message},
         serve::{self, FullTrackName, ServeError, Tracks},
@@ -1383,6 +1455,70 @@ mod tests {
             namespace: TrackNamespace::from_utf8_path(namespace),
             name: TrackName::from(name),
         }
+    }
+
+    #[test]
+    fn subscribe_tracks_pending_prefixes_reserve_overlap_space() {
+        let pending = HashMap::from([(0, TrackNamespacePrefix::from_utf8_path("room/123"))]);
+
+        assert!(Publisher::has_subscribed_tracks_overlap(
+            &pending,
+            &TrackNamespacePrefix::from_utf8_path("room")
+        ));
+        assert!(Publisher::has_subscribed_tracks_overlap(
+            &pending,
+            &TrackNamespacePrefix::from_utf8_path("room/123/video")
+        ));
+        assert!(Publisher::has_subscribed_tracks_overlap(
+            &pending,
+            &TrackNamespacePrefix::from_utf8_path("room/123")
+        ));
+        assert!(Publisher::has_subscribed_tracks_overlap(
+            &pending,
+            &TrackNamespacePrefix::new()
+        ));
+        assert!(!Publisher::has_subscribed_tracks_overlap(
+            &pending,
+            &TrackNamespacePrefix::from_utf8_path("room/456")
+        ));
+    }
+
+    #[tokio::test]
+    async fn subscribe_rejects_name_reserved_by_outbound_publish() {
+        let (publisher_session, _peer_session) = loopback_session_pair().await;
+        let (outgoing, mut outgoing_recv) = Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let full_name = full_track_name("room/123", "video");
+        publisher
+            .published_names
+            .lock()
+            .unwrap()
+            .insert(full_name.clone(), 1);
+
+        publisher
+            .recv_subscribe(message::Subscribe {
+                id: 2,
+                track_namespace: full_name.namespace,
+                track_name: full_name.name,
+                params: KeyValuePairs::default(),
+            })
+            .unwrap();
+
+        let Some(Message::RequestError(error)) = outgoing_recv.pop().await else {
+            panic!("expected REQUEST_ERROR");
+        };
+        assert_eq!(error.id, 2);
+        assert_eq!(
+            error.error_code,
+            message::RequestErrorCode::DuplicateSubscription as u64
+        );
     }
 
     fn subgroup_track() -> (serve::SubgroupsWriter, serve::TrackReader) {

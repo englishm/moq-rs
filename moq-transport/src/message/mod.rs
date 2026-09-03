@@ -30,6 +30,7 @@ mod namespace;
 mod params;
 mod pubilsh_namespace_done;
 mod publish;
+mod publish_blocked;
 mod publish_done;
 mod publish_namespace;
 mod publish_namespace_cancel;
@@ -42,6 +43,7 @@ mod request_update;
 mod subscribe;
 mod subscribe_namespace;
 mod subscribe_ok;
+mod subscribe_tracks;
 mod subscriber;
 mod track_status;
 mod unsubscribe;
@@ -58,6 +60,7 @@ pub use namespace::*;
 pub use params::*;
 pub use pubilsh_namespace_done::*;
 pub use publish::*;
+pub use publish_blocked::*;
 pub use publish_done::*;
 pub use publish_namespace::*;
 pub use publish_namespace_cancel::*;
@@ -70,6 +73,7 @@ pub use request_update::*;
 pub use subscribe::*;
 pub use subscribe_namespace::*;
 pub use subscribe_ok::*;
+pub use subscribe_tracks::*;
 pub use subscriber::*;
 pub use track_status::*;
 pub use unsubscribe::*;
@@ -181,6 +185,7 @@ macro_rules! message_types {
                     Self::Fetch(m) => &m.params,
                     Self::FetchOk(m) => &m.params,
                     Self::SubscribeNamespace(m) => &m.params,
+                    Self::SubscribeTracks(m) => &m.params,
                     _ => return true,
                 };
 
@@ -199,6 +204,7 @@ macro_rules! message_types {
                     Self::Fetch(m) => Some(m.id),
                     Self::TrackStatus(m) => Some(m.id),
                     Self::SubscribeNamespace(m) => Some(m.id),
+                    Self::SubscribeTracks(m) => Some(m.id),
                     Self::Publish(m) => Some(m.id),
                     Self::PublishNamespace(m) => Some(m.id),
                     _ => None,
@@ -267,6 +273,7 @@ message_types! {
     Publish         = 0x1d,
     PublishDone     = 0xb,
     PublishOk       = 0x1e,
+    PublishBlocked  = 0x0f,
 
     // ── FETCH family ─────────────────────────────────────────────────────────
     Fetch           = 0x16,
@@ -275,6 +282,7 @@ message_types! {
 
     // ── SUBSCRIBE_NAMESPACE (bidi stream; §10.18) ────────────────────────────
     SubscribeNamespace = 0x50,
+    SubscribeTracks = 0x51,
 
     // ── Session management ────────────────────────────────────────────────────
     GoAway          = 0x10,
@@ -357,24 +365,33 @@ mod tests {
         );
 
         assert_sequenced(
-            Message::Publish(Publish {
+            Message::SubscribeTracks(SubscribeTracks {
                 id: 10,
+                track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("test/ns"),
+                params: KeyValuePairs::default(),
+            }),
+            10,
+        );
+
+        assert_sequenced(
+            Message::Publish(Publish {
+                id: 12,
                 track_namespace: namespace(),
                 track_name: "track".into(),
                 track_alias: 1,
                 params: KeyValuePairs::default(),
                 track_extensions: TrackExtensions::default(),
             }),
-            10,
+            12,
         );
 
         assert_sequenced(
             Message::PublishNamespace(PublishNamespace {
-                id: 12,
+                id: 14,
                 track_namespace: namespace(),
                 params: KeyValuePairs::default(),
             }),
-            12,
+            14,
         );
     }
 
@@ -473,6 +490,34 @@ mod tests {
         };
         assert_eq!(decoded.params.rendezvous_timeout().unwrap(), Some(1_000));
         assert!(decoded.params.get(123).is_some());
+
+        let mut params = KeyValuePairs::default();
+        params.set_subscriber_priority(128);
+        let subscribe_tracks = Message::SubscribeTracks(SubscribeTracks {
+            id: 4,
+            track_namespace_prefix: TrackNamespacePrefix::new(),
+            params,
+        });
+        encoded.clear();
+        assert!(matches!(
+            subscribe_tracks.encode(&mut encoded),
+            Err(EncodeError::InvalidValue)
+        ));
+
+        let mut params = KeyValuePairs::default();
+        params.set_forward(false);
+        params.set_bytesvalue(parameter_type::AUTHORIZATION_TOKEN, vec![1, 2, 3]);
+        let subscribe_tracks = Message::SubscribeTracks(SubscribeTracks {
+            id: 4,
+            track_namespace_prefix: TrackNamespacePrefix::new(),
+            params,
+        });
+        encoded.clear();
+        subscribe_tracks.encode(&mut encoded).unwrap();
+        assert!(matches!(
+            Message::decode(&mut encoded).unwrap(),
+            Message::SubscribeTracks(_)
+        ));
     }
 
     #[test]
@@ -574,6 +619,23 @@ mod tests {
                 params: KeyValuePairs::default(),
             })),
             vec![0x50, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00]
+        );
+
+        assert_eq!(
+            encoded(Message::SubscribeTracks(SubscribeTracks {
+                id: 0,
+                track_namespace_prefix: TrackNamespacePrefix::new(),
+                params: KeyValuePairs::default(),
+            })),
+            vec![0x51, 0x00, 0x03, 0x00, 0x00, 0x00]
+        );
+
+        assert_eq!(
+            encoded(Message::PublishBlocked(PublishBlocked {
+                track_namespace_suffix: TrackNamespacePrefix::new(),
+                track_name: "t".into(),
+            })),
+            vec![0x0f, 0x00, 0x03, 0x00, 0x01, b't']
         );
     }
 }

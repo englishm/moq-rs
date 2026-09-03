@@ -41,6 +41,8 @@ pub const U8_VALUE_PARAMETER_TYPES: &[u64] = &[
     parameter_type::GROUP_ORDER,         // 0x22
 ];
 
+const TWO_VARINT_VALUE_PARAMETER_TYPES: &[u64] = &[parameter_type::LARGEST_OBJECT];
+
 /// Message scopes enforced for supported parameters with restricted use.
 /// Unknown parameter types remain available for negotiated extensions.
 const MESSAGE_PARAMETER_SCOPES: &[(u64, &[u64])] =
@@ -291,16 +293,32 @@ impl KeyValuePairs {
     /// generic [`KeyValuePairs::decode`], otherwise a peer's single-byte
     /// SUBSCRIBER_PRIORITY (default 128) desynchronises the whole block.
     pub fn decode_message_params<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        Self::decode_with_u8_types(r, U8_VALUE_PARAMETER_TYPES)
+        Self::decode_with_value_types(
+            r,
+            U8_VALUE_PARAMETER_TYPES,
+            TWO_VARINT_VALUE_PARAMETER_TYPES,
+        )
     }
 
     /// Encode a draft-18 §10.2 message-parameter block. Counterpart to
     /// [`decode_message_params`](KeyValuePairs::decode_message_params).
     pub fn encode_message_params<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        self.encode_with_u8_types(w, U8_VALUE_PARAMETER_TYPES)
+        self.encode_with_value_types(
+            w,
+            U8_VALUE_PARAMETER_TYPES,
+            TWO_VARINT_VALUE_PARAMETER_TYPES,
+        )
     }
 
     pub(crate) fn parameters_allowed_on(&self, message_type: u64) -> bool {
+        if message_type == wire_id::SubscribeTracks {
+            return self.0.iter().all(|parameter| {
+                matches!(
+                    parameter.key,
+                    parameter_type::AUTHORIZATION_TOKEN | parameter_type::FORWARD
+                )
+            });
+        }
         self.0.iter().all(|parameter| {
             MESSAGE_PARAMETER_SCOPES
                 .iter()
@@ -430,6 +448,7 @@ impl KeyValuePairs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
 
     #[test]
     fn key_value_pairs_message_parameter_methods_round_trip_typed_values() {
@@ -475,6 +494,27 @@ mod tests {
     #[test]
     fn rendezvous_timeout_absent_is_none() {
         assert_eq!(KeyValuePairs::default().rendezvous_timeout().unwrap(), None);
+    }
+
+    #[test]
+    fn largest_object_uses_two_inline_varints() {
+        let mut params = KeyValuePairs::default();
+        params.set_largest_object(Location::new(4, 5)).unwrap();
+        let mut encoded = BytesMut::new();
+
+        params.encode_message_params(&mut encoded).unwrap();
+
+        assert_eq!(
+            encoded.as_ref(),
+            &[1, parameter_type::LARGEST_OBJECT as u8, 4, 5]
+        );
+        assert_eq!(
+            KeyValuePairs::decode_message_params(&mut encoded)
+                .unwrap()
+                .largest_object()
+                .unwrap(),
+            Some(Location::new(4, 5))
+        );
     }
 
     #[test]

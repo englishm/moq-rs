@@ -453,6 +453,13 @@ impl TrackNamespacePrefix {
             .all(|(left, right)| left == right)
     }
 
+    fn validate_namespace_byte_len(&self) -> Result<(), DecodeError> {
+        if namespace_fields_byte_len(&self.fields) > MAX_FULL_TRACK_NAME_LEN {
+            return Err(DecodeError::TrackNameTooLong);
+        }
+        Ok(())
+    }
+
     /// Build a full namespace from this prefix and a suffix received in NAMESPACE.
     pub fn join_suffix(
         &self,
@@ -475,12 +482,19 @@ impl Decode for TrackNamespacePrefix {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         // Draft-16 §9.25: prefixes have 0-32 non-empty fields.
         let fields = decode_namespace_fields(r, 0, Self::MAX_FIELDS, "TrackNamespacePrefix")?;
-        Ok(Self { fields })
+        let prefix = Self { fields };
+        prefix.validate_namespace_byte_len()?;
+        Ok(prefix)
     }
 }
 
 impl Encode for TrackNamespacePrefix {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+        if namespace_fields_byte_len(&self.fields) > MAX_FULL_TRACK_NAME_LEN {
+            return Err(EncodeError::FieldBoundsExceeded(
+                "TrackNamespacePrefix".to_string(),
+            ));
+        }
         encode_namespace_fields(&self.fields, 0, Self::MAX_FIELDS, "TrackNamespacePrefix", w)
     }
 }
@@ -782,6 +796,26 @@ mod tests {
         assert!(matches!(
             prefix.encode(&mut buf).unwrap_err(),
             EncodeError::EmptyNamespaceField
+        ));
+    }
+
+    #[test]
+    fn prefix_rejects_total_over_limit() {
+        let prefix = TrackNamespacePrefix {
+            fields: vec![
+                TupleField {
+                    value: vec![b'a'; 2049],
+                },
+                TupleField {
+                    value: vec![b'b'; 2048],
+                },
+            ],
+        };
+        let mut buf = BytesMut::new();
+
+        assert!(matches!(
+            prefix.encode(&mut buf).unwrap_err(),
+            EncodeError::FieldBoundsExceeded(_)
         ));
     }
 

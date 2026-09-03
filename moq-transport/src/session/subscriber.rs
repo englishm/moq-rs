@@ -897,6 +897,11 @@ impl Subscriber {
             }
             message::Publisher::Publish(msg) => self.recv_publish(msg)?,
             message::Publisher::PublishDone(msg) => self.recv_publish_done(msg)?,
+            message::Publisher::PublishBlocked(_) => {
+                return Err(SessionError::ProtocolViolation(
+                    "PUBLISH_BLOCKED is only valid on a SUBSCRIBE_TRACKS stream".to_string(),
+                ));
+            }
             message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg)?,
             // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
             message::Publisher::RequestOk(msg) => self.recv_request_ok(msg)?,
