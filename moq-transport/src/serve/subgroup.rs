@@ -794,6 +794,19 @@ impl SubgroupWriter {
         Ok(())
     }
 
+    /// Cleanly end the stream at the current point.
+    ///
+    /// This is the explicit form of dropping the writer: readers deliver the
+    /// Objects already written and then observe end-of-stream, and the session
+    /// FINs the wire stream (draft-18 §11.4.3). Use it to close each subgroup
+    /// after its final Object — [`close`](Self::close) always reports an error
+    /// to readers, which resets the wire stream instead.
+    pub fn finish(self) -> Result<(), ServeError> {
+        let state = self.state.lock();
+        state.closed.clone()?;
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.state.lock().objects.len()
     }
@@ -1616,6 +1629,22 @@ mod tests {
 
         assert_subgroups(&mut reader, &[(0, 0), (0, 1)]).await;
         assert!(matches!(reader.next().await, Err(ServeError::Cancel)));
+    }
+
+    /// `finish` is the explicit clean close: buffered Objects are delivered,
+    /// then the reader observes end-of-stream rather than an error.
+    #[tokio::test]
+    async fn finish_delivers_buffered_objects_then_ends_the_stream() {
+        let (mut writer, mut reader) = subgroup();
+        writer.write(Bytes::from_static(b"x")).unwrap();
+        writer.finish().unwrap();
+
+        let mut object = reader.next().await.unwrap().unwrap();
+        assert_eq!(object.read_all().await.unwrap(), Bytes::from_static(b"x"));
+        assert!(
+            reader.next().await.unwrap().is_none(),
+            "the stream ends cleanly after the final object"
+        );
     }
 
     #[tokio::test]

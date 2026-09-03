@@ -5,9 +5,9 @@
 use std::{ops, time::Duration};
 
 use crate::{
-    coding::{KeyValuePairs, Location, TrackName, TrackNamespace},
+    coding::{KeyValuePairs, Location, ReasonPhrase, TrackName, TrackNamespace},
     data,
-    message::{self, FilterType, GroupOrder, SubscriptionFilter},
+    message::{self, FilterType, GroupOrder, SubscriptionFilter, TrackExtensions},
     serve::{self, ServeError, TrackWriter, TrackWriterMode},
 };
 
@@ -133,6 +133,47 @@ impl SubscribeInfo {
     }
 }
 
+/// The SUBSCRIBE_OK acknowledgement received from the publisher (draft-18
+/// §9.10).
+///
+/// The transport consumes only the Track Alias (for stream routing) and
+/// `default_publisher_priority` (for Object decoding); everything else the
+/// publisher sent is kept here, losslessly, so an application can read
+/// LARGEST_OBJECT, EXPIRES, DELIVERY_TIMEOUT, NEW_GROUP_REQUEST, GROUP_ORDER,
+/// MAX_CACHE_DURATION, DYNAMIC_GROUPS, and any unrecognized parameters or
+/// extensions through the typed accessors on [`KeyValuePairs`] and
+/// [`TrackExtensions`].
+#[derive(Debug, Clone)]
+pub struct SubscribeOkInfo {
+    /// The Track Alias the publisher bound this subscription to (§10.1).
+    pub track_alias: u64,
+
+    /// Message parameters carried by SUBSCRIBE_OK (§10.2).
+    pub params: KeyValuePairs,
+
+    /// Track extensions carried by SUBSCRIBE_OK.
+    pub track_extensions: TrackExtensions,
+}
+
+/// The PUBLISH_DONE that terminated this subscription (draft-18 §10.11).
+///
+/// [`Subscribe::closed`] reports termination only as a [`ServeError`]; this
+/// keeps the full terminal record so an application can compare the announced
+/// Stream Count against the data streams it actually received and read the
+/// publisher's reason phrase.
+#[derive(Debug, Clone)]
+pub struct PublishDoneInfo {
+    /// Why the subscription ended (§15.10.3).
+    pub status_code: u64,
+
+    /// The number of data streams the publisher opened for this subscription,
+    /// including streams that contained no Objects.
+    pub stream_count: u64,
+
+    /// The publisher's human-readable reason for ending the subscription.
+    pub reason: ReasonPhrase,
+}
+
 fn next_object_location(largest_location: Option<Location>) -> Location {
     let Some(location) = largest_location else {
         return Location::new(0, 0);
@@ -157,6 +198,10 @@ struct SubscribeState {
     ok: bool,
     peer_rejected: bool,
     track_alias: Option<u64>,
+    /// The SUBSCRIBE_OK received from the publisher, once it arrives.
+    subscribe_ok: Option<SubscribeOkInfo>,
+    /// The PUBLISH_DONE received from the publisher, if one arrives.
+    publish_done: Option<PublishDoneInfo>,
     closed: Result<(), ServeError>,
 }
 
@@ -166,6 +211,8 @@ impl Default for SubscribeState {
             ok: Default::default(),
             peer_rejected: false,
             track_alias: None,
+            subscribe_ok: None,
+            publish_done: None,
             closed: Ok(()),
         }
     }
@@ -346,6 +393,28 @@ impl Subscribe {
     pub fn peer_rejected(&self) -> bool {
         self.state.lock().peer_rejected
     }
+
+    /// The SUBSCRIBE_OK the publisher acknowledged this subscription with, if
+    /// it has arrived.
+    ///
+    /// Parameters the transport does not itself consume — LARGEST_OBJECT,
+    /// EXPIRES, DELIVERY_TIMEOUT, NEW_GROUP_REQUEST, GROUP_ORDER,
+    /// MAX_CACHE_DURATION, DYNAMIC_GROUPS — are only observable here. Await
+    /// [`ok`](Self::ok) first to know one is coming.
+    pub fn subscribe_ok(&self) -> Option<SubscribeOkInfo> {
+        self.state.lock().subscribe_ok.clone()
+    }
+
+    /// The PUBLISH_DONE the publisher terminated this subscription with, if it
+    /// sent one.
+    ///
+    /// Recorded when PUBLISH_DONE arrives, ahead of the §10.11 drain, so it is
+    /// available as soon as [`closed`](Self::closed) resolves. `None` means the
+    /// subscription ended some other way (UNSUBSCRIBE, a dead request stream,
+    /// or session teardown).
+    pub fn publish_done(&self) -> Option<PublishDoneInfo> {
+        self.state.lock().publish_done.clone()
+    }
 }
 
 impl Drop for Subscribe {
@@ -372,7 +441,11 @@ pub(super) struct SubscribeRecv {
 }
 
 impl SubscribeRecv {
-    pub fn ok(&mut self, alias: u64, default_publisher_priority: u8) -> Result<(), ServeError> {
+    pub fn ok(
+        &mut self,
+        msg: &message::SubscribeOk,
+        default_publisher_priority: u8,
+    ) -> Result<(), ServeError> {
         let state = self.state.lock();
         if state.ok {
             return Err(ServeError::Duplicate);
@@ -380,7 +453,12 @@ impl SubscribeRecv {
 
         if let Some(mut state) = state.into_mut() {
             state.ok = true;
-            state.track_alias = Some(alias);
+            state.track_alias = Some(msg.track_alias);
+            state.subscribe_ok = Some(SubscribeOkInfo {
+                track_alias: msg.track_alias,
+                params: msg.params.clone(),
+                track_extensions: msg.track_extensions.clone(),
+            });
         }
         self.default_publisher_priority = default_publisher_priority;
 
@@ -414,8 +492,19 @@ impl SubscribeRecv {
     /// The subscription is kept alive until the announced Stream Count has been
     /// received and every stream has closed, so Objects the publisher already
     /// sent are still delivered. See [`DoneOutcome`].
-    pub fn recv_done(&mut self, err: ServeError, stream_count: u64) -> DoneOutcome {
-        let (outcome, terminal) = self.drain.arm(err, stream_count);
+    pub fn recv_done(&mut self, done: PublishDoneInfo) -> DoneOutcome {
+        // Keep only the first PUBLISH_DONE: a duplicate while draining (or
+        // after teardown) must not replace the record the drain is completing
+        // against.
+        let first = !self.drain.is_draining() && !self.drain.is_finished();
+        let (outcome, terminal) = self
+            .drain
+            .arm(ServeError::Closed(done.status_code), done.stream_count);
+        if first {
+            if let Some(mut state) = self.state.lock().into_mut() {
+                state.publish_done = Some(done);
+            }
+        }
         if let Some(err) = terminal {
             self.finish(err);
         }
@@ -589,6 +678,23 @@ mod tests {
         .unwrap()
     }
 
+    fn subscribe_ok(track_alias: u64) -> message::SubscribeOk {
+        message::SubscribeOk {
+            id: 0,
+            track_alias,
+            params: KeyValuePairs::default(),
+            track_extensions: message::TrackExtensions::default(),
+        }
+    }
+
+    fn publish_done(status_code: u64, stream_count: u64) -> PublishDoneInfo {
+        PublishDoneInfo {
+            status_code,
+            stream_count,
+            reason: ReasonPhrase("test reason".into()),
+        }
+    }
+
     async fn test_recv_with_reader() -> (Subscribe, SubscribeRecv, serve::TrackReader) {
         let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
         let subscriber = crate::session::Subscriber::new(
@@ -615,7 +721,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn datagram_resolves_default_priority_and_preserves_semantics() {
         let (_send, mut recv, reader) = test_recv_with_reader().await;
-        recv.ok(42, 200).unwrap();
+        recv.ok(&subscribe_ok(42), 200).unwrap();
 
         let mut properties = data::ExtensionHeaders::new();
         properties.set_intvalue(2, 7);
@@ -647,8 +753,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn publish_done_drain_preserves_reverse_order_subgroups() {
         let (_send, mut recv, reader) = test_recv_with_reader().await;
-        recv.ok(42, 200).unwrap();
-        assert_eq!(recv.recv_done(ServeError::Done, 2), DoneOutcome::DrainArmed);
+        recv.ok(&subscribe_ok(42), 200).unwrap();
+        assert_eq!(
+            recv.recv_done(publish_done(message::PublishDoneCode::TrackEnded as u64, 2)),
+            DoneOutcome::DrainArmed
+        );
 
         recv.note_stream_received();
         let mut one = recv
@@ -747,13 +856,99 @@ mod tests {
         let (send, mut recv) = test_recv().await;
 
         assert_eq!(
-            recv.recv_done(ServeError::Closed(0x6), 4),
+            recv.recv_done(publish_done(0x6, 4)),
             DoneOutcome::DrainArmed
         );
         assert_eq!(recv.abort(ServeError::Cancel), DoneOutcome::AlreadyDraining);
 
         assert!(recv.drain_timeout());
         assert_eq!(send.closed().await, Err(ServeError::Closed(0x6)));
+    }
+
+    /// SUBSCRIBE_OK parameters the transport does not consume — LARGEST_OBJECT
+    /// and the Track Extensions here — must still reach the application.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_ok_params_are_exposed_to_the_application() {
+        let (send, mut recv) = test_recv().await;
+
+        let mut msg = subscribe_ok(42);
+        msg.params.set_largest_object(Location::new(7, 3)).unwrap();
+        msg.params.set_expires(30_000);
+        msg.track_extensions.set_max_cache_duration(60_000);
+        msg.track_extensions.set_dynamic_groups(true);
+        recv.ok(&msg, 200).unwrap();
+
+        let ok = send
+            .subscribe_ok()
+            .expect("SUBSCRIBE_OK must be visible to the application");
+        assert_eq!(ok.track_alias, 42);
+        assert_eq!(
+            ok.params.largest_object().unwrap(),
+            Some(Location::new(7, 3))
+        );
+        assert_eq!(ok.params.expires().unwrap(), Some(30_000));
+        assert_eq!(
+            ok.track_extensions.max_cache_duration().unwrap(),
+            Some(60_000)
+        );
+        assert_eq!(ok.track_extensions.dynamic_groups().unwrap(), Some(true));
+    }
+
+    /// PUBLISH_DONE's Stream Count, status code, and reason phrase must reach
+    /// the application, not just the status code folded into `closed()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_done_details_are_exposed_to_the_application() {
+        let (send, mut recv) = test_recv().await;
+
+        assert!(send.publish_done().is_none(), "nothing received yet");
+        assert_eq!(
+            recv.recv_done(publish_done(message::PublishDoneCode::TrackEnded as u64, 0)),
+            DoneOutcome::Finished
+        );
+
+        let done = send
+            .publish_done()
+            .expect("PUBLISH_DONE must be visible to the application");
+        assert_eq!(
+            done.status_code,
+            message::PublishDoneCode::TrackEnded as u64
+        );
+        assert_eq!(done.stream_count, 0);
+        assert_eq!(done.reason.0, "test reason");
+    }
+
+    /// A duplicate PUBLISH_DONE while draining must not replace the record the
+    /// application will read after the drain completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_duplicate_publish_done_keeps_the_first_record() {
+        let (send, mut recv) = test_recv().await;
+
+        assert_eq!(
+            recv.recv_done(publish_done(0x2, 1)),
+            DoneOutcome::DrainArmed
+        );
+        assert_eq!(
+            recv.recv_done(publish_done(0x6, 9)),
+            DoneOutcome::AlreadyDraining
+        );
+
+        recv.note_stream_received();
+        assert!(recv.note_stream_finished());
+
+        let done = send
+            .publish_done()
+            .expect("the first PUBLISH_DONE survives");
+        assert_eq!(done.status_code, 0x2);
+        assert_eq!(done.stream_count, 1);
+    }
+
+    /// Ending without PUBLISH_DONE must not fabricate a record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ending_without_publish_done_exposes_no_record() {
+        let (send, mut recv) = test_recv().await;
+
+        assert_eq!(recv.abort(ServeError::Cancel), DoneOutcome::Finished);
+        assert!(send.publish_done().is_none());
     }
 
     #[test]

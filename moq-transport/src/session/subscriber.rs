@@ -22,9 +22,9 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    BidiResponse, BidiResponseMap, DoneOutcome, NameRegistry, PublishReceived, PublishReceivedRecv,
-    PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, Session, SessionError,
-    Subscribe, SubscribeNamespace, SubscribeNamespaceInfo, SubscribeRecv, Writer,
+    BidiResponse, BidiResponseMap, DoneOutcome, NameRegistry, PublishDoneInfo, PublishReceived,
+    PublishReceivedRecv, PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, Session,
+    SessionError, Subscribe, SubscribeNamespace, SubscribeNamespaceInfo, SubscribeRecv, Writer,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -985,7 +985,7 @@ impl Subscriber {
             self.track_alias_notify.notify_waiters();
 
             // Notify the subscribe of the successful subscription
-            subscribe.ok(msg.track_alias, default_publisher_priority)?;
+            subscribe.ok(msg, default_publisher_priority)?;
         }
 
         Ok(())
@@ -1086,9 +1086,11 @@ impl Subscriber {
             let outcome = {
                 let mut subscribes = self.subscribes.lock().map_err(|_| SessionError::Internal)?;
                 match subscribes.get_mut(&msg.id) {
-                    Some(recv) => {
-                        recv.recv_done(ServeError::Closed(msg.status_code), msg.stream_count)
-                    }
+                    Some(recv) => recv.recv_done(PublishDoneInfo {
+                        status_code: msg.status_code,
+                        stream_count: msg.stream_count,
+                        reason: msg.reason.clone(),
+                    }),
                     None => DoneOutcome::Finished,
                 }
             };
@@ -2515,7 +2517,16 @@ mod tests {
             KeyValuePairs::default(),
         )
         .unwrap();
-        recv.ok(track_alias, default_publisher_priority).unwrap();
+        recv.ok(
+            &message::SubscribeOk {
+                id: request_id,
+                track_alias,
+                params: KeyValuePairs::default(),
+                track_extensions: Default::default(),
+            },
+            default_publisher_priority,
+        )
+        .unwrap();
         subscriber
             .subscribes
             .lock()
@@ -3556,7 +3567,16 @@ mod tests {
         // still alive, so the recv state accepts the mutation. Then drop the
         // handle — its Drop runs against the still-empty map (a no-op) — and
         // drive remove_subscribe directly via the registered recv state.
-        recv.ok(track_alias, 128).unwrap();
+        recv.ok(
+            &message::SubscribeOk {
+                id: request_id,
+                track_alias,
+                params: Default::default(),
+                track_extensions: Default::default(),
+            },
+            128,
+        )
+        .unwrap();
         drop(subscribe);
         subscriber
             .subscribes
