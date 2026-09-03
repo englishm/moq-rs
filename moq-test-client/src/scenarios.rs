@@ -24,7 +24,7 @@ use moq_transport::{
 use crate::Args;
 
 /// Overall test timeout - individual operations should complete faster
-const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Namespace used for test operations
 const TEST_NAMESPACE: &str = "moq-test/interop";
@@ -94,7 +94,7 @@ fn write_test_subgroup(track: TrackWriter, payload: &'static [u8]) -> Result<()>
 /// PUBLISH_DONE / TRACK_ENDED (draft-18 §10.11), which surfaces here as
 /// `Closed(0x2)`. Treating that as a failure would fail every test that
 /// subscribes to a finite track.
-fn is_normal_subscription_end(err: &ServeError) -> bool {
+pub(crate) fn is_normal_subscription_end(err: &ServeError) -> bool {
     match err {
         ServeError::Done | ServeError::Cancel => true,
         ServeError::Closed(code) => *code == PublishDoneCode::TrackEnded as u64,
