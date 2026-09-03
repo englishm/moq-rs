@@ -547,7 +547,11 @@ impl Consumer {
 
         let _registration = match self
             .locals
-            .register_track(self.context.scope(), reader)
+            .register_track_for_session(
+                self.context.scope(),
+                reader,
+                self.context.identity().clone(),
+            )
             .await
         {
             Ok(registration) => registration,

@@ -15,6 +15,7 @@ use tokio::sync::{broadcast, mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::interest::{TrackInterest, TrackInterestGuard};
 use crate::metrics::GaugeGuard;
+use crate::SessionIdentity;
 
 /// Scope key for the outer level of the two-level registry.
 ///
@@ -346,6 +347,7 @@ struct RemoteNamespaceSource {
 struct TrackEntry {
     reader: TrackReader,
     source: TrackSource,
+    origin: Option<SessionIdentity>,
 
     /// Downstream interest in this entry, for [`TrackSource::Cache`] entries only.
     ///
@@ -407,6 +409,25 @@ pub enum TrackChange {
     },
 }
 
+#[derive(Clone)]
+pub(crate) enum PublishedTrackChange {
+    Added {
+        scope: Option<String>,
+        track: TrackReader,
+        origin: Option<SessionIdentity>,
+    },
+    Removed {
+        scope: Option<String>,
+        full_name: FullTrackName,
+        track: TrackReader,
+    },
+}
+
+pub(crate) enum TrackSnapshot {
+    Tracks(Vec<TrackReader>),
+    TooLarge,
+}
+
 /// Relay-local registry.
 ///
 /// Actual media tracks are always stored by exact Full Track Name. Namespace
@@ -427,6 +448,9 @@ pub struct Locals {
 
     /// Actual PUBLISH track add/remove notifications for Publish/Both fan-out.
     track_changes: broadcast::Sender<TrackChange>,
+
+    /// Generation- and origin-aware PUBLISH changes for SUBSCRIBE_TRACKS.
+    published_track_changes: broadcast::Sender<PublishedTrackChange>,
 
     /// How long an unwatched pull-through cache entry is retained before its
     /// upstream subscription is released. Zero disables eviction.
@@ -492,11 +516,13 @@ impl Locals {
     ) -> Self {
         let (namespace_changes, _) = broadcast::channel(NAMESPACE_CHANGE_CHANNEL_CAPACITY);
         let (track_changes, _) = broadcast::channel(TRACK_CHANGE_CHANNEL_CAPACITY);
+        let (published_track_changes, _) = broadcast::channel(TRACK_CHANGE_CHANNEL_CAPACITY);
         Self {
             tracks: Default::default(),
             namespaces: Default::default(),
             namespace_changes,
             track_changes,
+            published_track_changes,
             cache_idle_timeout,
             rendezvous_hold_permits: Arc::new(Semaphore::new(rendezvous_capacity)),
             rendezvous_retry_sequence: Arc::new(AtomicU64::new(0)),
@@ -554,6 +580,12 @@ impl Locals {
         self.track_changes.subscribe()
     }
 
+    pub(crate) fn subscribe_published_track_changes(
+        &self,
+    ) -> broadcast::Receiver<PublishedTrackChange> {
+        self.published_track_changes.subscribe()
+    }
+
     pub fn list_namespaces_matching(
         &self,
         scope: Option<&str>,
@@ -609,6 +641,44 @@ impl Locals {
         }
 
         matches
+    }
+
+    pub(crate) fn list_tracks_matching_for_session(
+        &self,
+        scope: Option<&str>,
+        prefix: &TrackNamespacePrefix,
+        session: &SessionIdentity,
+        limit: usize,
+    ) -> Result<TrackSnapshot, ServeError> {
+        let scope_key = scope.unwrap_or(UNSCOPED);
+        let tracks = self
+            .tracks
+            .read()
+            .map_err(|_| ServeError::internal_ctx("locals track registry lock poisoned"))?;
+        let Some(bucket) = tracks.get(scope_key) else {
+            return Ok(TrackSnapshot::Tracks(Vec::new()));
+        };
+
+        // This bounded scan runs only for initial setup and lag recovery. Keep
+        // the registry simple until scope sizes justify a second prefix index.
+        let mut matches = Vec::new();
+        for (full_name, entry) in bucket {
+            if entry.source == TrackSource::Published
+                && !entry.reader.is_closed()
+                && prefix.is_prefix_of(&full_name.namespace)
+                && !entry
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.same_as(session))
+            {
+                if matches.len() == limit {
+                    return Ok(TrackSnapshot::TooLarge);
+                }
+                matches.push(entry.reader.clone());
+            }
+        }
+
+        Ok(TrackSnapshot::Tracks(matches))
     }
 
     /// Mark closed cache entries as closing without removing published generations.
@@ -755,7 +825,21 @@ impl Locals {
             namespace: track.namespace.clone(),
             name: track.name.clone(),
         };
-        self.insert_track_with_registration(scope, full_name, track)
+        self.insert_track_with_registration(scope, full_name, track, None)
+            .await
+    }
+
+    pub(crate) async fn register_track_for_session(
+        &mut self,
+        scope: Option<&str>,
+        track: TrackReader,
+        origin: SessionIdentity,
+    ) -> anyhow::Result<LocalTrackRegistration> {
+        let full_name = FullTrackName {
+            namespace: track.namespace.clone(),
+            name: track.name.clone(),
+        };
+        self.insert_track_with_registration(scope, full_name, track, Some(origin))
             .await
     }
 
@@ -764,6 +848,7 @@ impl Locals {
         scope: Option<&str>,
         full_name: FullTrackName,
         track: TrackReader,
+        origin: Option<SessionIdentity>,
     ) -> anyhow::Result<LocalTrackRegistration> {
         let scope_key = scope.unwrap_or(UNSCOPED).to_string();
 
@@ -776,6 +861,7 @@ impl Locals {
             hash_map::Entry::Vacant(entry) => entry.insert(TrackEntry {
                 reader: track.clone(),
                 source: TrackSource::Published,
+                origin: origin.clone(),
                 // A locally published track has no upstream subscription to
                 // release, so there is nothing to count interest against and
                 // nothing to wait for before accepting a downstream SUBSCRIBE.
@@ -789,6 +875,13 @@ impl Locals {
             scope: scope_key_to_option(&scope_key),
             track: track.clone(),
         });
+        let _ = self
+            .published_track_changes
+            .send(PublishedTrackChange::Added {
+                scope: scope_key_to_option(&scope_key),
+                track: track.clone(),
+                origin: origin.clone(),
+            });
 
         Ok(LocalTrackRegistration {
             locals: self.clone(),
@@ -986,7 +1079,7 @@ impl Locals {
             // owns requesting it from the source; concurrent callers share the reserved
             // reader instead of racing to insert and failing with a spurious `None`.
             let mut closing_generation = None;
-            let mut removed_published = false;
+            let mut removed_published = None;
             let created = {
                 let mut tracks = self.tracks.write().ok()?;
                 let bucket = tracks.entry(scope_key.clone()).or_default();
@@ -1010,7 +1103,7 @@ impl Locals {
                         interest.mark_closing();
                         closing_generation = Some(interest.clone());
                     } else if entry.source == TrackSource::Published {
-                        removed_published = true;
+                        removed_published = Some(entry.reader.clone());
                     }
                 }
 
@@ -1038,6 +1131,7 @@ impl Locals {
                         TrackEntry {
                             reader: reader.clone(),
                             source: TrackSource::Cache,
+                            origin: None,
                             interest: Some(interest.clone()),
                             upstream: Some(upstream.clone()),
                         },
@@ -1053,11 +1147,18 @@ impl Locals {
                 }
             };
 
-            if removed_published {
+            if let Some(track) = removed_published {
                 let _ = self.track_changes.send(TrackChange::Removed {
                     scope: scope_key_to_option(&scope_key),
                     full_name: full_name.clone(),
                 });
+                let _ = self
+                    .published_track_changes
+                    .send(PublishedTrackChange::Removed {
+                        scope: scope_key_to_option(&scope_key),
+                        full_name: full_name.clone(),
+                        track,
+                    });
             }
 
             if let Some(closing) = closing_generation {
@@ -1297,6 +1398,14 @@ impl Drop for LocalTrackRegistration {
                         scope: scope_key_to_option(&self.scope_key),
                         full_name: self.full_name.clone(),
                     });
+                    let _ =
+                        self.locals
+                            .published_track_changes
+                            .send(PublishedTrackChange::Removed {
+                                scope: scope_key_to_option(&self.scope_key),
+                                full_name: self.full_name.clone(),
+                                track: self.reader.clone(),
+                            });
                 }
                 if bucket.is_empty() {
                     tracks.remove(self.scope_key.as_str());
@@ -1321,6 +1430,78 @@ mod tests {
             namespace: namespace.clone(),
             name: TrackName::from(name),
         }
+    }
+
+    #[tokio::test]
+    async fn subscribe_tracks_snapshot_excludes_only_the_originating_session() {
+        let namespace = ns("room/123");
+        let (_writer, reader) = Track::new(namespace, "video").produce();
+        let origin = crate::SessionContext::public(None);
+        let other = crate::SessionContext::public(None);
+        let mut locals = Locals::new();
+        let mut changes = locals.subscribe_published_track_changes();
+        let _registration = locals
+            .register_track_for_session(None, reader, origin.identity().clone())
+            .await
+            .expect("register track");
+        let PublishedTrackChange::Added {
+            origin: Some(change_origin),
+            ..
+        } = changes.recv().await.expect("published track change")
+        else {
+            panic!("expected published track addition with an origin");
+        };
+        assert!(change_origin.same_as(origin.identity()));
+        let prefix = TrackNamespacePrefix::from_utf8_path("room");
+
+        let TrackSnapshot::Tracks(origin_tracks) = locals
+            .list_tracks_matching_for_session(None, &prefix, origin.identity(), 1)
+            .unwrap()
+        else {
+            panic!("origin snapshot exceeded bound");
+        };
+        let TrackSnapshot::Tracks(other_tracks) = locals
+            .list_tracks_matching_for_session(None, &prefix, other.identity(), 1)
+            .unwrap()
+        else {
+            panic!("other snapshot exceeded bound");
+        };
+        assert!(origin_tracks.is_empty());
+        assert_eq!(other_tracks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn subscribe_tracks_snapshot_stops_at_the_bound() {
+        let namespace = ns("room/123");
+        let origin = crate::SessionContext::public(None);
+        let mut locals = Locals::new();
+        let mut writers = Vec::new();
+        let mut registrations = Vec::new();
+        for name in ["audio", "video"] {
+            let (writer, reader) = Track::new(namespace.clone(), name).produce();
+            writers.push(writer);
+            registrations.push(
+                locals
+                    .register_track_for_session(None, reader, origin.identity().clone())
+                    .await
+                    .expect("register track"),
+            );
+        }
+        let other = crate::SessionContext::public(None);
+
+        assert!(matches!(
+            locals
+                .list_tracks_matching_for_session(
+                    None,
+                    &TrackNamespacePrefix::from_utf8_path("room"),
+                    other.identity(),
+                    1,
+                )
+                .unwrap(),
+            TrackSnapshot::TooLarge
+        ));
+        drop(writers);
+        drop(registrations);
     }
 
     async fn assert_no_namespace_change(changes: &mut broadcast::Receiver<NamespaceChange>) {
@@ -2099,7 +2280,7 @@ mod tests {
 
         let added = changes.recv().await.expect("added event");
         match added {
-            TrackChange::Added { scope, track } => {
+            TrackChange::Added { scope, track, .. } => {
                 assert_eq!(scope, Some("scope-a".to_string()));
                 assert_eq!(track.namespace, namespace);
                 assert_eq!(track.name, TrackName::from("audio"));
@@ -2111,7 +2292,9 @@ mod tests {
 
         let removed = changes.recv().await.expect("removed event");
         match removed {
-            TrackChange::Removed { scope, full_name } => {
+            TrackChange::Removed {
+                scope, full_name, ..
+            } => {
                 assert_eq!(scope, Some("scope-a".to_string()));
                 assert_eq!(full_name.namespace, ns("room/123"));
                 assert_eq!(full_name.name, TrackName::from("audio"));

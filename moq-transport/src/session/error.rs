@@ -157,7 +157,7 @@ impl SessionError {
     /// request stream, and a request that legitimately fails (an unknown track,
     /// say). Collapsing those into "close the session" would let any subscriber
     /// kill the connection by asking for something that does not exist.
-    pub(crate) fn is_session_fatal(&self) -> bool {
+    pub fn is_session_fatal(&self) -> bool {
         if self.is_stream_ended() {
             return false;
         }

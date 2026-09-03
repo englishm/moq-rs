@@ -16,6 +16,7 @@ mod subscribe;
 mod subscribe_namespace;
 mod subscribed;
 mod subscribed_namespace;
+mod subscribed_tracks;
 mod subscriber;
 mod track_status_requested;
 mod writer;
@@ -35,6 +36,7 @@ pub use subscribe::*;
 pub use subscribe_namespace::*;
 pub use subscribed::*;
 pub use subscribed_namespace::*;
+pub use subscribed_tracks::*;
 pub use subscriber::*;
 pub use track_status_requested::*;
 
@@ -469,6 +471,26 @@ impl Session {
                     msg_type = "SUBSCRIBE_NAMESPACE",
                     request_id = m.id,
                     namespace_prefix = %m.track_namespace_prefix,
+                    "MoQT control message"
+                );
+            }
+            Message::SubscribeTracks(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "SUBSCRIBE_TRACKS",
+                    request_id = m.id,
+                    namespace_prefix = %m.track_namespace_prefix,
+                    "MoQT control message"
+                );
+            }
+            Message::PublishBlocked(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "PUBLISH_BLOCKED",
+                    namespace_suffix = %m.track_namespace_suffix,
+                    track_name = %m.track_name,
                     "MoQT control message"
                 );
             }
@@ -984,7 +1006,7 @@ impl Session {
     /// one-shot request types (TRACK_STATUS, REQUEST_UPDATE).
     ///
     /// Long-lived request types (SUBSCRIBE, PUBLISH_NAMESPACE, PUBLISH,
-    /// SUBSCRIBE_NAMESPACE, FETCH) intentionally keep their bidi stream open
+    /// SUBSCRIBE_NAMESPACE, SUBSCRIBE_TRACKS, FETCH) intentionally keep their bidi stream open
     /// until an explicit terminal message, so they are deliberately NOT bounded
     /// here — bounding them would break the protocol. For those, the QUIC
     /// connection idle timeout (configured by the transport layer; e.g.
@@ -1111,6 +1133,15 @@ impl Session {
                 .as_mut()
                 .ok_or(SessionError::RoleViolation)?
                 .recv_subscribe_namespace(msg)?;
+            return recv.run(writer, reader, mlog).await;
+        }
+
+        if let Message::SubscribeTracks(msg) = msg {
+            request_id.validate_incoming(msg.id)?;
+            let recv = publisher
+                .as_mut()
+                .ok_or(SessionError::RoleViolation)?
+                .recv_subscribe_tracks(msg)?;
             return recv.run(writer, reader, mlog).await;
         }
         let mut writer = ResetOnDropWriter::new(writer);
@@ -1444,6 +1475,10 @@ impl Session {
             Message::NamespaceDone(m) => {
                 m.track_namespace_suffix.encode(&mut payload)?;
             }
+            Message::PublishBlocked(m) => {
+                m.track_namespace_suffix.encode(&mut payload)?;
+                m.track_name.encode(&mut payload)?;
+            }
             Message::PublishOk(m) => {
                 m.params.encode_message_params(&mut payload)?;
             }
@@ -1566,6 +1601,14 @@ impl Session {
                 let track_namespace_suffix = crate::coding::TrackNamespacePrefix::decode(&mut buf)?;
                 Ok(Message::NamespaceDone(message::NamespaceDone {
                     track_namespace_suffix,
+                }))
+            }
+            wire_id::PublishBlocked => {
+                let track_namespace_suffix = crate::coding::TrackNamespacePrefix::decode(&mut buf)?;
+                let track_name = crate::coding::TrackName::decode(&mut buf)?;
+                Ok(Message::PublishBlocked(message::PublishBlocked {
+                    track_namespace_suffix,
+                    track_name,
                 }))
             }
             wire_id::PublishOk => {
@@ -2614,6 +2657,49 @@ mod tests {
 
             assert_eq!(encode_bidi_response_bytes(&msg), plain.to_vec());
         }
+    }
+
+    #[test]
+    fn encode_bidi_publish_blocked_matches_plain_message_encoding() {
+        let msg = Message::PublishBlocked(message::PublishBlocked {
+            track_namespace_suffix: crate::coding::TrackNamespacePrefix::from_utf8_path(
+                "participant=5",
+            ),
+            track_name: "video".into(),
+        });
+        let mut plain = bytes::BytesMut::new();
+        msg.encode(&mut plain).unwrap();
+
+        assert_eq!(encode_bidi_response_bytes(&msg), plain.to_vec());
+    }
+
+    #[tokio::test]
+    async fn decode_bidi_publish_blocked() {
+        let (requester, responder) = test_support::loopback_session_pair().await;
+        let (_request_send, response_recv) = requester.open_bi().await.unwrap();
+        let (response_send, _request_recv) = responder.accept_bi().await.unwrap();
+        let msg = Message::PublishBlocked(message::PublishBlocked {
+            track_namespace_suffix: crate::coding::TrackNamespacePrefix::from_utf8_path(
+                "participant=5",
+            ),
+            track_name: "video".into(),
+        });
+        Session::encode_bidi_response(&mut Writer::new(response_send), &msg)
+            .await
+            .unwrap();
+
+        let Message::PublishBlocked(blocked) =
+            Session::decode_bidi_response(&mut Reader::new(response_recv), 42)
+                .await
+                .unwrap()
+        else {
+            panic!("expected PUBLISH_BLOCKED");
+        };
+        assert_eq!(
+            blocked.track_namespace_suffix,
+            crate::coding::TrackNamespacePrefix::from_utf8_path("participant=5")
+        );
+        assert_eq!(blocked.track_name, crate::coding::TrackName::from("video"));
     }
 
     #[test]

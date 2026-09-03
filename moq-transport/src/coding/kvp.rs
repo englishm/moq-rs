@@ -92,7 +92,7 @@ impl KeyValuePair {
         r: &mut R,
         prev: u64,
     ) -> Result<(Self, u64), DecodeError> {
-        Self::decode_with_prev_typed(r, prev, &[])
+        Self::decode_with_prev_typed(r, prev, &[], &[])
     }
 
     /// Like [`decode_with_prev`](KeyValuePair::decode_with_prev), but the
@@ -106,6 +106,7 @@ impl KeyValuePair {
         r: &mut R,
         prev: u64,
         u8_value_types: &[u64],
+        two_varint_value_types: &[u64],
     ) -> Result<(Self, u64), DecodeError> {
         let delta = u64::decode(r)?;
 
@@ -118,6 +119,17 @@ impl KeyValuePair {
             // Draft-17+ typed parameter → single raw uint8 value.
             let value = u8::decode(r)?;
             KeyValuePair::new_int(abs_type, value.into())
+        } else if two_varint_value_types.contains(&abs_type) {
+            let first = u64::decode(r)?;
+            let second = u64::decode(r)?;
+            let mut value = Vec::new();
+            first
+                .encode(&mut value)
+                .map_err(|_| DecodeError::InvalidParameter)?;
+            second
+                .encode(&mut value)
+                .map_err(|_| DecodeError::InvalidParameter)?;
+            KeyValuePair::new_bytes(abs_type, value)
         } else if abs_type % 2 == 0 {
             // Even type → varint value.
             let value = u64::decode(r)?;
@@ -145,7 +157,7 @@ impl KeyValuePair {
         w: &mut W,
         prev: u64,
     ) -> Result<u64, EncodeError> {
-        self.encode_with_prev_typed(w, prev, &[])
+        self.encode_with_prev_typed(w, prev, &[], &[])
     }
 
     /// Like [`encode_with_prev`](KeyValuePair::encode_with_prev), but the keys
@@ -159,6 +171,7 @@ impl KeyValuePair {
         w: &mut W,
         prev: u64,
         u8_value_types: &[u64],
+        two_varint_value_types: &[u64],
     ) -> Result<u64, EncodeError> {
         // Keys must be consistent with their value parity.
         match &self.value {
@@ -186,6 +199,17 @@ impl KeyValuePair {
                 }
             }
             Value::BytesValue(v) => {
+                if two_varint_value_types.contains(&self.key) {
+                    let mut value = bytes::Bytes::copy_from_slice(v);
+                    let first = u64::decode(&mut value).map_err(|_| EncodeError::InvalidValue)?;
+                    let second = u64::decode(&mut value).map_err(|_| EncodeError::InvalidValue)?;
+                    if value.has_remaining() {
+                        return Err(EncodeError::InvalidValue);
+                    }
+                    first.encode(w)?;
+                    second.encode(w)?;
+                    return Ok(self.key);
+                }
                 if v.len() > MAX_BYTES_VALUE_LEN {
                     return Err(EncodeError::KeyValuePairLengthExceeded);
                 }
@@ -265,6 +289,14 @@ impl KeyValuePairs {
         r: &mut R,
         u8_value_types: &[u64],
     ) -> Result<Self, DecodeError> {
+        Self::decode_with_value_types(r, u8_value_types, &[])
+    }
+
+    pub(crate) fn decode_with_value_types<R: bytes::Buf>(
+        r: &mut R,
+        u8_value_types: &[u64],
+        two_varint_value_types: &[u64],
+    ) -> Result<Self, DecodeError> {
         let count = u64::decode(r)?;
 
         // `count` is peer-controlled, so do not allocate directly from it.
@@ -277,7 +309,12 @@ impl KeyValuePairs {
         let mut prev = 0u64;
 
         for _ in 0..count {
-            let (pair, new_prev) = KeyValuePair::decode_with_prev_typed(r, prev, u8_value_types)?;
+            let (pair, new_prev) = KeyValuePair::decode_with_prev_typed(
+                r,
+                prev,
+                u8_value_types,
+                two_varint_value_types,
+            )?;
             prev = new_prev;
             kvps.push(pair);
         }
@@ -294,6 +331,15 @@ impl KeyValuePairs {
         w: &mut W,
         u8_value_types: &[u64],
     ) -> Result<(), EncodeError> {
+        self.encode_with_value_types(w, u8_value_types, &[])
+    }
+
+    pub(crate) fn encode_with_value_types<W: bytes::BufMut>(
+        &self,
+        w: &mut W,
+        u8_value_types: &[u64],
+        two_varint_value_types: &[u64],
+    ) -> Result<(), EncodeError> {
         // Sort a working copy by ascending key before encoding so the delta is
         // always non-negative.  The internal Vec is not required to be sorted.
         let mut sorted: Vec<&KeyValuePair> = self.0.iter().collect();
@@ -303,7 +349,7 @@ impl KeyValuePairs {
 
         let mut prev = 0u64;
         for kvp in &sorted {
-            prev = kvp.encode_with_prev_typed(w, prev, u8_value_types)?;
+            prev = kvp.encode_with_prev_typed(w, prev, u8_value_types, two_varint_value_types)?;
         }
 
         Ok(())
