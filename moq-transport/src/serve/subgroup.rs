@@ -737,7 +737,13 @@ impl SubgroupWriter {
         )
     }
 
-    pub(crate) fn create_with_id_and_status(
+    /// Write an object with an explicit absolute Object ID and status.
+    ///
+    /// This is how End of Group / End of Track markers (draft-18 §10.2.1.1)
+    /// are published on a subgroup stream: a status other than
+    /// [`ObjectStatus::NormalObject`] requires `size == 0` and no extension
+    /// headers, matching the wire encoding.
+    pub fn create_with_id_and_status(
         &mut self,
         object_id: u64,
         size: usize,
@@ -1645,6 +1651,38 @@ mod tests {
             reader.next().await.unwrap().is_none(),
             "the stream ends cleanly after the final object"
         );
+    }
+
+    /// Status objects (EOG/EOT markers) carry no payload and no extensions;
+    /// the reader observes the status and an immediate end of the (empty) body.
+    #[tokio::test]
+    async fn status_object_delivers_status_with_empty_body() {
+        let (mut writer, mut reader) = subgroup();
+        let object = writer
+            .create_with_id_and_status(7, 0, ObjectStatus::EndOfGroup, None)
+            .unwrap();
+        drop(object);
+
+        let mut object = reader.next().await.unwrap().unwrap();
+        assert_eq!(object.info.object_id, 7);
+        assert_eq!(object.info.status, ObjectStatus::EndOfGroup);
+        assert_eq!(object.read_all().await.unwrap(), Bytes::new());
+    }
+
+    #[tokio::test]
+    async fn status_object_rejects_payload_or_extensions() {
+        let (mut writer, _reader) = subgroup();
+        assert!(matches!(
+            writer.create_with_id_and_status(0, 1, ObjectStatus::EndOfGroup, None),
+            Err(ServeError::Size)
+        ));
+
+        let mut extensions = crate::data::ExtensionHeaders::new();
+        extensions.set_intvalue(2, 42);
+        assert!(matches!(
+            writer.create_with_id_and_status(0, 0, ObjectStatus::EndOfTrack, Some(extensions)),
+            Err(ServeError::Size)
+        ));
     }
 
     #[tokio::test]
