@@ -1068,10 +1068,11 @@ fn base() -> MoqTestParams {
     }
 }
 
-/// The built-in scenarios, built and validated once. Small and finite:
-/// every run is well under a second of object pacing plus round-trips.
+/// The built-in scenarios. Small and finite: every run is well under a
+/// second of object pacing plus round-trips. Validated at lookup (see
+/// [`scenario`]) and by the all-scenarios unit test.
 static SCENARIOS: LazyLock<Vec<(&'static str, Scenario)>> = LazyLock::new(|| {
-    let table = vec![
+    vec![
         (
             "moq-test-subgroup-per-group",
             Scenario {
@@ -1201,19 +1202,22 @@ static SCENARIOS: LazyLock<Vec<(&'static str, Scenario)>> = LazyLock::new(|| {
                 forward_zero: true,
             },
         ),
-    ];
-    for (name, scenario) in &table {
-        scenario
-            .params
-            .validate()
-            .unwrap_or_else(|e| panic!("built-in scenario {name} is invalid: {e}"));
-    }
-    table
+    ]
 });
 
-/// Look up a built-in scenario by name.
-pub fn scenario(name: &str) -> Option<&'static Scenario> {
-    SCENARIOS.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
+/// Look up a built-in scenario by name, validating its parameters first.
+/// An invalid built-in entry is a programmer error, but it is surfaced as an
+/// ordinary error rather than a panic (the all-scenarios unit test fails
+/// first); `Ok(None)` means no scenario is registered under `name`.
+pub fn scenario(name: &str) -> Result<Option<&'static Scenario>> {
+    let Some((_, scenario)) = SCENARIOS.iter().find(|(n, _)| *n == name) else {
+        return Ok(None);
+    };
+    scenario
+        .params
+        .validate()
+        .with_context(|| format!("built-in scenario {name} is invalid"))?;
+    Ok(Some(scenario))
 }
 
 async fn connect(
@@ -1793,5 +1797,21 @@ mod tests {
         let sb = Scoreboard::new(p);
         let report = sb.finish(Some(&done(PublishDoneCode::TrackEnded as u64, 3)), true);
         assert!(report.failures.iter().any(|f| f.contains("stream count 3")));
+    }
+
+    #[test]
+    fn all_builtin_scenarios_are_valid() {
+        // An invalid built-in entry is a programmer error; fail here rather
+        // than at lookup (which surfaces it as an ordinary error, not a
+        // panic).
+        let invalid: Vec<&str> = SCENARIOS
+            .iter()
+            .filter(|(_, s)| s.params.validate().is_err())
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(
+            invalid.is_empty(),
+            "invalid built-in scenarios: {invalid:?}"
+        );
     }
 }

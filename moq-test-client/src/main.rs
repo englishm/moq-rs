@@ -235,7 +235,7 @@ async fn run_moqtest_scenario(
 
 /// Run a named moq-test scenario.
 async fn run_moqtest(args: &Args, test_case: TestCase) -> Result<scenarios::TestConnectionIds> {
-    let scenario = moqtest::scenario(test_case.name())
+    let scenario = moqtest::scenario(test_case.name())?
         .ok_or_else(|| anyhow::anyhow!("unregistered moq-test scenario"))?;
     run_moqtest_scenario(args, scenario).await
 }
