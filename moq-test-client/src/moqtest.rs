@@ -64,6 +64,11 @@ const MAX_DATAGRAM_PAYLOAD: usize = 1200;
 /// Generous test-scale limit; the datagram budget is much tighter.
 const MAX_OBJECT_SIZE: u64 = 16 * 1024 * 1024;
 
+/// Worst-case cumulative payload volume for a track. The per-object and
+/// object-count caps are independent, so without this a tuple like 1,000
+/// objects x 16 MiB still validates. Generous test-scale limit.
+const MAX_TOTAL_PAYLOAD: u128 = 256 * 1024 * 1024;
+
 /// moq-test forwarding preference (tuple field 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Forwarding {
@@ -280,6 +285,21 @@ impl MoqTestParams {
             );
         }
 
+        // With EOG markers, last_object must land on the object series:
+        // the generator marks the object whose ID equals last_object, and
+        // the scoreboard expects the marker there. A misaligned tuple
+        // (e.g. start 0, last 5, increment 2) would emit no marker at all
+        // and trip its own verifier. Without EOG a short series is
+        // self-consistent, so no alignment requirement applies.
+        if self.eog_markers && (self.last_object - self.start_object) % self.object_increment != 0 {
+            bail!(
+                "last object {} is unreachable from start object {} by increment {}; the EOG marker would never be generated",
+                self.last_object,
+                self.start_object,
+                self.object_increment
+            );
+        }
+
         let max_size = self.size_object_zero.max(self.size_object_rest);
         if max_size > MAX_OBJECT_SIZE {
             bail!("object size {max_size} exceeds the {MAX_OBJECT_SIZE} byte limit");
@@ -309,6 +329,17 @@ impl MoqTestParams {
         if total_objects > MAX_DATA_OBJECTS {
             bail!(
                 "track would carry {total_objects} objects, exceeding the {MAX_DATA_OBJECTS} object limit"
+            );
+        }
+
+        // Bound cumulative payload volume too: generation materializes
+        // every payload and the track buffers them until served, so
+        // per-object and per-track caps alone still permit e.g. 1,000 x
+        // 16 MiB.
+        let total_payload = total_objects * u128::from(max_size);
+        if total_payload > MAX_TOTAL_PAYLOAD {
+            bail!(
+                "track would carry {total_payload} bytes of payload, exceeding the {MAX_TOTAL_PAYLOAD} byte limit"
             );
         }
         Ok(())
@@ -667,6 +698,12 @@ fn write_object(
 async fn pace(params: &MoqTestParams) {
     if params.frequency_ms > 0 {
         sleep(Duration::from_millis(params.frequency_ms)).await;
+    } else {
+        // Zero frequency must still yield: every other call in the
+        // generation loop is synchronous, so without this the whole track
+        // is emitted in a single poll — Published::serve never drains it
+        // and the scenario timeout cannot fire.
+        tokio::task::yield_now().await;
     }
 }
 
@@ -972,8 +1009,14 @@ pub async fn verify(
         let mut report = scoreboard.finish(subscribe.publish_done().as_ref(), true);
         // If the relay forwarded data anyway, the session would already have
         // resolved the track mode; a resolved mode here is a failure. A
-        // no-data track leaves mode() pending or closed.
-        if let Ok(Ok(_mode)) = tokio::time::timeout(Duration::from_millis(10), track.mode()).await {
+        // no-data track leaves mode() pending or closed. Data and control
+        // travel on independent QUIC paths, so a violating stream could in
+        // theory arrive just after PUBLISH_DONE; sample well past the DONE
+        // rather than for a token instant. A violating relay forwards during
+        // generation (hundreds of ms of pacing), so in practice the mode has
+        // long resolved by this point.
+        if let Ok(Ok(_mode)) = tokio::time::timeout(Duration::from_millis(250), track.mode()).await
+        {
             report
                 .failures
                 .push("FORWARD=0 but the relay forwarded data".to_string());
@@ -1263,6 +1306,20 @@ async fn connect(
     Ok((session, connection_id, transport))
 }
 
+/// Aborts the spawned subscriber task if `run` exits without awaiting it
+/// (early publisher error, or the outer scenario timeout dropping the
+/// future). A bare `JoinHandle` detaches on drop, which would leave the
+/// subscriber session running for the rest of the process.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        // No-op if the task already finished (the happy path awaits it
+        // first).
+        self.0.abort();
+    }
+}
+
 /// Run a moq-test scenario with the subscribe-first choreography and return
 /// the verification report.
 pub async fn run(args: &Args, scenario: &Scenario) -> Result<(TestConnectionIds, Report)> {
@@ -1301,7 +1358,7 @@ pub async fn run(args: &Args, scenario: &Scenario) -> Result<(TestConnectionIds,
 
     let params = scenario.params.clone();
     let forward_zero = scenario.forward_zero;
-    let sub_handle = tokio::spawn(async move {
+    let mut sub_handle = AbortOnDrop(tokio::spawn(async move {
         let work = async move {
             let subscribe = subscriber
                 .subscribe_open_with_params(sub_writer, sub_params)
@@ -1317,7 +1374,7 @@ pub async fn run(args: &Args, scenario: &Scenario) -> Result<(TestConnectionIds,
                 Err(anyhow!("subscriber session ended before verification completed"))
             }
         }
-    });
+    }));
 
     // Give the subscriber a head start so the SUBSCRIBE genuinely arrives
     // first at the relay. This is a bias, not a guarantee: if the publisher
@@ -1381,7 +1438,7 @@ pub async fn run(args: &Args, scenario: &Scenario) -> Result<(TestConnectionIds,
         }
     }
 
-    let report = sub_handle
+    let report = (&mut sub_handle.0)
         .await
         .context("subscriber task panicked")?
         .context("subscriber verification failed")?;
@@ -1684,6 +1741,66 @@ mod tests {
             last_object: 4,
             objects_per_group: 5,
             size_object_zero: u64::MAX,
+            ..base()
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn eog_last_object_must_land_on_the_series() {
+        // Series 0,2,4 never reaches 5: no marker would be generated, and
+        // the verifier would fail against its own generator. Reject up
+        // front.
+        assert!(MoqTestParams {
+            last_object: 5,
+            objects_per_group: 3,
+            object_increment: 2,
+            eog_markers: true,
+            ..base()
+        }
+        .validate()
+        .is_err());
+        // Aligned: the marker lands at 4.
+        assert!(MoqTestParams {
+            last_object: 4,
+            objects_per_group: 3,
+            object_increment: 2,
+            eog_markers: true,
+            ..base()
+        }
+        .validate()
+        .is_ok());
+        // Without EOG a last_object off the series is self-consistent.
+        assert!(MoqTestParams {
+            last_object: 3,
+            objects_per_group: 3,
+            object_increment: 2,
+            ..base()
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn total_payload_bound() {
+        // 10 objects x 16 MiB = 160 MiB: within the 256 MiB track budget.
+        assert!(MoqTestParams {
+            last_object: 9,
+            objects_per_group: 10,
+            size_object_zero: MAX_OBJECT_SIZE,
+            size_object_rest: MAX_OBJECT_SIZE,
+            ..base()
+        }
+        .validate()
+        .is_ok());
+        // 20 x 16 MiB = 320 MiB: each object is individually legal, but
+        // the cumulative volume is not.
+        assert!(MoqTestParams {
+            last_object: 19,
+            objects_per_group: 20,
+            size_object_zero: MAX_OBJECT_SIZE,
+            size_object_rest: MAX_OBJECT_SIZE,
             ..base()
         }
         .validate()
