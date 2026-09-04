@@ -71,8 +71,8 @@ pub enum Forwarding {
     SubgroupPerGroup,
     /// 1: one subgroup stream per object, Subgroup ID == Object ID.
     SubgroupPerObject,
-    /// 2: two subgroup streams per group; even objects on Subgroup 0, odd on
-    /// Subgroup 1.
+    /// 2: two subgroup streams per group; objects alternate by offset from
+    /// start_object: `(object_id - start_object) % 2` is the Subgroup ID.
     TwoSubgroupsPerGroup,
     /// 3: one datagram per object.
     Datagram,
