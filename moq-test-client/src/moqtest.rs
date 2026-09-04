@@ -58,6 +58,12 @@ const RENDEZVOUS_TIMEOUT_MS: u64 = 10_000;
 /// test-declaration error.
 const MAX_DATAGRAM_PAYLOAD: usize = 1200;
 
+/// Worst-case object size in any mode. Payloads are materialized as
+/// `vec![b't'; size]` during generation, so an absurd operator-supplied
+/// size must be a clean validation error, not an allocator failure.
+/// Generous test-scale limit; the datagram budget is much tighter.
+const MAX_OBJECT_SIZE: u64 = 16 * 1024 * 1024;
+
 /// moq-test forwarding preference (tuple field 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Forwarding {
@@ -274,11 +280,13 @@ impl MoqTestParams {
             );
         }
 
-        if self.forwarding == Forwarding::Datagram {
-            let max_size = self.size_object_zero.max(self.size_object_rest) as usize;
-            if max_size > MAX_DATAGRAM_PAYLOAD {
-                bail!("datagram-mode object size {max_size} exceeds budget {MAX_DATAGRAM_PAYLOAD}");
-            }
+        let max_size = self.size_object_zero.max(self.size_object_rest);
+        if max_size > MAX_OBJECT_SIZE {
+            bail!("object size {max_size} exceeds the {MAX_OBJECT_SIZE} byte limit");
+        }
+
+        if self.forwarding == Forwarding::Datagram && max_size as usize > MAX_DATAGRAM_PAYLOAD {
+            bail!("datagram-mode object size {max_size} exceeds budget {MAX_DATAGRAM_PAYLOAD}");
         }
 
         // Bound the materialized ranges: the scoreboard eagerly allocates one
@@ -837,7 +845,17 @@ impl Scoreboard {
         self.check_extensions(group, object, extensions);
     }
 
-    fn record_eog(&mut self, group: u64, object: u64, subgroup: Option<u64>) {
+    /// Record a status object. Only `EndOfGroup` is an EOG marker: the
+    /// generator never emits any other status, so a relay that injected
+    /// e.g. `EndOfTrack` at the EOG slot must fail verification rather
+    /// than silently pass.
+    fn record_eog(&mut self, status: ObjectStatus, group: u64, object: u64, subgroup: Option<u64>) {
+        if status != ObjectStatus::EndOfGroup {
+            self.fail(format!(
+                "unexpected status {status:?} at ({group}, {object}), expected EndOfGroup"
+            ));
+            return;
+        }
         if !self.params.eog_markers {
             self.fail(format!("unexpected EOG marker at ({group}, {object})"));
             return;
@@ -988,7 +1006,12 @@ pub async fn verify(
                                         &object.info.extension_headers,
                                     );
                                 } else {
-                                    scoreboard.record_eog(group, object_id, Some(subgroup_id));
+                                    scoreboard.record_eog(
+                                        object.info.status,
+                                        group,
+                                        object_id,
+                                        Some(subgroup_id),
+                                    );
                                 }
                             }
                             Ok(None) => break,
@@ -1014,7 +1037,12 @@ pub async fn verify(
                             &datagram.extension_headers,
                         );
                     } else {
-                        scoreboard.record_eog(datagram.group_id, datagram.object_id, None);
+                        scoreboard.record_eog(
+                            datagram.status,
+                            datagram.group_id,
+                            datagram.object_id,
+                            None,
+                        );
                     }
                 }
                 Ok(None) => break,
@@ -1638,6 +1666,30 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn subgroup_size_bound() {
+        // Subgroup modes stream over QUIC, so the tight datagram budget
+        // does not apply — but payloads are still materialized eagerly, so
+        // an absurd operator-supplied size is a validation error rather
+        // than an allocator failure.
+        assert!(MoqTestParams {
+            last_object: 4,
+            objects_per_group: 5,
+            size_object_rest: MAX_OBJECT_SIZE,
+            ..base()
+        }
+        .validate()
+        .is_ok());
+        assert!(MoqTestParams {
+            last_object: 4,
+            objects_per_group: 5,
+            size_object_zero: u64::MAX,
+            ..base()
+        }
+        .validate()
+        .is_err());
+    }
+
     fn full_scoreboard() -> Scoreboard {
         // One group, objects 0,1 data + EOG at 2.
         let p = MoqTestParams {
@@ -1665,7 +1717,7 @@ mod tests {
         // Group 0: data at 0,1; EOG at 2.
         sb.record_data(0, 0, Some(0), b"tttt", &ExtensionHeaders::new());
         sb.record_data(0, 1, Some(0), b"tt", &ExtensionHeaders::new());
-        sb.record_eog(0, 2, Some(0));
+        sb.record_eog(ObjectStatus::EndOfGroup, 0, 2, Some(0));
         let report = sb.finish(Some(&done(PublishDoneCode::TrackEnded as u64, 1)), false);
         assert!(report.passed(), "failures: {:?}", report.failures);
     }
@@ -1674,10 +1726,30 @@ mod tests {
     fn scoreboard_catches_missing_object() {
         let mut sb = full_scoreboard();
         sb.record_data(0, 0, Some(0), b"tttt", &ExtensionHeaders::new());
-        sb.record_eog(0, 2, Some(0));
+        sb.record_eog(ObjectStatus::EndOfGroup, 0, 2, Some(0));
         let report = sb.finish(Some(&done(PublishDoneCode::TrackEnded as u64, 1)), false);
         assert!(!report.passed());
         assert!(report.failures.iter().any(|f| f.contains("missing")));
+    }
+
+    #[test]
+    fn scoreboard_rejects_non_eog_status() {
+        // A relay that injects e.g. EndOfTrack at the EOG slot must not
+        // pass as an EOG marker.
+        let mut sb = full_scoreboard();
+        sb.record_data(0, 0, Some(0), b"tttt", &ExtensionHeaders::new());
+        sb.record_data(0, 1, Some(0), b"tt", &ExtensionHeaders::new());
+        sb.record_eog(ObjectStatus::EndOfTrack, 0, 2, Some(0));
+        let report = sb.finish(Some(&done(PublishDoneCode::TrackEnded as u64, 1)), false);
+        assert!(!report.passed());
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| f.contains("unexpected status")),
+            "failures: {:?}",
+            report.failures
+        );
     }
 
     #[test]
@@ -1685,7 +1757,7 @@ mod tests {
         let mut sb = full_scoreboard();
         sb.record_data(0, 0, Some(0), b"tttt", &ExtensionHeaders::new());
         sb.record_data(0, 1, Some(0), b"tt", &ExtensionHeaders::new());
-        sb.record_eog(0, 2, Some(0));
+        sb.record_eog(ObjectStatus::EndOfGroup, 0, 2, Some(0));
         sb.record_data(0, 1, Some(0), b"tt", &ExtensionHeaders::new()); // duplicate
         sb.record_data(0, 9, Some(0), b"tt", &ExtensionHeaders::new()); // unexpected
         let report = sb.finish(Some(&done(PublishDoneCode::TrackEnded as u64, 1)), false);
@@ -1698,7 +1770,7 @@ mod tests {
         let mut sb = full_scoreboard();
         sb.record_data(0, 0, Some(0), b"txtt", &ExtensionHeaders::new());
         sb.record_data(0, 1, Some(0), b"t", &ExtensionHeaders::new());
-        sb.record_eog(0, 2, Some(0));
+        sb.record_eog(ObjectStatus::EndOfGroup, 0, 2, Some(0));
         let report = sb.finish(Some(&done(PublishDoneCode::TrackEnded as u64, 1)), false);
         assert!(report.failures.iter().any(|f| f.contains("size")));
         assert!(report.failures.iter().any(|f| f.contains("corrupted")));
@@ -1772,7 +1844,7 @@ mod tests {
         let mut sb = full_scoreboard();
         sb.record_data(0, 0, Some(0), b"tttt", &ExtensionHeaders::new());
         sb.record_data(0, 1, Some(0), b"tt", &ExtensionHeaders::new());
-        sb.record_eog(0, 2, Some(0));
+        sb.record_eog(ObjectStatus::EndOfGroup, 0, 2, Some(0));
 
         let report = sb.finish(Some(&done(PublishDoneCode::TrackEnded as u64, 7)), false);
         assert!(report.failures.iter().any(|f| f.contains("stream count 7")));
