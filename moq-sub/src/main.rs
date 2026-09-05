@@ -16,7 +16,11 @@ use moq_transport::{coding::TrackNamespace, serve::Tracks};
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing with env filter (respects RUST_LOG environment variable)
     // Default to info level, but suppress quinn's verbose output
+    //
+    // Logs go to stderr so they can't corrupt the fMP4 byte stream this
+    // binary writes to stdout (e.g. `moq-sub ... | ffplay -`).
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
@@ -36,9 +40,15 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    let (session, subscriber) = moq_transport::session::Subscriber::connect(session, transport)
-        .await
-        .context("failed to create MoQ Transport session")?;
+    // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+    // `connect` accept it and remove `connect_with_session_id`.
+    let (session, subscriber) = moq_transport::session::Subscriber::connect_with_session_id(
+        session,
+        moq_transport::session::SessionId::new(connection_id.clone()),
+        transport,
+    )
+    .await
+    .context("failed to create MoQ Transport session")?;
 
     // Associate empty set of Tracks with provided namespace
     let tracks = Tracks::new(TrackNamespace::from_utf8_path(&config.name));

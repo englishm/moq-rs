@@ -6,6 +6,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.1...moq-transport-v0.16.2) - 2026-08-28
+
+### Added
+
+- *(moq-transport)* tie the client-visible error id to the session
+- *(moq-transport)* log session_id on stream and request-id paths
+- *(moq-transport)* log session_id on publisher and subscriber paths
+- *(moq-transport)* log session_id on all 35 control-plane sites
+- *(moq-transport)* thread SessionId through Session, Publisher and Subscriber
+- *(moq-transport)* add SessionId correlation id
+
+### Fixed
+
+- *(tracing)* harden session log context
+- *(tracing)* harden reason logs and share root spans
+- *(moq-transport)* preserve session constructor compatibility
+- *(moq-transport)* fix TrackName test assertions and pre-existing clippy lints
+
+### Other
+
+- *(moq-transport)* correct QUIC connection ID bounds
+- Merge pull request #156 from itzmanish/integrity-tests
+
+## [0.16.1](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.0...moq-transport-v0.16.1) - 2026-07-31
+
+### Fixed
+
+- reset subgroup streams instead of FIN-ing mid-object
+
+### Other
+
+- stream namespace paths into the formatter
+
 ## [0.16.0](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.15.1...moq-transport-v0.16.0) - 2026-07-19
 
 ### Added

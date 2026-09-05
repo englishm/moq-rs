@@ -24,7 +24,7 @@ use crate::watch::Queue;
 use super::{
     OpenSubscribeNamespace, PendingRequest, PendingRequests, PublishReceived, PublishReceivedRecv,
     PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session,
-    SessionConfig, SessionError, Subscribe, SubscribeNamespace, SubscribeRecv,
+    SessionConfig, SessionError, SessionId, Subscribe, SubscribeNamespace, SubscribeRecv,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -92,6 +92,9 @@ pub struct Subscriber {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// Correlation id of the owning session, tagged onto this subscriber's log records.
+    session_id: SessionId,
 }
 
 /// RAII guard that rolls back a SUBSCRIBE_NAMESPACE prefix reservation on failure.
@@ -228,6 +231,7 @@ impl Subscriber {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         pending_requests: PendingRequests,
+        session_id: SessionId,
     ) -> Self {
         Self {
             published_namespaces: Default::default(),
@@ -245,43 +249,135 @@ impl Subscriber {
             request_id,
             pending_requests,
             mlog,
+            session_id,
         }
     }
 
+    /// Correlation id of the session this subscriber belongs to.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     /// Create an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for control messages.
+    ///
+    /// Generates a local correlation ID. Use [`Self::accept_with_session_id`] when a peer-observed
+    /// QUIC connection ID is available.
     pub async fn accept(
         session: web_transport::Session,
         transport: super::Transport,
     ) -> Result<(Session, Self), SessionError> {
-        Self::accept_with_config(session, transport, SessionConfig::default()).await
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept` accept it and remove `accept_with_session_id`.
+        Self::accept_with_session_id(session, SessionId::generate(), transport).await
     }
 
+    /// Accept a configured subscriber session using a generated local correlation ID.
+    ///
+    /// Use [`Self::accept_with_config_and_session_id`] when a peer-observed QUIC connection ID is
+    /// available.
     pub async fn accept_with_config(
         session: web_transport::Session,
         transport: super::Transport,
         config: SessionConfig,
     ) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) =
-            Session::accept_with_config(session, None, transport, config).await?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        Self::accept_with_config_and_session_id(session, SessionId::generate(), transport, config)
+            .await
+    }
+
+    /// Accept a subscriber session using a peer-observed QUIC connection ID.
+    pub async fn accept_with_session_id(
+        session: web_transport::Session,
+        session_id: SessionId,
+        transport: super::Transport,
+    ) -> Result<(Session, Self), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        Self::accept_with_config_and_session_id(
+            session,
+            session_id,
+            transport,
+            SessionConfig::default(),
+        )
+        .await
+    }
+
+    /// Accept a configured subscriber session using a peer-observed QUIC connection ID.
+    pub async fn accept_with_config_and_session_id(
+        session: web_transport::Session,
+        session_id: SessionId,
+        transport: super::Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Self), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        let (session, _, subscriber) = Session::accept_with_config_and_session_id(
+            session, session_id, None, transport, config,
+        )
+        .await?;
         let subscriber = subscriber.ok_or(SessionError::Internal)?;
         Ok((session, subscriber))
     }
 
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for control messages.
+    ///
+    /// Generates a local correlation ID. Use [`Self::connect_with_session_id`] when a peer-observed
+    /// QUIC connection ID is available.
     pub async fn connect(
         session: web_transport::Session,
         transport: super::Transport,
     ) -> Result<(Session, Self), SessionError> {
-        Self::connect_with_config(session, transport, SessionConfig::default()).await
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        Self::connect_with_session_id(session, SessionId::generate(), transport).await
     }
 
+    /// Create a configured subscriber session using a generated local correlation ID.
+    ///
+    /// Use [`Self::connect_with_config_and_session_id`] when a peer-observed QUIC connection ID is
+    /// available.
     pub async fn connect_with_config(
         session: web_transport::Session,
         transport: super::Transport,
         config: SessionConfig,
     ) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) =
-            Session::connect_with_config(session, None, transport, config).await?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        Self::connect_with_config_and_session_id(session, SessionId::generate(), transport, config)
+            .await
+    }
+
+    /// Create a subscriber session using a peer-observed QUIC connection ID.
+    pub async fn connect_with_session_id(
+        session: web_transport::Session,
+        session_id: SessionId,
+        transport: super::Transport,
+    ) -> Result<(Session, Self), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        Self::connect_with_config_and_session_id(
+            session,
+            session_id,
+            transport,
+            SessionConfig::default(),
+        )
+        .await
+    }
+
+    /// Create a configured subscriber session using a peer-observed QUIC connection ID.
+    pub async fn connect_with_config_and_session_id(
+        session: web_transport::Session,
+        session_id: SessionId,
+        transport: super::Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Self), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        let (session, _, subscriber) = Session::connect_with_config_and_session_id(
+            session, session_id, None, transport, config,
+        )
+        .await?;
         Ok((session, subscriber))
     }
 
@@ -350,7 +446,7 @@ impl Subscriber {
     /// Called by `PublishReceived::drop` when the app did not call `ok()`.
     pub(super) fn remove_publish_received(&self, request_id: u64) {
         if let Err(err) = self.remove_publish_received_state(request_id) {
-            tracing::error!(request_id, error = %err, "failed to remove inbound PUBLISH state");
+            tracing::error!(session_id = %self.session_id, request_id, error = %err, "failed to remove inbound PUBLISH state");
         }
     }
 
@@ -434,14 +530,14 @@ impl Subscriber {
         let id = match self.get_next_request_id() {
             Ok(id) => id,
             Err(e) => {
-                tracing::warn!(error = %e, "could not send TRACK_STATUS: request ID limit reached");
+                tracing::warn!(session_id = %self.session_id, error = %e, "could not send TRACK_STATUS: request ID limit reached");
                 return;
             }
         };
         if let Ok(mut track_statuses) = self.track_statuses.lock() {
             track_statuses.insert(id);
         } else {
-            tracing::warn!("could not track outbound TRACK_STATUS: lock poisoned");
+            tracing::warn!(session_id = %self.session_id, "could not track outbound TRACK_STATUS: lock poisoned");
             return;
         }
         self.send_message(message::TrackStatus {
@@ -553,6 +649,7 @@ impl Subscriber {
             message::Publisher::FetchOk(msg) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %self.session_id,
                     request_id = msg.id,
                     "received FETCH_OK for unsupported FETCH — ignoring"
                 );
@@ -783,6 +880,7 @@ impl Subscriber {
 
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %self.session_id,
             request_id = msg.id,
             track_alias = msg.track_alias,
             namespace = %msg.track_namespace,
@@ -839,6 +937,7 @@ impl Subscriber {
         } else {
             tracing::debug!(
                 target: "moq_transport::control",
+                session_id = %self.session_id,
                 request_id = msg.id,
                 "received PUBLISH_DONE for unknown subscription — ignoring"
             );
@@ -858,6 +957,7 @@ impl Subscriber {
             self.log_request_ok_parsed(request_kind, msg);
             tracing::debug!(
                 target: "moq_transport::control",
+                session_id = %self.session_id,
                 request_id = msg.id,
                 request_kind,
                 "received REQUEST_OK"
@@ -869,6 +969,7 @@ impl Subscriber {
         self.log_request_ok_parsed(request_kind, msg);
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %self.session_id,
             request_id = msg.id,
             request_kind,
             "received REQUEST_OK"
@@ -889,11 +990,12 @@ impl Subscriber {
             subscribe.error(ServeError::Closed(msg.error_code))?;
             tracing::debug!(
                 target: "moq_transport::control",
+                session_id = %self.session_id,
                 request_id = msg.id,
                 request_kind = "subscribe",
                 error_code = msg.error_code,
                 retry_interval = msg.retry_interval,
-                reason = %msg.reason.0,
+                reason = ?msg.reason.0,
                 "received REQUEST_ERROR"
             );
             return Ok(());
@@ -901,11 +1003,12 @@ impl Subscriber {
             self.log_request_error_parsed("track_status", msg);
             tracing::debug!(
                 target: "moq_transport::control",
+                session_id = %self.session_id,
                 request_id = msg.id,
                 request_kind = "track_status",
                 error_code = msg.error_code,
                 retry_interval = msg.retry_interval,
-                reason = %msg.reason.0,
+                reason = ?msg.reason.0,
                 "received REQUEST_ERROR"
             );
             return Ok(());
@@ -914,11 +1017,12 @@ impl Subscriber {
         self.log_request_error_parsed("unknown", msg);
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %self.session_id,
             request_id = msg.id,
             request_kind = "unknown",
             error_code = msg.error_code,
             retry_interval = msg.retry_interval,
-            reason = %msg.reason.0,
+            reason = ?msg.reason.0,
             "received REQUEST_ERROR"
         );
         Ok(())
@@ -1023,7 +1127,7 @@ impl Subscriber {
         stream: web_transport::RecvStream,
     ) -> Result<(), SessionError> {
         tracing::trace!("[SUBSCRIBER] recv_stream: new stream received, decoding header");
-        let mut reader = Reader::new(stream);
+        let mut reader = Reader::new(self.session_id.clone(), stream);
 
         // Decode the stream header
         let stream_header: data::StreamHeader = reader.decode().await?;
@@ -1063,6 +1167,7 @@ impl Subscriber {
             .await;
         if let Err(SessionError::Serve(err)) = &res {
             tracing::warn!(
+                session_id = %self.session_id,
                 "[SUBSCRIBER] recv_stream: stream processing error for track_alias={}: {:?}",
                 track_alias,
                 err
@@ -1127,6 +1232,7 @@ impl Subscriber {
     /// PUBLISH).  Keeping this as a closure avoids duplicating ~100 lines of
     /// object decoding, ID tracking, validation, logging, and payload reading.
     async fn recv_subgroup_objects(
+        session_id: SessionId,
         stream_header_type: data::StreamHeaderType,
         mut subgroup_header: data::SubgroupHeader,
         mut reader: Reader,
@@ -1270,6 +1376,7 @@ impl Subscriber {
             while remaining_bytes > 0 {
                 let chunk = reader.read_chunk(remaining_bytes).await?.ok_or_else(|| {
                     tracing::error!(
+                        session_id = %session_id,
                         "[SUBSCRIBER] recv_subgroup_objects: stream ended with {} bytes remaining",
                         remaining_bytes
                     );
@@ -1308,6 +1415,7 @@ impl Subscriber {
         let subscribes = self.subscribes.clone();
         let publishes_received = self.publishes_received.clone();
         Self::recv_subgroup_objects(
+            self.session_id.clone(),
             stream_header_type,
             subgroup_header,
             reader,
@@ -1432,6 +1540,7 @@ impl Subscriber {
             }
             None => {
                 tracing::warn!(
+                    session_id = %self.session_id,
                     "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias={}, group_id={}, object_id={}",
                     track_alias,
                     datagram.group_id,
@@ -1459,6 +1568,7 @@ mod tests {
             None,
             request_id,
             PendingRequests::default(),
+            SessionId::generate(),
         )
     }
 

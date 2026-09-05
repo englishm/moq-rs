@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{future::Future, net, path::PathBuf, pin::Pin, sync::Arc};
+use std::{future::Future, net, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::Context;
 
@@ -13,7 +13,8 @@ use url::Url;
 use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
 use crate::{
     metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
-    RelayInfo, RemoteManager, Session, SessionContext,
+    RelayInfo, RemoteManager, Session, SessionContext, SessionInterface,
+    DEFAULT_CACHE_IDLE_TIMEOUT,
 };
 
 // A type alias for boxed future
@@ -74,6 +75,18 @@ impl RelayConfig {
     pub fn build(self) -> anyhow::Result<Relay> {
         Relay::new(self)
     }
+
+    /// Build a relay with a custom pull-through cache idle timeout.
+    ///
+    /// See [`Relay::new_with_cache_idle_timeout`]. This is a separate
+    /// constructor rather than a `RelayConfig` field so that adding it does not
+    /// break existing struct-literal construction of [`RelayConfig`].
+    pub fn build_with_cache_idle_timeout(
+        self,
+        cache_idle_timeout: Duration,
+    ) -> anyhow::Result<Relay> {
+        Relay::new_with_cache_idle_timeout(self, cache_idle_timeout)
+    }
 }
 
 /// MoQ Relay server.
@@ -86,7 +99,21 @@ pub struct Relay {
 }
 
 impl Relay {
-    pub fn new(mut config: RelayConfig) -> anyhow::Result<Self> {
+    pub fn new(config: RelayConfig) -> anyhow::Result<Self> {
+        Self::new_with_cache_idle_timeout(config, DEFAULT_CACHE_IDLE_TIMEOUT)
+    }
+
+    /// Create a relay that releases upstream subscriptions for cached tracks that
+    /// have had no downstream subscribers for `cache_idle_timeout`.
+    ///
+    /// The relay caches tracks it does not publish itself so multiple downstream
+    /// subscribers can share one upstream subscription. Without a timeout that
+    /// subscription outlives the last subscriber and the relay keeps receiving a
+    /// track nobody is watching. A zero timeout restores that behaviour.
+    pub fn new_with_cache_idle_timeout(
+        mut config: RelayConfig,
+        cache_idle_timeout: Duration,
+    ) -> anyhow::Result<Self> {
         if config.bind.is_some() && !config.endpoints.is_empty() {
             anyhow::bail!("cannot specify both bind and endpoints");
         }
@@ -115,7 +142,7 @@ impl Relay {
             tracing::info!("mlog output enabled: {}", mlog_dir.display());
         }
 
-        let locals = Locals::new();
+        let locals = Locals::with_cache_idle_timeout(cache_idle_timeout);
 
         // FIXME(itzmanish): have a generic filter to find endpoints for forward, remote etc.
         let remote_clients = config
@@ -129,7 +156,8 @@ impl Relay {
             config.coordinator.clone(),
             remote_clients,
             config.session,
-        );
+        )
+        .with_cache_idle_timeout(cache_idle_timeout);
         let (upstream_namespaces, upstream_namespaces_runner) =
             UpstreamNamespaces::new(locals.clone(), remotes.clone(), config.coordinator.clone());
 
@@ -180,15 +208,20 @@ impl Relay {
                 tracing::info!("forwarding PUBLISH_NAMESPACE messages to {}", url);
 
                 // Establish a QUIC connection to the forward URL
-                let (session, _quic_client_initial_cid, transport) = quic_endpoints[0]
+                let (session, forward_cid, transport) = quic_endpoints[0]
                     .client
                     .connect(url, None)
                     .await
                     .context("failed to establish forward connection")?;
 
                 // Create the MoQ session over the connection
-                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config(
+                let forward_session_id = moq_transport::session::SessionId::new(forward_cid);
+                // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API,
+                // make `connect_with_config` accept it and remove
+                // `connect_with_config_and_session_id`.
+                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config_and_session_id(
                     session,
+                    forward_session_id.clone(),
                     None,
                     transport,
                     session_config,
@@ -196,7 +229,8 @@ impl Relay {
                 .await
                 .context("failed to establish forward session")?;
 
-                // Use the connection path already validated and stored by Session::connect().
+                // Use the connection path already validated and stored by
+                // Session::connect_with_config_and_session_id().
                 // The forward session is scoped to whatever path the announce URL specifies.
                 //
                 // Note: the forward connection intentionally does not call
@@ -210,10 +244,8 @@ impl Relay {
                 // Multi-scope forwarding (routing different incoming scopes to different
                 // upstream paths) would require per-scope forward connections.
                 let forward_scope = session.connection_path().map(|s| s.to_string());
-                let forward_context = SessionContext::internal(
-                    forward_scope,
-                    Some(RelayInfo::new(url.clone())),
-                );
+                let forward_context =
+                    SessionContext::internal(forward_scope, Some(RelayInfo::new(url.clone())));
 
                 let forward_coordinator = coordinator.clone();
                 let session = Session {
@@ -231,7 +263,7 @@ impl Relay {
                         forward_coordinator,
                         remote_manager.clone(),
                         None,
-                        forward_context,
+                        forward_context.clone(),
                     )),
                     // Forward connections are always full read-write relay peers,
                     // so no reject loops needed.
@@ -241,7 +273,15 @@ impl Relay {
 
                 let forward_producer = session.producer.clone();
 
-                tasks.push(async move { session.run().await.context("forwarding failed") }.boxed());
+                tasks.push(
+                    async move {
+                        session
+                            .run_with_context(&forward_context)
+                            .await
+                            .context("forwarding failed")
+                    }
+                    .boxed(),
+                );
 
                 forward_producer
             } else {
@@ -287,6 +327,10 @@ impl Relay {
                             id: connection_id,
                             transport,
                             remote_address: remote_addr,
+                            // The local IP the connection was accepted on
+                            // (destination IP the peer targeted); forwarded to the
+                            // connection tagger for inbound-interface classification.
+                            local_ip,
                             server_name,
                         } = info;
 
@@ -313,10 +357,20 @@ impl Relay {
                             let raw_conn = conn.clone();
 
                             // Create the MoQ session over the connection (setup handshake etc)
-                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config(conn, mlog_path, transport, session_config).await {
+                            let session_id = moq_transport::session::SessionId::new(connection_id.clone());
+                            // TODO(itzmanish): When SessionId becomes mandatory in the next
+                            // breaking API, make `accept_with_config` accept it and remove
+                            // `accept_with_config_and_session_id`.
+                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config_and_session_id(
+                                conn,
+                                session_id.clone(),
+                                mlog_path,
+                                transport,
+                                session_config,
+                            ).await {
                                 Ok(session) => session,
                                 Err(err) => {
-                                    tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
+                                    tracing::warn!(session_id = %session_id, error = %err, "failed to accept MoQ session: {}", err);
                                     metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
                                     // Maintain invariant: connections_total - connections_closed_total == active_connections
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
@@ -334,6 +388,7 @@ impl Relay {
                                 Ok(info) => info,
                                 Err(err) => {
                                     tracing::warn!(
+                                        session_id = %session_id,
                                         connection_path = moq_session.connection_path(),
                                         error = %err,
                                         "scope resolution failed, rejecting session"
@@ -371,15 +426,60 @@ impl Relay {
                                         Some(remote_addr),
                                         server_name,
                                         moq_session.connection_path().map(str::to_string),
-                                    );
+                                    )
+                                    .with_local_ip(local_ip);
                                     let tags = tagger.tag(&meta);
-                                    SessionContext::from_tags(scope, &tags, Some(remote_addr))
+                                    SessionContext::from_tags(
+                                        scope,
+                                        &tags,
+                                        Some(remote_addr),
+                                    )
                                 }
                                 None => SessionContext::public(scope),
                             };
 
+                            // The resolved interface decides whether a
+                            // PUBLISH_NAMESPACE on this session is treated as
+                            // ours or as proxied for a peer, and until now
+                            // nothing recorded it. Classification depends on
+                            // `local_ip` being populated, which is a platform
+                            // property rather than a configured one: if it is
+                            // absent, every peer relay silently classifies as a
+                            // public client and the proxied path is never taken.
+                            // That failure mode is invisible without this line —
+                            // the behaviour degrades to exactly what it was
+                            // before, with no error anywhere.
+                            //
+                            // Emitted for every accepted session so the
+                            // precondition is observable in production rather
+                            // than inferred, but only peer sessions are worth
+                            // info: they are rare and they are the ones whose
+                            // classification changes behaviour. Clients are the
+                            // bulk of the traffic and would drown it out, so
+                            // they stay at debug and remain available when a
+                            // misclassification is what is being investigated.
+                            match context.interface {
+                                SessionInterface::Internal => tracing::info!(
+                                    session_id = %session_id,
+                                    interface = ?context.interface,
+                                    local_ip = ?local_ip,
+                                    remote_addr = %remote_addr,
+                                    tagger = connection_tagger.is_some(),
+                                    "session accepted"
+                                ),
+                                SessionInterface::Public => tracing::debug!(
+                                    session_id = %session_id,
+                                    interface = ?context.interface,
+                                    local_ip = ?local_ip,
+                                    remote_addr = %remote_addr,
+                                    tagger = connection_tagger.is_some(),
+                                    "session accepted"
+                                ),
+                            }
+
                             if let Some(ref info) = scope_info {
                                 tracing::debug!(
+                                    session_id = %session_id,
                                     connection_path = moq_session.connection_path(),
                                     scope_id = %info.scope_id,
                                     permissions = ?info.permissions,
@@ -402,7 +502,7 @@ impl Relay {
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context)), None)
+                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context.clone())), None)
                             } else {
                                 (None, subscriber)
                             };
@@ -415,19 +515,19 @@ impl Relay {
                                 reject_subscribes,
                             };
 
-                            match session.run().await {
+                            match session.run_with_context(&context).await {
                                 Ok(()) => {
                                     // Session ended cleanly (uncommon - usually ends via close)
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 }
                                 Err(err) if err.is_graceful_close() => {
                                     // Graceful close - peer sent APPLICATION_CLOSE with code 0
-                                    tracing::debug!("MoQ session closed gracefully");
+                                    tracing::debug!(session_id = %session_id, "MoQ session closed gracefully");
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 }
                                 Err(err) => {
                                     // Actual error - protocol violation, timeout, etc.
-                                    tracing::warn!(error = %err, "MoQ session error: {}", err);
+                                    tracing::warn!(session_id = %session_id, error = %err, "MoQ session error: {}", err);
                                     metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_run").increment(1);
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 }

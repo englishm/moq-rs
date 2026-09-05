@@ -8,7 +8,7 @@ authors = ["moq-rs contributors"]
 repository = "https://github.com/cloudflare/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.7.23"
+version = "0.7.26"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
@@ -24,7 +24,7 @@ path = "src/bin/moq-relay-ietf/main.rs"
 
 [dependencies]
 moq-transport = { path = "../moq-transport", version = "0.16" }
-moq-native-ietf = { path = "../moq-native-ietf", version = "0.9" }
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
 moq-api = { path = "../moq-api", version = "0.2" }
 web-transport = { workspace = true }
 
@@ -69,6 +69,13 @@ thiserror = "2.0.17"
 # The metrics-prometheus feature adds the optional Prometheus exporter.
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", optional = true }
+
+[dev-dependencies]
+# test-util provides the paused-clock runtime used to test idle timeouts without
+# sleeping for real.
+tokio = { version = "1", features = ["full", "test-util"] }
+# Used to assert that session correlation fields actually reach formatted output.
+tracing-subscriber = { workspace = true }
 
 [features]
 default = []

@@ -8,7 +8,11 @@ This codebase was originally created by [Luke Curley (@kixelated)](https://githu
 
 ## Protocol Support
 
-The `main` branch targets **draft-16** of the MoQT specification and is the only actively supported draft version. Branches for older drafts remain available for interoperability testing and backports when needed. For draft-07 compatibility (used in [Cloudflare's current production deployment](https://developers.cloudflare.com/moq/)), see the [`draft-ietf-moq-transport-07`](https://github.com/cloudflare/moq-rs/tree/draft-ietf-moq-transport-07) branch.
+The `main` branch targets **draft-16** of the MoQT specification and is the basis for Cloudflare's production deployment. Cloudflare currently runs draft-14 and draft-16 relays globally. See the [Cloudflare MoQ developer docs](https://developers.cloudflare.com/moq/) for endpoint URLs, provisioning, and a full feature matrix.
+
+Other branches:
+- [`draft-ietf-moq-transport-14`](https://github.com/cloudflare/moq-rs/tree/draft-ietf-moq-transport-14) — draft-14 maintenance branch
+- [`draft-18-dev`](https://github.com/cloudflare/moq-rs/tree/draft-18-dev) — early draft-18 development
 
 ### What's Included
 
@@ -29,16 +33,12 @@ This repository provides:
 - Both stream ("subgroup") and datagram delivery modes
 
 **Not Supported:**
-- FETCH (Not Soon)
+- FETCH
+- GOAWAY
 
 ## Interoperability
 
-A public relay instance running the latest `main` branch is available for interop testing at:
-```
-https://interop-relay.cloudflare.mediaoverquic.com:443
-```
-
-As an implementation targeting the IETF specification, this codebase should be compatible with other implementations targeting the same draft version. See the [moq-wg/moq-transport wiki](https://github.com/moq-wg/moq-transport/wiki/Interop) for a list of other implementations.
+This codebase is compatible with other MoQT implementations targeting the same draft version. See the [moq-wg/moq-transport wiki](https://github.com/moq-wg/moq-transport/wiki/Interop) for a list of implementations, and the [moq-interop-runner](https://github.com/englishm/moq-interop-runner) for interop test tooling and a registry of public relay endpoints across draft versions.
 
 For streaming format compatibility:
 - **[video-dev/moq-js](https://github.com/video-dev/moq-js)**: A TypeScript player implementation compatible with moq-pub's fMP4 output. Check draft version compatibility when selecting branches.

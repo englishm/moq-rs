@@ -7,6 +7,7 @@ mod extension_headers;
 mod fetch;
 mod header;
 mod object_status;
+mod reset_code;
 mod subgroup;
 
 pub use datagram::*;
@@ -14,4 +15,5 @@ pub use extension_headers::*;
 pub use fetch::*;
 pub use header::*;
 pub use object_status::*;
+pub use reset_code::*;
 pub use subgroup::*;

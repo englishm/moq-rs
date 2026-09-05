@@ -380,7 +380,7 @@ mod tests {
     use crate::{
         coding::TrackNamespace,
         serve::Track,
-        session::{Queue, RequestId},
+        session::{Queue, RequestId, SessionId},
     };
 
     fn make_pair(
@@ -397,6 +397,7 @@ mod tests {
             None,
             rid,
             crate::session::PendingRequests::default(),
+            SessionId::generate(),
         );
         let (writer, reader) =
             Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4").produce();

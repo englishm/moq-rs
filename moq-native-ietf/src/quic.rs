@@ -385,6 +385,17 @@ pub struct ConnInfo {
     /// Peer socket address.
     pub remote_address: net::SocketAddr,
 
+    /// Local IP the peer connected to: the destination IP the peer's packets
+    /// targeted (the port is always our fixed listening port, so it is omitted).
+    ///
+    /// On a wildcard bind (`0.0.0.0` / `[::]`) this identifies which local
+    /// address/interface (e.g. an anycast VIP) actually received the
+    /// connection — something neither [`remote_address`](Self::remote_address)
+    /// nor the wildcard [`Server::local_addr`] can tell you. `None` when the
+    /// platform does not expose the destination address (see
+    /// `quinn::Connection::local_ip`).
+    pub local_ip: Option<IpAddr>,
+
     /// TLS SNI server name sent by the peer, if any.
     pub server_name: Option<String>,
 }
@@ -489,11 +500,17 @@ impl Server {
         // the connection interface (public client vs internal relay peer).
         let remote_address = conn.remote_address();
 
+        // The destination IP the peer targeted, which differs from the wildcard
+        // bind address on multi-homed / anycast hosts. `None` if the platform
+        // does not expose it.
+        let local_ip = conn.local_ip();
+
         tracing::debug!(
-            "established QUIC connection: cid={} stable_id={} ip={} alpn={} server={}",
+            "established QUIC connection: cid={} stable_id={} ip={} local_ip={:?} alpn={} server={}",
             connection_id_hex,
             conn.stable_id(),
             remote_address,
+            local_ip,
             alpn,
             server_name,
         );
@@ -537,6 +554,7 @@ impl Server {
             id: connection_id_hex,
             transport,
             remote_address,
+            local_ip,
             // An empty SNI means the peer sent no server name.
             server_name: (!server_name.is_empty()).then_some(server_name),
         };

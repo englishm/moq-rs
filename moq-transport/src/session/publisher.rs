@@ -21,8 +21,8 @@ use crate::watch::Queue;
 use super::{
     split_published_state, ObjectForwarderRecv, PendingRequest, PendingRequests, PublishNamespace,
     PublishNamespaceRecv, Published, PublishedInfo, PublishedRecv, RequestId, RequestIdAllocation,
-    Session, SessionConfig, SessionError, Subscribed, SubscribedNamespace, SubscribedNamespaceInfo,
-    SubscribedNamespaceRecv, TrackStatusRequested,
+    Session, SessionConfig, SessionError, SessionId, Subscribed, SubscribedNamespace,
+    SubscribedNamespaceInfo, SubscribedNamespaceRecv, TrackStatusRequested,
 };
 use crate::message::RequestErrorCode;
 
@@ -134,6 +134,9 @@ pub struct Publisher {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// Correlation id of the owning session, tagged onto this publisher's log records.
+    session_id: SessionId,
 }
 
 impl Publisher {
@@ -143,6 +146,7 @@ impl Publisher {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         pending_requests: PendingRequests,
+        session_id: SessionId,
     ) -> Self {
         Self {
             webtransport,
@@ -159,41 +163,133 @@ impl Publisher {
             request_id,
             pending_requests,
             mlog,
+            session_id,
         }
     }
 
+    /// Correlation id of the session this publisher belongs to.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Accept a publisher session using a generated local correlation ID.
+    ///
+    /// Use [`Self::accept_with_session_id`] when a peer-observed QUIC connection ID is available.
     pub async fn accept(
         session: web_transport::Session,
         transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        Self::accept_with_config(session, transport, SessionConfig::default()).await
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept` accept it and remove `accept_with_session_id`.
+        Self::accept_with_session_id(session, SessionId::generate(), transport).await
     }
 
+    /// Accept a publisher session with explicit configuration and a generated correlation ID.
+    ///
+    /// Use [`Self::accept_with_config_and_session_id`] when a peer-observed QUIC connection ID is
+    /// available.
     pub async fn accept_with_config(
         session: web_transport::Session,
         transport: super::Transport,
         config: SessionConfig,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) =
-            Session::accept_with_config(session, None, transport, config).await?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        Self::accept_with_config_and_session_id(session, SessionId::generate(), transport, config)
+            .await
+    }
+
+    /// Accept a publisher session using a peer-observed QUIC connection ID.
+    pub async fn accept_with_session_id(
+        session: web_transport::Session,
+        session_id: SessionId,
+        transport: super::Transport,
+    ) -> Result<(Session, Publisher), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        Self::accept_with_config_and_session_id(
+            session,
+            session_id,
+            transport,
+            SessionConfig::default(),
+        )
+        .await
+    }
+
+    /// Accept a configured publisher session using a peer-observed QUIC connection ID.
+    pub async fn accept_with_config_and_session_id(
+        session: web_transport::Session,
+        session_id: SessionId,
+        transport: super::Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Publisher), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `accept_with_config` accept it and remove `accept_with_config_and_session_id`.
+        let (session, publisher, _) = Session::accept_with_config_and_session_id(
+            session, session_id, None, transport, config,
+        )
+        .await?;
         let publisher = publisher.ok_or(SessionError::Internal)?;
         Ok((session, publisher))
     }
 
+    /// Create a publisher session using a generated local correlation ID.
+    ///
+    /// Use [`Self::connect_with_session_id`] when a peer-observed QUIC connection ID is available.
     pub async fn connect(
         session: web_transport::Session,
         transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        Self::connect_with_config(session, transport, SessionConfig::default()).await
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        Self::connect_with_session_id(session, SessionId::generate(), transport).await
     }
 
+    /// Create a configured publisher session using a generated local correlation ID.
+    ///
+    /// Use [`Self::connect_with_config_and_session_id`] when a peer-observed QUIC connection ID is
+    /// available.
     pub async fn connect_with_config(
         session: web_transport::Session,
         transport: super::Transport,
         config: SessionConfig,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) =
-            Session::connect_with_config(session, None, transport, config).await?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        Self::connect_with_config_and_session_id(session, SessionId::generate(), transport, config)
+            .await
+    }
+
+    /// Create a publisher session using a peer-observed QUIC connection ID.
+    pub async fn connect_with_session_id(
+        session: web_transport::Session,
+        session_id: SessionId,
+        transport: super::Transport,
+    ) -> Result<(Session, Publisher), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        Self::connect_with_config_and_session_id(
+            session,
+            session_id,
+            transport,
+            SessionConfig::default(),
+        )
+        .await
+    }
+
+    /// Create a configured publisher session using a peer-observed QUIC connection ID.
+    pub async fn connect_with_config_and_session_id(
+        session: web_transport::Session,
+        session_id: SessionId,
+        transport: super::Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Publisher), SessionError> {
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
+        let (session, publisher, _) = Session::connect_with_config_and_session_id(
+            session, session_id, None, transport, config,
+        )
+        .await?;
         Ok((session, publisher))
     }
 
@@ -241,10 +337,12 @@ impl Publisher {
                     match res? {
                         Some(subscribed) => {
                             let tracks = tracks.clone();
+                            let session_id = self.session_id.clone();
                             subscribe_tasks.push(async move {
                                 let info = subscribed.info.clone();
                                 if let Err(err) = Self::serve_subscribe(subscribed, tracks).await {
                                     tracing::warn!(
+                                        session_id = %session_id,
                                         subscribe_info = ?info,
                                         error = %err,
                                         "failed serving subscribe"
@@ -259,10 +357,12 @@ impl Publisher {
                     match res? {
                         Some(status) => {
                             let tracks = tracks.clone();
+                            let session_id = self.session_id.clone();
                             status_tasks.push(async move {
                                 let request_msg = status.request_msg.clone();
                                 if let Err(err) = Self::serve_track_status(status, tracks).await {
                                     tracing::warn!(
+                                        session_id = %session_id,
                                         request = ?request_msg,
                                         error = %err,
                                         "failed serving track status request"
@@ -506,6 +606,7 @@ impl Publisher {
             message::Subscriber::FetchCancel(msg) => {
                 tracing::debug!(
                     target: "moq_transport::control",
+                    session_id = %self.session_id,
                     request_id = msg.id,
                     "received FETCH_CANCEL for unsupported FETCH — ignoring"
                 );
@@ -534,6 +635,7 @@ impl Publisher {
     fn send_not_supported(&mut self, request_id: u64, request_kind: &str) {
         tracing::debug!(
             target: "moq_transport::control",
+            session_id = %self.session_id,
             request_id,
             "sending REQUEST_ERROR NOT_SUPPORTED for unimplemented request"
         );
@@ -576,6 +678,7 @@ impl Publisher {
         } else {
             tracing::debug!(
                 target: "moq_transport::control",
+                session_id = %self.session_id,
                 request_id = msg.id,
                 "received PUBLISH_OK for unknown PUBLISH — ignoring"
             );
@@ -878,7 +981,7 @@ impl Publisher {
 
     pub(super) fn drop_subscribe(&mut self, id: u64) {
         if let Err(err) = self.remove_subscribe(id) {
-            tracing::error!(request_id = id, error = %err, "failed to drop subscribe state");
+            tracing::error!(session_id = %self.session_id, request_id = id, error = %err, "failed to drop subscribe state");
         }
     }
 
@@ -941,7 +1044,7 @@ impl Publisher {
 
     fn drop_published(&mut self, id: u64) {
         if let Err(err) = self.remove_published(id) {
-            tracing::error!(request_id = id, error = %err, "failed to drop published state");
+            tracing::error!(session_id = %self.session_id, request_id = id, error = %err, "failed to drop published state");
         }
     }
 

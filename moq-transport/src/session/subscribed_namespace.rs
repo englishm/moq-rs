@@ -266,6 +266,7 @@ impl SubscribedNamespaceRecv {
                         }
                         Err(err) => {
                             tracing::debug!(
+                                session_id = %writer.session_id(),
                                 request_id = self.request_id,
                                 error = %err,
                                 "SUBSCRIBE_NAMESPACE request stream closed with error"
@@ -289,6 +290,25 @@ impl SubscribedNamespaceRecv {
         msg: Message,
     ) -> Result<bool, SessionError> {
         self.emit_mlog(mlog, &msg);
+        // This stream bypasses Session::log_control_message, so without this
+        // a REQUEST_ERROR sent here would reach the peer with no log record at
+        // all — nothing to correlate against the id the client is quoting.
+        if let Message::RequestError(ref m) = msg {
+            tracing::debug!(
+                target: "moq_transport::control",
+                session_id = %writer.session_id(),
+                direction = "sent",
+                msg_type = "REQUEST_ERROR",
+                request_id = m.id,
+                error_code = m.error_code,
+                // The reason is peer-supplied (up to 1024 bytes, arbitrary UTF-8).
+                // Log a sanitized form (control chars → '?') and the raw hex so
+                // analysts can reconstruct the exact bytes without log-injection risk.
+                reason_lossy = ?super::SanitizedDisplay(&m.reason.0).to_string(),
+                reason_hex = %super::HexDisplay(&m.reason.0),
+                "MoQT control message"
+            );
+        }
         match writer.encode(&msg).await {
             Ok(()) => Ok(true),
             Err(err) if err.is_stream_error() => Ok(false),

@@ -27,13 +27,19 @@ fn namespace_fields_byte_len(fields: &[TupleField]) -> usize {
     fields.iter().map(|f| f.value.len()).sum()
 }
 
-fn namespace_path(fields: &[TupleField]) -> String {
-    let mut path = String::new();
+/// Stream a `/`-separated namespace path straight into a formatter.
+///
+/// Writing through the formatter keeps `Display` allocation-free, which matters
+/// because namespaces are used as `tracing` fields on hot relay paths: with `%ns`
+/// the path is only rendered when the subscriber actually records the event, and
+/// even then nothing is allocated. `String::from_utf8_lossy` borrows for valid
+/// UTF-8, so only genuinely invalid fields allocate a replacement string.
+fn write_namespace_path(fields: &[TupleField], f: &mut fmt::Formatter<'_>) -> fmt::Result {
     for field in fields {
-        path.push('/');
-        path.push_str(&String::from_utf8_lossy(&field.value));
+        f.write_str("/")?;
+        f.write_str(&String::from_utf8_lossy(&field.value))?;
     }
-    path
+    Ok(())
 }
 
 fn decode_namespace_fields<R: bytes::Buf>(
@@ -268,8 +274,12 @@ impl TrackNamespace {
         ns
     }
 
+    /// Render as a `/`-separated UTF-8 path.
+    ///
+    /// Allocates. Prefer the [`fmt::Display`] impl (e.g. `%namespace` in a
+    /// `tracing` field) when a `String` is not actually needed.
     pub fn to_utf8_path(&self) -> String {
-        namespace_path(&self.fields)
+        self.to_string()
     }
 
     /// Sum of all field lengths. Used for full-track-name limit calculation.
@@ -332,7 +342,7 @@ impl fmt::Debug for TrackNamespace {
 
 impl fmt::Display for TrackNamespace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{0}", namespace_path(&self.fields))
+        write_namespace_path(&self.fields, f)
     }
 }
 
@@ -417,8 +427,12 @@ impl TrackNamespacePrefix {
         prefix
     }
 
+    /// Render as a `/`-separated UTF-8 path.
+    ///
+    /// Allocates. Prefer the [`fmt::Display`] impl (e.g. `%prefix` in a
+    /// `tracing` field) when a `String` is not actually needed.
     pub fn to_utf8_path(&self) -> String {
-        namespace_path(&self.fields)
+        self.to_string()
     }
 
     /// Return true when this prefix matches the beginning of `namespace`.
@@ -479,7 +493,7 @@ impl fmt::Debug for TrackNamespacePrefix {
 
 impl fmt::Display for TrackNamespacePrefix {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{0}", namespace_path(&self.fields))
+        write_namespace_path(&self.fields, f)
     }
 }
 
@@ -889,6 +903,50 @@ mod tests {
             err,
             TrackNamespaceError::NamespaceTooLarge(4097, MAX_FULL_TRACK_NAME_LEN)
         ));
+    }
+
+    // ── Display / to_utf8_path equivalence ────────────────────────────────────
+
+    /// `to_utf8_path` delegates to `Display`, which streams into the formatter
+    /// rather than building a `String`. Both must keep producing the same path,
+    /// including for fields that are not valid UTF-8 (rendered lossily).
+    #[test]
+    fn display_matches_to_utf8_path() {
+        let namespace = TrackNamespace::from_utf8_path("example.com/meeting=123");
+        assert_eq!(namespace.to_string(), namespace.to_utf8_path());
+        assert_eq!(namespace.to_utf8_path(), "/example.com/meeting=123");
+
+        let prefix = TrackNamespacePrefix::from_utf8_path("example.com");
+        assert_eq!(prefix.to_string(), prefix.to_utf8_path());
+        assert_eq!(prefix.to_utf8_path(), "/example.com");
+
+        let empty = TrackNamespacePrefix::new();
+        assert_eq!(empty.to_string(), empty.to_utf8_path());
+        assert_eq!(empty.to_utf8_path(), "");
+    }
+
+    #[test]
+    fn display_renders_non_utf8_fields_lossily() {
+        let namespace = TrackNamespace {
+            fields: vec![
+                TupleField { value: vec![0xff] },
+                TupleField::from_utf8("ok"),
+            ],
+        };
+
+        assert_eq!(namespace.to_string(), namespace.to_utf8_path());
+        assert_eq!(namespace.to_utf8_path(), "/\u{fffd}/ok");
+    }
+
+    /// `Debug` is written in terms of `Display`, so it must not regress into
+    /// printing the raw field vector.
+    #[test]
+    fn debug_matches_display() {
+        let namespace = TrackNamespace::from_utf8_path("a/b");
+        assert_eq!(format!("{namespace:?}"), format!("{namespace}"));
+
+        let prefix = TrackNamespacePrefix::from_utf8_path("a/b");
+        assert_eq!(format!("{prefix:?}"), format!("{prefix}"));
     }
 
     // ── full_track_name_len ───────────────────────────────────────────────────

@@ -33,10 +33,62 @@
 //! relay.run().await?;
 //! ```
 
+// Build an explicit root span at the most verbose level enabled for a target.
+macro_rules! enabled_root_span {
+    (target: $target:expr, $name:literal, $($fields:tt)*) => {{
+        if tracing::enabled!(target: $target, tracing::Level::TRACE) {
+            tracing::span!(
+                target: $target,
+                parent: None,
+                tracing::Level::TRACE,
+                $name,
+                $($fields)*
+            )
+        } else if tracing::enabled!(target: $target, tracing::Level::DEBUG) {
+            tracing::span!(
+                target: $target,
+                parent: None,
+                tracing::Level::DEBUG,
+                $name,
+                $($fields)*
+            )
+        } else if tracing::enabled!(target: $target, tracing::Level::INFO) {
+            tracing::span!(
+                target: $target,
+                parent: None,
+                tracing::Level::INFO,
+                $name,
+                $($fields)*
+            )
+        } else if tracing::enabled!(target: $target, tracing::Level::WARN) {
+            tracing::span!(
+                target: $target,
+                parent: None,
+                tracing::Level::WARN,
+                $name,
+                $($fields)*
+            )
+        } else if tracing::enabled!(target: $target, tracing::Level::ERROR) {
+            tracing::span!(
+                target: $target,
+                parent: None,
+                tracing::Level::ERROR,
+                $name,
+                $($fields)*
+            )
+        } else {
+            tracing::Span::none()
+        }
+    }};
+}
+
+pub(crate) use enabled_root_span;
+
 mod api;
 mod consumer;
 mod coordinator;
 mod covering_prefix_set;
+mod interest;
 mod local;
 pub mod metrics;
 mod producer;

@@ -17,7 +17,7 @@ use moq_native_ietf::quic;
 use moq_transport::{
     coding::{KeyValuePairs, TrackNamespace},
     serve::{Track, TrackReaderMode, TrackWriter, Tracks},
-    session::Session,
+    session::{Session, SessionId},
 };
 
 use crate::Args;
@@ -84,11 +84,14 @@ pub async fn test_setup_only(args: &Args) -> Result<TestConnectionIds> {
         let (session, cid, transport) =
             connect(args).await.context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
-        cids.add(cid);
+        cids.add(cid.clone());
 
-        let (session, _publisher, _subscriber) = Session::connect(session, None, transport)
-            .await
-            .context("SETUP exchange failed")?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        let (session, _publisher, _subscriber) =
+            Session::connect_with_session_id(session, SessionId::new(cid), None, transport)
+                .await
+                .context("SETUP exchange failed")?;
 
         tracing::info!("SETUP exchange completed successfully");
         drop(session);
@@ -106,11 +109,14 @@ pub async fn test_publish_namespace_only(args: &Args) -> Result<TestConnectionId
         let (session, cid, transport) =
             connect(args).await.context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
-        cids.add(cid);
+        cids.add(cid.clone());
 
-        let (session, mut publisher, _subscriber) = Session::connect(session, None, transport)
-            .await
-            .context("SETUP exchange failed")?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        let (session, mut publisher, _subscriber) =
+            Session::connect_with_session_id(session, SessionId::new(cid), None, transport)
+                .await
+                .context("SETUP exchange failed")?;
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
         let (_, _, reader) = Tracks::new(namespace.clone()).produce();
@@ -150,11 +156,14 @@ pub async fn test_subscribe_error(args: &Args) -> Result<TestConnectionIds> {
         let (session, cid, transport) =
             connect(args).await.context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
-        cids.add(cid);
+        cids.add(cid.clone());
 
-        let (session, _publisher, mut subscriber) = Session::connect(session, None, transport)
-            .await
-            .context("SETUP exchange failed")?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        let (session, _publisher, mut subscriber) =
+            Session::connect_with_session_id(session, SessionId::new(cid), None, transport)
+                .await
+                .context("SETUP exchange failed")?;
 
         let namespace = TrackNamespace::from_utf8_path("nonexistent/namespace");
         let (mut writer, _, _reader) = Tracks::new(namespace.clone()).produce();
@@ -217,18 +226,32 @@ pub async fn test_publish_namespace_subscribe(args: &Args) -> Result<TestConnect
 
         let (pub_session, pub_cid, pub_transport) =
             connect(args).await.context("publisher failed to connect")?;
-        cids.add(pub_cid);
-        let (pub_session, mut publisher, _) = Session::connect(pub_session, None, pub_transport)
-            .await
-            .context("publisher SETUP failed")?;
+        cids.add(pub_cid.clone());
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        let (pub_session, mut publisher, _) = Session::connect_with_session_id(
+            pub_session,
+            SessionId::new(pub_cid),
+            None,
+            pub_transport,
+        )
+        .await
+        .context("publisher SETUP failed")?;
 
         let (sub_session, sub_cid, sub_transport) = connect(args)
             .await
             .context("subscriber failed to connect")?;
-        cids.add(sub_cid);
-        let (sub_session, _, mut subscriber) = Session::connect(sub_session, None, sub_transport)
-            .await
-            .context("subscriber SETUP failed")?;
+        cids.add(sub_cid.clone());
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        let (sub_session, _, mut subscriber) = Session::connect_with_session_id(
+            sub_session,
+            SessionId::new(sub_cid),
+            None,
+            sub_transport,
+        )
+        .await
+        .context("subscriber SETUP failed")?;
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
 
@@ -287,11 +310,14 @@ pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionId
         let (session, cid, transport) =
             connect(args).await.context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
-        cids.add(cid);
+        cids.add(cid.clone());
 
-        let (session, mut publisher, _subscriber) = Session::connect(session, None, transport)
-            .await
-            .context("SETUP exchange failed")?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        let (session, mut publisher, _subscriber) =
+            Session::connect_with_session_id(session, SessionId::new(cid), None, transport)
+                .await
+                .context("SETUP exchange failed")?;
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
         let (_, _, reader) = Tracks::new(namespace.clone()).produce();
@@ -332,11 +358,14 @@ pub async fn test_publish_track_only(args: &Args) -> Result<TestConnectionIds> {
             .await
             .context("publisher failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
-        cids.add(cid);
+        cids.add(cid.clone());
 
-        let (session, mut publisher, _subscriber) = Session::connect(session, None, transport)
-            .await
-            .context("publisher SETUP failed")?;
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        let (session, mut publisher, _subscriber) =
+            Session::connect_with_session_id(session, SessionId::new(cid), None, transport)
+                .await
+                .context("publisher SETUP failed")?;
 
         let namespace = TrackNamespace::from_utf8_path(PUBLISH_NAMESPACE);
         let (track_writer, track_reader) = Track::new(namespace.clone(), PUBLISH_TRACK).produce();
@@ -385,18 +414,32 @@ pub async fn test_publish_track_subscribe(args: &Args) -> Result<TestConnectionI
         let (pub_session, pub_cid, pub_transport) = connect(args)
             .await
             .context("publisher failed to connect")?;
-        cids.add(pub_cid);
+        cids.add(pub_cid.clone());
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
         let (pub_session, mut publisher, _pub_subscriber) =
-            Session::connect(pub_session, None, pub_transport)
+            Session::connect_with_session_id(
+                pub_session,
+                SessionId::new(pub_cid),
+                None,
+                pub_transport,
+            )
                 .await
                 .context("publisher SETUP failed")?;
 
         let (sub_session, sub_cid, sub_transport) = connect(args)
             .await
             .context("subscriber failed to connect")?;
-        cids.add(sub_cid);
+        cids.add(sub_cid.clone());
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
         let (sub_session, _sub_publisher, mut subscriber) =
-            Session::connect(sub_session, None, sub_transport)
+            Session::connect_with_session_id(
+                sub_session,
+                SessionId::new(sub_cid),
+                None,
+                sub_transport,
+            )
                 .await
                 .context("subscriber SETUP failed")?;
 
@@ -486,10 +529,17 @@ pub async fn test_subscribe_before_publish_namespace(args: &Args) -> Result<Test
         let (sub_session, sub_cid, sub_transport) = connect(args)
             .await
             .context("subscriber failed to connect")?;
-        cids.add(sub_cid);
-        let (sub_session, _, mut subscriber) = Session::connect(sub_session, None, sub_transport)
-            .await
-            .context("subscriber SETUP failed")?;
+        cids.add(sub_cid.clone());
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        let (sub_session, _, mut subscriber) = Session::connect_with_session_id(
+            sub_session,
+            SessionId::new(sub_cid),
+            None,
+            sub_transport,
+        )
+        .await
+        .context("subscriber SETUP failed")?;
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
 
@@ -521,10 +571,17 @@ pub async fn test_subscribe_before_publish_namespace(args: &Args) -> Result<Test
         // Now publisher connects and sends PUBLISH_NAMESPACE.
         let (pub_session, pub_cid, pub_transport) =
             connect(args).await.context("publisher failed to connect")?;
-        cids.add(pub_cid);
-        let (pub_session, mut publisher, _) = Session::connect(pub_session, None, pub_transport)
-            .await
-            .context("publisher SETUP failed")?;
+        cids.add(pub_cid.clone());
+        // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
+        // `connect` accept it and remove `connect_with_session_id`.
+        let (pub_session, mut publisher, _) = Session::connect_with_session_id(
+            pub_session,
+            SessionId::new(pub_cid),
+            None,
+            pub_transport,
+        )
+        .await
+        .context("publisher SETUP failed")?;
 
         let (mut pub_writer, _, pub_reader) = Tracks::new(namespace.clone()).produce();
         let _track_writer = pub_writer.create(TEST_TRACK);

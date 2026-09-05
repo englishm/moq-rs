@@ -229,7 +229,11 @@ fn print_tap_result(test_number: usize, result: &TestResult, verbose: bool) {
 async fn main() -> Result<()> {
     // Initialize tracing with env filter (respects RUST_LOG environment variable)
     // Default to info level, but suppress quinn's verbose output
+    //
+    // Logs go to stderr so they can't corrupt the TAP report this binary
+    // writes to stdout.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
