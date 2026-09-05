@@ -819,6 +819,27 @@ impl Scoreboard {
         }
     }
 
+    /// Relay-transparent metadata: the generator sets a constant priority
+    /// on every subgroup and datagram, so a deviation is a relay rewrite.
+    fn check_priority(&mut self, priority: u8, what: String) {
+        if priority != PRIORITY {
+            self.fail(format!(
+                "{what} carried priority {priority}, expected {PRIORITY}"
+            ));
+        }
+    }
+
+    /// The generator never sets the datagram end-of-group type bit (status
+    /// datagrams carry the marker instead), so a set bit is a relay
+    /// rewrite.
+    fn check_datagram_flags(&mut self, group: u64, object: u64, end_of_group: bool) {
+        if end_of_group {
+            self.fail(format!(
+                "datagram ({group}, {object}) carried an unexpected end-of-group type bit"
+            ));
+        }
+    }
+
     fn check_extensions(&mut self, group: u64, object: u64, extensions: &ExtensionHeaders) {
         let mut expected = 0;
         if let Some(id) = self.params.int_extension_id() {
@@ -1036,6 +1057,10 @@ pub async fn verify(
                     streams_received += 1;
                     let group = subgroup.info.group_id;
                     let subgroup_id = subgroup.info.subgroup_id;
+                    scoreboard.check_priority(
+                        subgroup.info.priority,
+                        format!("subgroup ({group}, {subgroup_id})"),
+                    );
                     loop {
                         match subgroup.next().await {
                             Ok(Some(mut object)) => {
@@ -1073,6 +1098,15 @@ pub async fn verify(
         TrackReaderMode::Datagrams(mut datagrams) => loop {
             match datagrams.read().await {
                 Ok(Some(datagram)) => {
+                    scoreboard.check_priority(
+                        datagram.priority,
+                        format!("datagram ({}, {})", datagram.group_id, datagram.object_id),
+                    );
+                    scoreboard.check_datagram_flags(
+                        datagram.group_id,
+                        datagram.object_id,
+                        datagram.end_of_group,
+                    );
                     if datagram.status == ObjectStatus::NormalObject {
                         scoreboard.record_data(
                             datagram.group_id,
@@ -1971,6 +2005,26 @@ mod tests {
         let sb = full_scoreboard();
         let report = sb.finish(None, false);
         assert!(report.failures.iter().any(|f| f.contains("never arrived")));
+    }
+
+    #[test]
+    fn scoreboard_checks_priority_and_datagram_flags() {
+        let mut sb = full_scoreboard();
+        // Correct values record no failure.
+        sb.check_priority(PRIORITY, "subgroup (0, 0)".to_string());
+        sb.check_datagram_flags(0, 1, false);
+        assert!(sb.failures.is_empty());
+        // A relay rewrite of either is a verification failure.
+        sb.check_priority(64, "subgroup (0, 0)".to_string());
+        sb.check_datagram_flags(0, 1, true);
+        assert!(sb
+            .failures
+            .iter()
+            .any(|f| f.contains("priority 64, expected 128")));
+        assert!(sb
+            .failures
+            .iter()
+            .any(|f| f.contains("end-of-group type bit")));
     }
 
     #[test]
