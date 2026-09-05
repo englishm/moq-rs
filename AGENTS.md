@@ -4,6 +4,7 @@
 
 - This repository targets MoQT `draft-ietf-moq-transport-18`.
 - Core protocol code lives in `moq-transport`; relay behavior lives in `moq-relay-ietf`.
+- `moq-test-client` is the interop test harness: it runs TAP-emitting scenarios against a relay. The `moq-test-*` scenarios implement the moq-test protocol (draft-afrind-moq-test) as self-publishing scoreboard tests that need no relay-side moq-test support.
 - `moq-relay-ietf` is production critical, so prefer small, tested changes over broad refactors.
 - Avoid breaking public APIs, wire behavior, CLI flags, and operator workflows unless explicitly requested.
 - Do not add `unsafe` code unless there is a clear performance or FFI need and the safety invariant is documented at the call site.
@@ -17,6 +18,9 @@
 - Run `cargo test -p moq-relay-ietf` or `cargo build -p moq-relay-ietf` for relay-only changes.
 - Run `cargo build --workspace` when shared APIs, relay behavior, or test-client behavior changes.
 - Consider `cargo clippy --workspace --all-targets` before larger changes or when review asks for lint coverage.
+- List interop scenarios with `cargo run -p moq-test-client -- --list`.
+- Run a scenario against a local relay with `cargo run -p moq-test-client -- --relay https://localhost:4443 --tls-disable-verify --test moq-test-datagram` (any `--list` name works; omit `--test` to run them all).
+- Run an ad-hoc moq-test tuple with `cargo run -p moq-test-client -- --relay https://localhost:4443 --tls-disable-verify --moq-test-tuple "moq-test-00/0/0/0/2/4/5/64/32/2/1/1/0/-1/-1/0"` (16 `/`-separated fields; blanks select defaults).
 - When tests fail, diagnose from compiler/test output first and keep fixes scoped to the failing behavior.
 
 ## Draft-18 Terminology
