@@ -51,8 +51,10 @@ const PRIORITY: u8 = 128;
 
 /// Rendezvous window requested on SUBSCRIBE so the relay holds the
 /// subscription pending until the publisher appears (subscribe-first
-/// choreography).
-const RENDEZVOUS_TIMEOUT_MS: u64 = 10_000;
+/// choreography). Deliberately half the outer TEST_TIMEOUT (10s): if a
+/// relay never binds the pair, the specific rendezvous TIMEOUT error
+/// surfaces before the generic scenario timeout masks it.
+const RENDEZVOUS_TIMEOUT_MS: u64 = 5_000;
 
 /// Worst-case datagram payload budget; larger datagram-mode objects are a
 /// test-declaration error.
