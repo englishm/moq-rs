@@ -22,6 +22,26 @@
 //! - A data object's size is `size_object_zero` when `object_id ==
 //!   start_object`, otherwise `size_object_rest`.
 //! - Payload is the byte `b't'` repeated.
+//!
+//! ## Verification contract
+//!
+//! The scoreboard checks, per track: the exact `(group, object)` set with
+//! payload length and content; EOG markers iff configured, and only with
+//! `EndOfGroup` status; extension IDs and exact count on every data
+//! object; subgroup mapping and per-stream ordering (no cross-stream
+//! ordering); relay-transparent metadata (constant publisher priority on
+//! every subgroup and datagram; absence of the datagram end-of-group type
+//! bit); and the PUBLISH_DONE terminal signal (TRACK_ENDED status and the
+//! §10.11 Stream Count for the forwarding mode).
+//!
+//! Deliberately not checked: extension *values* (tuple fields 13/14
+//! specify random values, so presence, ID, and exact count are the
+//! contract) and cross-stream/cross-group ordering (MoQ multiplexing
+//! makes it non-deterministic; per-stream order is still asserted).
+//!
+//! FORWARD=0 scenarios invert the contract: no data plane at all — pass
+//! is setup completing, PUBLISH_DONE with Stream Count 0, and zero
+//! objects received.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
