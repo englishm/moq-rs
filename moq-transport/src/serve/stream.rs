@@ -326,7 +326,7 @@ impl StreamGroupReader {
         loop {
             {
                 let state = self.state.lock();
-                if self.index < state.objects.len() {
+                if self.index < state.objects.len() - 1 {
                     self.index += 1;
                     return Ok(Some(state.objects[self.index].clone()));
                 }
