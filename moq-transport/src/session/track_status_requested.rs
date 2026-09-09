@@ -32,7 +32,7 @@ impl TrackStatusRequested {
                 id: self.request_msg.id,
                 error_code,
                 retry_interval: 0,
-                reason: ReasonPhrase(error_message.to_string()),
+                reason: ReasonPhrase::new(error_message),
             },
         );
         Ok(())

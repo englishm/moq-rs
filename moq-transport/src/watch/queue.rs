@@ -10,6 +10,14 @@ pub struct Queue<T> {
     state: State<VecDeque<(T, Option<oneshot::Sender<()>>)>>, // store optional notifier per item
 }
 
+/// The queue was closed before the operation could complete.
+///
+/// A named type rather than `()` so a caller can tell from the signature what
+/// went wrong, and so the reason is not lost when the error is propagated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("queue closed")]
+pub struct QueueClosed;
+
 impl<T> Queue<T> {
     /// Push an item onto the queue. Returns Err(item) if the queue has been closed.
     pub fn push(&mut self, item: T) -> Result<(), T> {
@@ -76,23 +84,23 @@ impl<T> Queue<T> {
     }
 
     /// Push an item and wait until it is popped.
-    /// Returns Ok(()) if the item was successfully popped.
-    /// Returns Err(()) if the queue was closed before the item could be confirmed popped.
-    #[allow(clippy::result_unit_err)]
-    pub async fn push_and_wait_until_popped(&mut self, item: T) -> Result<(), ()> {
+    ///
+    /// Returns [`QueueClosed`] if the queue was closed either before the push
+    /// or while waiting for the item to be taken.
+    pub async fn push_and_wait_until_popped(&mut self, item: T) -> Result<(), QueueClosed> {
         // Create a oneshot channel
         let (tx, rx) = oneshot::channel();
 
         // Push the item along with the sender
         match self.state.lock_mut() {
             Some(mut state) => state.push_back((item, Some(tx))),
-            None => return Err(()), // Queue already closed before push
+            None => return Err(QueueClosed), // Queue already closed before push
         }
 
         // Wait until the item is popped.
         // If we receive Canceled, it means the sender was dropped without sending,
         // which indicates the queue was closed while we were waiting.
-        rx.await.map_err(|_| ())
+        rx.await.map_err(|_| QueueClosed)
     }
 
     /// Split the queue into two handles that share the same underlying state.

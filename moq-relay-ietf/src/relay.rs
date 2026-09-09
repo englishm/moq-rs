@@ -10,6 +10,7 @@ use moq_native_ietf::quic::{self, Endpoint};
 use moq_transport::session::SessionConfig;
 use url::Url;
 
+use crate::auth::{decode_setup_tokens, ScopeAuthorizer, SessionAuth, SESSION_ERROR_UNAUTHORIZED};
 use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
 use crate::{
     metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
@@ -89,6 +90,145 @@ impl RelayConfig {
     }
 }
 
+/// Why a session was refused at setup.
+///
+/// Carries the QUIC application close code and a fixed reason phrase. The
+/// phrase is deliberately coarse: the peer learns that it was refused, not why
+/// validation failed.
+struct SessionRejection {
+    code: u32,
+    reason: &'static str,
+}
+
+/// Authorize an accepted session against its scope's policy.
+///
+/// Returns the session's authorization state, or `None` when the scope has no
+/// policy. Every failure path refuses the session: the relay never proceeds
+/// with a connection it could not positively authorize.
+async fn authorize_session(
+    authorizer: &ScopeAuthorizer,
+    context: &SessionContext,
+    session: &moq_transport::session::Session,
+) -> Result<Option<SessionAuth>, SessionRejection> {
+    // Decode before resolving the scope's policy. Draft-16 §9.2.2.1 makes
+    // rejecting a malformed Token structure, or an alias directive in
+    // CLIENT_SETUP, an unconditional obligation on the receiver -- it is not
+    // predicated on the receiver requiring authorization. Doing this after the
+    // policy lookup would skip both MUSTs for every scope that has no policy,
+    // which is the default.
+    let tokens = match decode_setup_tokens(session.setup_params()) {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            // A wire-format violation, so the close code comes from the draft
+            // rather than being UNAUTHORIZED.
+            tracing::debug!(
+                scope = context.scope(),
+                error = %err,
+                "invalid AUTHORIZATION TOKEN parameter in CLIENT_SETUP"
+            );
+            metrics::counter!(
+                "moq_relay_auth_denied_total",
+                "phase" => "setup",
+                "operation" => "client_setup",
+                "reason" => err.metric_label(),
+            )
+            .increment(1);
+            return Err(SessionRejection {
+                code: err.session_error_code(),
+                reason: err.reason_phrase(),
+            });
+        }
+    };
+
+    let hook = match authorizer.resolve(context.scope()).await {
+        Ok(Some(hook)) => hook,
+        // The scope did not opt in to token authorization.
+        Ok(None) => return Ok(None),
+        Err(err) => {
+            // We could not learn whether this scope requires a token, so we
+            // must not assume it does not.
+            tracing::error!(
+                scope = context.scope(),
+                error = %err,
+                "could not determine the scope's authorization policy"
+            );
+            metrics::counter!("moq_relay_auth_errors_total", "stage" => "scope_config")
+                .increment(1);
+            return Err(SessionRejection {
+                code: SESSION_ERROR_UNAUTHORIZED,
+                reason: "authorization unavailable",
+            });
+        }
+    };
+
+    let decision = hook.on_setup(context, &tokens).await.map_err(|err| {
+        tracing::error!(
+            scope = context.scope(),
+            error = %err,
+            "authorization hook failed during setup"
+        );
+        metrics::counter!("moq_relay_auth_errors_total", "stage" => "setup").increment(1);
+        SessionRejection {
+            code: SESSION_ERROR_UNAUTHORIZED,
+            reason: "authorization unavailable",
+        }
+    })?;
+
+    match decision.into_principal() {
+        Ok(principal) => {
+            tracing::debug!(
+                scope = context.scope(),
+                subject = principal.subject(),
+                "session authorized"
+            );
+            Ok(Some(SessionAuth::new(hook, principal)))
+        }
+        Err(reason) => {
+            tracing::debug!(
+                scope = context.scope(),
+                reason = %reason,
+                "session authorization denied"
+            );
+            metrics::counter!(
+                "moq_relay_auth_denied_total",
+                "phase" => "setup",
+                "operation" => "client_setup",
+                "reason" => reason.label(),
+            )
+            .increment(1);
+            Err(SessionRejection {
+                code: SESSION_ERROR_UNAUTHORIZED,
+                reason: "unauthorized",
+            })
+        }
+    }
+}
+
+/// The scope identity used for this session's coordinator calls and media
+/// lookups.
+///
+/// An unscoped session and one whose `scope_id` is empty are the same thing,
+/// and are normalized to `None` here so that they stay the same thing
+/// everywhere downstream. [`Locals`] already collapses the two into one media
+/// bucket (it keys unscoped sessions under `""`), but [`ScopeAuthorizer`]
+/// caches by `Option<String>`, where `None` and `Some("")` are distinct keys.
+/// Left unnormalized, a coordinator that returned an empty `scope_id` could
+/// have its authorization policy looked up under one key while its media
+/// landed in the other's bucket — an unauthenticated session sharing tracks
+/// with an enforced one.
+///
+/// Not reachable through the in-tree coordinators, whose `scope_id` comes from
+/// a connection path that [`Session::normalize_connection_path`] never yields
+/// empty. It is reachable through a custom [`Coordinator`], which is reason
+/// enough to close it here rather than rely on every implementation not to.
+///
+/// [`Session::normalize_connection_path`]: moq_transport::session::Session::normalize_connection_path
+fn normalize_scope_id(scope_info: Option<&crate::ScopeInfo>) -> Option<String> {
+    scope_info
+        .map(|info| info.scope_id.clone())
+        .filter(|scope_id| !scope_id.is_empty())
+}
+
 /// MoQ Relay server.
 pub struct Relay {
     config: RelayConfig,
@@ -96,6 +236,10 @@ pub struct Relay {
     remotes: RemoteManager,
     upstream_namespaces: UpstreamNamespaces,
     upstream_namespaces_runner: UpstreamNamespacesRunner,
+
+    /// Per-scope authorization policy, resolved from the coordinator and
+    /// cached. Shared by every connection task.
+    authorizer: Arc<ScopeAuthorizer>,
 }
 
 impl Relay {
@@ -161,12 +305,15 @@ impl Relay {
         let (upstream_namespaces, upstream_namespaces_runner) =
             UpstreamNamespaces::new(locals.clone(), remotes.clone(), config.coordinator.clone());
 
+        let authorizer = Arc::new(ScopeAuthorizer::new(config.coordinator.clone()));
+
         Ok(Self {
             config,
             locals,
             remotes,
             upstream_namespaces,
             upstream_namespaces_runner,
+            authorizer,
         })
     }
 
@@ -178,6 +325,7 @@ impl Relay {
             remotes,
             upstream_namespaces,
             upstream_namespaces_runner,
+            authorizer,
         } = self;
 
         let RelayConfig {
@@ -244,8 +392,43 @@ impl Relay {
                 // Multi-scope forwarding (routing different incoming scopes to different
                 // upstream paths) would require per-scope forward connections.
                 let forward_scope = session.connection_path().map(|s| s.to_string());
-                let forward_context =
-                    SessionContext::internal(forward_scope, Some(RelayInfo::new(url.clone())));
+                // The forward link is bidirectional: the upstream can publish
+                // and subscribe back into this scope over it. Token
+                // authorization is not applied — the relay has no credential
+                // of its own to present, and the upstream is operator-chosen —
+                // so if the scope does require tokens, say so loudly rather
+                // than leaving an unauthenticated path into it undocumented at
+                // runtime.
+                match coordinator.get_scope_config(forward_scope.as_deref()).await {
+                    Ok(config) if config.auth.is_some() => {
+                        tracing::warn!(
+                            url = %url,
+                            scope = forward_scope.as_deref(),
+                            "--announce targets a scope that requires token authorization, but \
+                             the forward link is not authorized: the upstream relay can publish \
+                             and subscribe in this scope without presenting a token. Ensure the \
+                             announce target is trusted and reachable only over a trusted path."
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        // Not fatal — the link is operator-configured either
+                        // way — but the warning above is the only signal that
+                        // this path exists, so its absence must not be silent.
+                        tracing::warn!(
+                            url = %url,
+                            scope = forward_scope.as_deref(),
+                            error = %err,
+                            "could not determine whether the --announce target's scope requires \
+                             token authorization; the forward link is unauthorized regardless"
+                        );
+                    }
+                }
+
+                let forward_context = SessionContext::internal(
+                    forward_scope,
+                    Some(RelayInfo::new(url.clone())),
+                );
 
                 let forward_coordinator = coordinator.clone();
                 let session = Session {
@@ -256,6 +439,8 @@ impl Relay {
                         remote_manager.clone(),
                         upstream_namespaces.clone(),
                         forward_context.clone(),
+                        // Operator-configured peer; see the warning above.
+                        None,
                     )),
                     consumer: Some(Consumer::new(
                         subscriber,
@@ -264,6 +449,7 @@ impl Relay {
                         remote_manager.clone(),
                         None,
                         forward_context.clone(),
+                        None,
                     )),
                     // Forward connections are always full read-write relay peers,
                     // so no reject loops needed.
@@ -346,6 +532,7 @@ impl Relay {
                         let coordinator = coordinator.clone();
                         let upstream_namespaces = upstream_namespaces.clone();
                         let connection_tagger = connection_tagger.clone();
+                        let authorizer = authorizer.clone();
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
@@ -419,7 +606,7 @@ impl Relay {
                             // connection is treated as a public client. For connections
                             // classified internal, the peer relay identity is derived from
                             // the inbound socket address (see RelayInfo::from_socket_addr).
-                            let scope = scope_info.as_ref().map(|info| info.scope_id.clone());
+                            let scope = normalize_scope_id(scope_info.as_ref());
                             let context = match connection_tagger.as_ref() {
                                 Some(tagger) => {
                                     let meta = ConnectionMeta::new(
@@ -487,6 +674,35 @@ impl Relay {
                                 );
                             }
 
+                            // Authorize the session, if this scope requires it.
+                            //
+                            // resolve_scope() established *which* scope this
+                            // connection belongs to and its coarse permissions;
+                            // this establishes *who* the peer is, from the
+                            // AUTHORIZATION TOKEN in CLIENT_SETUP. It runs
+                            // before either session half is built so that an
+                            // unauthorized peer never gets one.
+                            let session_auth = match authorize_session(
+                                &authorizer,
+                                &context,
+                                &moq_session,
+                            ).await {
+                                Ok(auth) => auth,
+                                Err(rejection) => {
+                                    tracing::info!(
+                                        connection_path = moq_session.connection_path(),
+                                        scope = context.scope(),
+                                        code = rejection.code,
+                                        reason = rejection.reason,
+                                        "session authorization failed, closing"
+                                    );
+                                    raw_conn.close(rejection.code, rejection.reason);
+                                    metrics::counter!("moq_relay_connection_errors_total", "stage" => "auth_setup").increment(1);
+                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                    return Ok(());
+                                }
+                            };
+
                             // Gate Producer/Consumer creation on permissions.
                             // Note the intentional inversion:
                             // - Producer serves SUBSCRIBEs → gated on can_subscribe
@@ -496,13 +712,13 @@ impl Relay {
                             // to the Session's reject fields so unauthorized messages get
                             // an explicit error response instead of being silently ignored.
                             let (producer, reject_subscribes) = if can_subscribe {
-                                (publisher.map(|publisher| Producer::new_with_upstream_namespaces(publisher, locals.clone(), remotes.clone(), upstream_namespaces, context.clone())), None)
+                                (publisher.map(|publisher| Producer::new_with_upstream_namespaces(publisher, locals.clone(), remotes.clone(), upstream_namespaces, context.clone(), session_auth.clone())), None)
                             } else {
                                 (None, publisher)
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context.clone())), None)
+                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context.clone(), session_auth)), None)
                             } else {
                                 (None, subscriber)
                             };
@@ -544,5 +760,66 @@ impl Relay {
 
         remotes.shutdown().await;
         run_result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::{ScopeInfo, ScopePermissions};
+
+    fn scope_info(scope_id: &str) -> ScopeInfo {
+        ScopeInfo {
+            scope_id: scope_id.to_string(),
+            permissions: ScopePermissions::ReadWrite,
+        }
+    }
+
+    #[test]
+    fn a_named_scope_is_preserved() {
+        assert_eq!(
+            normalize_scope_id(Some(&scope_info("tenant"))),
+            Some("tenant".to_string())
+        );
+        // Including shapes that merely look empty.
+        assert_eq!(
+            normalize_scope_id(Some(&scope_info("/"))),
+            Some("/".to_string())
+        );
+        assert_eq!(
+            normalize_scope_id(Some(&scope_info(" "))),
+            Some(" ".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unscoped_session_stays_unscoped() {
+        assert_eq!(normalize_scope_id(None), None);
+    }
+
+    /// The case this exists for: `Some("")` and `None` must not be distinct
+    /// keys, or a scope's authorization policy and its media could be looked
+    /// up under different ones.
+    #[test]
+    fn an_empty_scope_id_is_normalized_to_unscoped() {
+        assert_eq!(normalize_scope_id(Some(&scope_info(""))), None);
+        assert_eq!(
+            normalize_scope_id(Some(&scope_info(""))),
+            normalize_scope_id(None),
+            "an empty scope id and no scope must agree"
+        );
+    }
+
+    /// `Locals` keys unscoped media under `""`, so normalizing to `None` here
+    /// is what keeps the authorization key and the media key in agreement.
+    #[test]
+    fn normalization_agrees_with_the_locals_bucket() {
+        let normalized = normalize_scope_id(Some(&scope_info("")));
+        assert_eq!(normalized.as_deref().unwrap_or(""), "");
+        assert_eq!(
+            normalize_scope_id(None).as_deref().unwrap_or(""),
+            normalized.as_deref().unwrap_or(""),
+        );
     }
 }

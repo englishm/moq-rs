@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use moq_native_ietf::quic;
@@ -206,6 +207,174 @@ pub struct ScopeConfig {
     /// Future: A `rendezvous_timeout` field may be added to control how long
     /// the relay waits for a publisher before giving up.
     pub lingering_subscribe: bool,
+
+    /// Token authorization policy for this scope.
+    ///
+    /// `None` — token authorization is not enforced. Admission rests on
+    /// [`ScopeInfo::permissions`] alone, which is the behaviour of every relay
+    /// whose coordinator does not populate this field.
+    ///
+    /// `Some` — enforced. Sessions in this scope must present a valid
+    /// AUTHORIZATION TOKEN in CLIENT_SETUP, and every subsequent request is
+    /// checked against the token's claims. The relay fails closed on anything
+    /// it cannot positively authorize, including a configuration it cannot
+    /// parse and a relay binary built without the corresponding feature.
+    pub auth: Option<ScopeAuthConfig>,
+}
+
+/// Maximum number of signing keys a scope may advertise.
+///
+/// Bounds the worst-case number of signature verifications performed when a
+/// token carries no key identifier and every configured key must be tried.
+/// Verification happens once per session at setup, not per request.
+pub const MAX_SCOPE_AUTH_KEYS: usize = 5;
+
+/// Token authorization policy for a scope.
+///
+/// Returned inside [`ScopeConfig::auth`]. The relay converts this into an
+/// authorization hook once per scope and caches it for [`ttl`](Self::ttl).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ScopeAuthConfig {
+    /// Public keys accepted for token signature verification, most recently
+    /// issued first so that the common case during a rotation overlap costs a
+    /// single verification.
+    ///
+    /// Must contain between 1 and [`MAX_SCOPE_AUTH_KEYS`] keys. An empty or
+    /// oversized list is a configuration error and the scope fails closed.
+    pub keys: Vec<AuthPublicKey>,
+
+    /// Accepted token issuers (`iss`). An empty list accepts any issuer.
+    pub issuers: Vec<String>,
+
+    /// Accepted token audiences (`aud`). An empty list accepts any audience.
+    pub audiences: Vec<String>,
+
+    /// Tolerance applied when checking `exp` and `nbf`.
+    pub clock_skew: Duration,
+
+    /// How long the relay may reuse this configuration before re-fetching it.
+    ///
+    /// Bounds the propagation delay of a key rotation or revocation. A zero
+    /// TTL is replaced with [`DEFAULT_SCOPE_AUTH_TTL`] rather than causing a
+    /// coordinator round-trip on every connection.
+    pub ttl: Duration,
+}
+
+/// TTL applied when [`ScopeAuthConfig::ttl`] is zero.
+pub const DEFAULT_SCOPE_AUTH_TTL: Duration = Duration::from_secs(300);
+
+/// Default clock skew applied when [`ScopeAuthConfig::clock_skew`] is zero.
+pub const DEFAULT_SCOPE_AUTH_CLOCK_SKEW: Duration = Duration::from_secs(60);
+
+impl ScopeAuthConfig {
+    /// Create a configuration from a set of keys, with default skew and TTL.
+    pub fn new(keys: Vec<AuthPublicKey>) -> Self {
+        Self {
+            keys,
+            issuers: Vec::new(),
+            audiences: Vec::new(),
+            clock_skew: DEFAULT_SCOPE_AUTH_CLOCK_SKEW,
+            ttl: DEFAULT_SCOPE_AUTH_TTL,
+        }
+    }
+
+    /// Restrict accepted issuers (`iss`).
+    pub fn with_issuers(mut self, issuers: Vec<String>) -> Self {
+        self.issuers = issuers;
+        self
+    }
+
+    /// Restrict accepted audiences (`aud`).
+    pub fn with_audiences(mut self, audiences: Vec<String>) -> Self {
+        self.audiences = audiences;
+        self
+    }
+
+    /// Set the clock skew tolerance for `exp` and `nbf`.
+    pub fn with_clock_skew(mut self, clock_skew: Duration) -> Self {
+        self.clock_skew = clock_skew;
+        self
+    }
+
+    /// Set how long the relay may cache this configuration.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// The effective cache TTL, substituting the default for zero.
+    pub fn effective_ttl(&self) -> Duration {
+        if self.ttl.is_zero() {
+            DEFAULT_SCOPE_AUTH_TTL
+        } else {
+            self.ttl
+        }
+    }
+
+    /// The effective clock skew, substituting the default for zero.
+    pub fn effective_clock_skew(&self) -> Duration {
+        if self.clock_skew.is_zero() {
+            DEFAULT_SCOPE_AUTH_CLOCK_SKEW
+        } else {
+            self.clock_skew
+        }
+    }
+}
+
+/// A public key a scope accepts for token signature verification.
+///
+/// The key is carried as PEM text rather than a parsed key type so that
+/// [`ScopeConfig`] stays free of cryptography dependencies: its shape is
+/// identical whether or not the relay was built with token support, and
+/// coordinators that speak JSON can carry it without a custom encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AuthPublicKey {
+    /// Key identifier, matched against the token's `kid` header.
+    ///
+    /// This is an **ordering hint, not a filter**. A token naming this key has
+    /// it tried first; every other configured key is still tried afterwards,
+    /// and a token naming a key the scope does not have falls back to trying
+    /// them all. The signature decides authenticity, and `kid` arrives
+    /// unauthenticated, so letting a mismatch reject a token would hand an
+    /// attacker-controlled label a say in the outcome — and would turn an
+    /// issuer relabelling its tokens, or one typo here, into an outage.
+    ///
+    /// Setting it is therefore an optimisation: it saves verifications during
+    /// a key rotation, and costs nothing if it is wrong.
+    pub kid: Option<String>,
+
+    /// The signature algorithm this key verifies.
+    pub algorithm: AuthKeyAlgorithm,
+
+    /// PEM-encoded SubjectPublicKeyInfo (`-----BEGIN PUBLIC KEY-----`).
+    pub pem: String,
+}
+
+impl AuthPublicKey {
+    /// Create an ES256 key from PEM-encoded SubjectPublicKeyInfo.
+    pub fn es256(pem: impl Into<String>) -> Self {
+        Self {
+            kid: None,
+            algorithm: AuthKeyAlgorithm::Es256,
+            pem: pem.into(),
+        }
+    }
+
+    /// Attach a key identifier, enabling `kid`-based key selection.
+    pub fn with_kid(mut self, kid: impl Into<String>) -> Self {
+        self.kid = Some(kid.into());
+        self
+    }
+}
+
+/// Signature algorithm of an [`AuthPublicKey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AuthKeyAlgorithm {
+    /// ECDSA using P-256 and SHA-256 (COSE algorithm -7).
+    Es256,
 }
 
 /// Result of subscribing to a namespace prefix via SUBSCRIBE_NAMESPACE.
@@ -599,18 +768,31 @@ pub trait Coordinator: Send + Sync {
     /// Get configuration for a resolved scope.
     ///
     /// Called after [`resolve_scope()`] to retrieve operational parameters
-    /// for the scope, such as origin fallback URLs and lingering subscriber
-    /// settings.
+    /// for the scope, such as origin fallback URLs, lingering subscriber
+    /// settings, and the token authorization policy.
     ///
     /// # Arguments
     ///
     /// * `scope` - The resolved scope identity from [`resolve_scope()`],
     ///   or `None` for unscoped sessions.
     ///
+    /// # Authorization
+    ///
+    /// [`ScopeConfig::auth`] carries the scope's token authorization policy,
+    /// including the public keys used to verify AUTHORIZATION TOKEN signatures.
+    /// Returning `None` (the default) leaves token authorization disabled for
+    /// the scope; returning `Some` enables it and makes the relay fail closed
+    /// on anything it cannot positively authorize.
+    ///
+    /// The relay caches the returned configuration per scope for
+    /// [`ScopeAuthConfig::ttl`], so this method is not called per connection.
+    /// Key rotation therefore takes effect for new sessions within one TTL;
+    /// sessions already established keep the keys they were admitted with.
+    ///
     /// # Default Implementation
     ///
     /// Returns default configuration (no origin fallback, lingering subscribe
-    /// disabled).
+    /// disabled, token authorization disabled).
     ///
     /// [`resolve_scope()`]: Coordinator::resolve_scope
     async fn get_scope_config(&self, _scope: Option<&str>) -> CoordinatorResult<ScopeConfig> {
@@ -1546,6 +1728,7 @@ mod tests {
         let config = ScopeConfig {
             origin_fallback: Some(Url::parse("https://origin.example.com").unwrap()),
             lingering_subscribe: true,
+            ..Default::default()
         };
         assert_eq!(
             config.origin_fallback.unwrap().as_str(),
@@ -1672,6 +1855,7 @@ mod tests {
             ScopeConfig {
                 origin_fallback: Some(Url::parse("https://ingest.example.com/origin").unwrap()),
                 lingering_subscribe: true,
+                ..Default::default()
             },
         );
 
