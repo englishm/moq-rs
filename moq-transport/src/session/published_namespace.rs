@@ -29,6 +29,12 @@ pub struct PublishedNamespace {
 
     ok: bool,
     error: Option<ServeError>,
+
+    /// REQUEST_ERROR code to send on drop when the publish was never accepted.
+    /// `None` falls back to UNINTERESTED, the default for a relay that simply
+    /// declined the namespace. Set by [`reject`](Self::reject) so callers can
+    /// state a specific reason such as UNAUTHORIZED.
+    error_code: Option<u64>,
 }
 
 impl PublishedNamespace {
@@ -48,6 +54,7 @@ impl PublishedNamespace {
             info,
             ok: false,
             error: None,
+            error_code: None,
             state: send,
         };
         let recv = PublishedNamespaceRecv {
@@ -91,8 +98,34 @@ impl PublishedNamespace {
     }
 
     /// Reject the PUBLISH_NAMESPACE; the error is sent on drop.
+    ///
+    /// The REQUEST_ERROR carries UNINTERESTED. Use [`reject`](Self::reject) to
+    /// send a specific error code such as UNAUTHORIZED.
     pub fn close(mut self, err: ServeError) -> Result<(), ServeError> {
         self.error = Some(err);
+        Ok(())
+    }
+
+    /// Reject the PUBLISH_NAMESPACE with an explicit REQUEST_ERROR code
+    /// (draft-16 §9.8); the error is sent on drop.
+    ///
+    /// Mirrors [`SubscribedNamespace::reject`], letting a caller distinguish
+    /// "not interested" from "not permitted". Once the publish has been
+    /// accepted with [`ok`](Self::ok) the code is ignored: acceptance is
+    /// revoked with PUBLISH_NAMESPACE_CANCEL, which carries the error code
+    /// derived from `reason` instead.
+    ///
+    /// [`SubscribedNamespace::reject`]: super::SubscribedNamespace::reject
+    pub fn reject(mut self, error_code: u64, reason: &str) -> Result<(), ServeError> {
+        self.error = Some(ServeError::Closed(error_code));
+        self.error_code = Some(error_code);
+        tracing::debug!(
+            namespace = %self.info.namespace,
+            request_id = self.info.request_id,
+            error_code,
+            reason,
+            "rejecting PUBLISH_NAMESPACE"
+        );
         Ok(())
     }
 }
@@ -127,7 +160,9 @@ impl Drop for PublishedNamespace {
                 "publish_namespace",
                 message::RequestError {
                     id: self.info.request_id,
-                    error_code: RequestErrorCode::Uninterested as u64,
+                    error_code: self
+                        .error_code
+                        .unwrap_or(RequestErrorCode::Uninterested as u64),
                     retry_interval: 0,
                     reason: ReasonPhrase(err.to_string()),
                 },
