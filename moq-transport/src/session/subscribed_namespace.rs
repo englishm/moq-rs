@@ -379,7 +379,7 @@ fn request_error(id: u64, error_code: u64, reason: &str) -> Message {
         id,
         error_code,
         retry_interval: 0,
-        reason: ReasonPhrase(reason.to_string()),
+        reason: ReasonPhrase::new(reason),
     }
     .into()
 }

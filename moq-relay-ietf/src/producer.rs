@@ -2,22 +2,21 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    coding::{KeyValuePairs, TrackNamespace},
+    coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
     message::SubscribeOptions,
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{Publisher, SessionError, Subscribed, SubscribedNamespace, TrackStatusRequested},
 };
 use tokio::sync::broadcast;
 
+use crate::auth::{authorize, AuthzOperation, DenyReason, SessionAuth};
 use crate::{
     metrics::{GaugeGuard, TimingGuard},
     upstream_namespaces::UpstreamNamespaces,
-    Coordinator, Locals, NamespaceChange, RemoteManager, SessionContext, TrackChange,
-    UpstreamReady,
+    Locals, NamespaceChange, RemoteManager, SessionContext, TrackChange, UpstreamReady,
 };
 
 /// Producer of tracks to a remote Subscriber
@@ -29,6 +28,9 @@ pub struct Producer {
     upstream_namespaces: UpstreamNamespaces,
     /// Relay-level context for this MoQT session.
     context: SessionContext,
+    /// Authorization state for this session. `None` when the scope has no
+    /// authorization policy, in which case every request is permitted.
+    auth: Option<SessionAuth>,
 }
 
 /// Why the wait for upstream readiness ended without the subscription being
@@ -48,25 +50,21 @@ enum UpstreamWait {
 }
 
 impl Producer {
-    pub fn new(
-        publisher: Publisher,
-        locals: Locals,
-        remotes: RemoteManager,
-        coordinator: Arc<dyn Coordinator>,
-        context: SessionContext,
-    ) -> Self {
-        let (upstream_namespaces, runner) =
-            UpstreamNamespaces::new(locals.clone(), remotes.clone(), coordinator);
-        tokio::spawn(runner.run());
-        Self::new_with_upstream_namespaces(publisher, locals, remotes, upstream_namespaces, context)
-    }
-
+    /// Create a producer for a session.
+    ///
+    /// `auth` is the session's authorization state, and is deliberately a
+    /// required argument rather than something attached afterwards: a producer
+    /// with no authorization serves every request, so forgetting to supply it
+    /// must be a compile error rather than a silent grant. `None` states that
+    /// the session needs no authorization — its scope has no policy, or the
+    /// relay dialled the peer itself.
     pub(crate) fn new_with_upstream_namespaces(
         publisher: Publisher,
         locals: Locals,
         remotes: RemoteManager,
         upstream_namespaces: UpstreamNamespaces,
         context: SessionContext,
+        auth: Option<SessionAuth>,
     ) -> Self {
         Self {
             publisher,
@@ -74,6 +72,7 @@ impl Producer {
             remotes,
             upstream_namespaces,
             context,
+            auth,
         }
     }
 
@@ -166,6 +165,26 @@ impl Producer {
 
         let namespace = subscribed.track_namespace.clone();
         let track_name = subscribed.track_name.clone();
+
+        // Authorize before any lookup: deciding after would let response
+        // timing reveal whether a track the peer may not access exists.
+        if let Err(reason) = authorize(
+            self.auth.as_ref(),
+            &self.context,
+            AuthzOperation::Subscribe {
+                namespace: &namespace,
+                track: &track_name,
+            },
+            Some(subscribed.id),
+        )
+        .await
+        {
+            metrics::counter!("moq_relay_subscribe_errors_total", "phase" => "auth").increment(1);
+            timing_guard.set_label("source", "unauthorized");
+            let err = ServeError::Closed(reason.request_error_code());
+            subscribed.close(err.clone())?;
+            return Err(err.into());
+        }
 
         // Local lookup order inside Locals:
         // 1. actual FullTrackName -> TrackReader media cache
@@ -293,6 +312,24 @@ impl Producer {
         self,
         mut subscribed_namespace: SubscribedNamespace,
     ) -> Result<(), anyhow::Error> {
+        // Authorize before taking the upstream lease: an unauthorized prefix
+        // must not cause the relay to open upstream subscriptions.
+        if let Err(reason) = authorize(
+            self.auth.as_ref(),
+            &self.context,
+            AuthzOperation::SubscribeNamespace {
+                prefix: &subscribed_namespace.namespace_prefix,
+            },
+            Some(subscribed_namespace.info.request_id),
+        )
+        .await
+        {
+            metrics::counter!("moq_relay_subscribe_namespace_errors_total", "phase" => "auth")
+                .increment(1);
+            subscribed_namespace.reject(reason.request_error_code(), "unauthorized")?;
+            return Err(anyhow::anyhow!("unauthorized subscribe_namespace"));
+        }
+
         let wants_namespace = wants_namespace(subscribed_namespace.subscribe_options);
         let wants_publish = wants_publish(subscribed_namespace.subscribe_options);
         let namespace_changes = self.locals.subscribe_namespace_changes();
@@ -324,7 +361,8 @@ impl Producer {
         let mut known_namespaces = HashSet::new();
 
         if wants_namespace {
-            self.send_namespace_snapshot(&mut subscribed_namespace, &mut known_namespaces)?;
+            self.send_namespace_snapshot(&mut subscribed_namespace, &mut known_namespaces)
+                .await?;
         }
 
         let mut known_tracks = HashSet::new();
@@ -372,7 +410,7 @@ impl Producer {
                 change = namespace_changes.recv(), if wants_namespace => {
                     match change {
                         Ok(change) => {
-                            self.apply_namespace_change(&mut subscribed_namespace, &mut known_namespaces, change)?;
+                            self.apply_namespace_change(&mut subscribed_namespace, &mut known_namespaces, change).await?;
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             // Recoverable: a full resync reconstructs the state the
@@ -381,7 +419,7 @@ impl Producer {
                             // visible before it shows up as latency.
                             metrics::counter!("moq_relay_change_channel_lagged_total", "channel" => "namespace")
                                 .increment(skipped);
-                            self.resync_namespaces(&mut subscribed_namespace, &mut known_namespaces)?;
+                            self.resync_namespaces(&mut subscribed_namespace, &mut known_namespaces).await?;
                         }
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     }
@@ -404,7 +442,12 @@ impl Producer {
         }
     }
 
-    fn send_namespace_snapshot(
+    /// Whether the peer may be told that `namespace` exists.
+    async fn may_announce(&self, namespace: &TrackNamespace) -> bool {
+        may_announce_namespace(self.auth.as_ref(), &self.context, namespace).await
+    }
+
+    async fn send_namespace_snapshot(
         &self,
         subscribed_namespace: &mut SubscribedNamespace,
         known: &mut HashSet<TrackNamespace>,
@@ -413,6 +456,9 @@ impl Producer {
             .locals
             .list_namespaces_matching(self.context.scope(), &subscribed_namespace.namespace_prefix)
         {
+            if !self.may_announce(&namespace).await {
+                continue;
+            }
             if known.insert(namespace.clone()) {
                 subscribed_namespace.namespace(&namespace)?;
             }
@@ -421,7 +467,7 @@ impl Producer {
         Ok(())
     }
 
-    fn apply_namespace_change(
+    async fn apply_namespace_change(
         &self,
         subscribed_namespace: &mut SubscribedNamespace,
         known: &mut HashSet<TrackNamespace>,
@@ -439,6 +485,9 @@ impl Producer {
         }
 
         if change.added {
+            if !self.may_announce(&change.namespace).await {
+                return Ok(());
+            }
             if known.insert(change.namespace.clone()) {
                 subscribed_namespace.namespace(&change.namespace)?;
             }
@@ -449,16 +498,20 @@ impl Producer {
         Ok(())
     }
 
-    fn resync_namespaces(
+    async fn resync_namespaces(
         &self,
         subscribed_namespace: &mut SubscribedNamespace,
         known: &mut HashSet<TrackNamespace>,
     ) -> Result<(), ServeError> {
-        let current: HashSet<_> = self
+        let mut current = HashSet::new();
+        for namespace in self
             .locals
             .list_namespaces_matching(self.context.scope(), &subscribed_namespace.namespace_prefix)
-            .into_iter()
-            .collect();
+        {
+            if self.may_announce(&namespace).await {
+                current.insert(namespace);
+            }
+        }
 
         for namespace in current.difference(known) {
             subscribed_namespace.namespace(namespace)?;
@@ -555,6 +608,43 @@ impl Producer {
             return Ok(());
         }
 
+        // SUBSCRIBE_NAMESPACE grants discovery of a prefix, not delivery of
+        // everything under it. This path pushes PUBLISH and then streams the
+        // track's objects, so it needs the same authorization a SUBSCRIBE for
+        // that track would: a token scoped to a prefix for discovery, or to a
+        // subset of track names, must not receive media outside that grant.
+        //
+        // A denial skips the track rather than failing the subscription: the
+        // peer asked for a prefix, not for this track, so the rest of the
+        // prefix is still legitimately theirs.
+        if let Err(reason) = may_serve_track_in_fanout(
+            self.auth.as_ref(),
+            &self.context,
+            &full_name,
+            subscribed_namespace.info.request_id,
+        )
+        .await
+        {
+            tracing::debug!(
+                namespace = %full_name.namespace,
+                track = %full_name.name,
+                reason = %reason,
+                "withholding track from SUBSCRIBE_NAMESPACE fan-out"
+            );
+            metrics::counter!("moq_relay_publish_errors_total", "phase" => "auth_fanout")
+                .increment(1);
+
+            // A policy denial is stable for the session, so record it and stop
+            // re-deciding on every change event. A hook *fault* is not: it says
+            // nothing about this track, so leave it out of `known` and let the
+            // next event retry rather than withholding the track for the life
+            // of the subscription over one transient failure.
+            if reason.is_policy_denial() {
+                known.insert(full_name);
+            }
+            return Ok(());
+        }
+
         let mut params = KeyValuePairs::default();
         if !subscribed_namespace.forward {
             params.set_forward(false);
@@ -605,6 +695,26 @@ impl Producer {
             namespace: track_status_requested.request_msg.track_namespace.clone(),
             name: track_status_requested.request_msg.track_name.clone(),
         };
+
+        // Authorize before the lookup: TRACK_STATUS is an existence oracle, so
+        // answering it for an unauthorized track leaks exactly what the token
+        // scope is meant to hide.
+        if let Err(reason) = authorize(
+            self.auth.as_ref(),
+            &self.context,
+            AuthzOperation::TrackStatus {
+                namespace: &full_name.namespace,
+                track: &full_name.name,
+            },
+            Some(track_status_requested.request_msg.id),
+        )
+        .await
+        {
+            metrics::counter!("moq_relay_track_status_errors_total", "phase" => "auth")
+                .increment(1);
+            track_status_requested.respond_error(reason.request_error_code(), "unauthorized")?;
+            return Err(anyhow::anyhow!("unauthorized track_status"));
+        }
 
         // Check actual local tracks first.
         if let Some(track) = self.locals.retrieve_track(self.context.scope(), &full_name) {
@@ -663,11 +773,249 @@ fn full_name_for_track(track: &TrackReader) -> FullTrackName {
     }
 }
 
+/// Whether a track may be delivered through the SUBSCRIBE_NAMESPACE fan-out.
+///
+/// That path pushes PUBLISH and then streams the track's objects, so it needs
+/// the authorization a SUBSCRIBE for the same track would: a prefix
+/// subscription grants discovery, not delivery of everything beneath it. A
+/// token scoped to a subset of track names must not receive the rest merely
+/// because it subscribed to the enclosing prefix.
+///
+/// A free function so the decision is testable without a live session, which
+/// `Producer` requires: a `Publisher` cannot be constructed outside
+/// `moq-transport`, so the gate could not otherwise be covered at all.
+///
+/// The tests therefore pin this decision and the operation it asks about, but
+/// not that the caller still consults it — removing the call site produces a
+/// dead-code warning rather than a failing test. Closing that would need an
+/// end-to-end session harness.
+async fn may_serve_track_in_fanout(
+    auth: Option<&SessionAuth>,
+    context: &SessionContext,
+    full_name: &FullTrackName,
+    request_id: u64,
+) -> Result<(), DenyReason> {
+    authorize(
+        auth,
+        context,
+        AuthzOperation::Subscribe {
+            namespace: &full_name.namespace,
+            track: &full_name.name,
+        },
+        Some(request_id),
+    )
+    .await
+}
+
+/// Whether the peer may be told that `namespace` exists.
+///
+/// A prefix subscription is not a grant over everything beneath it. The `nil`
+/// terminator makes the distinction concrete: a scope of
+/// `[exact("sports"), nil]` authorizes SUBSCRIBE_NAMESPACE for `sports` while
+/// denying every operation under `sports/football`, so announcing that
+/// namespace would disclose the existence of something the token cannot touch.
+/// The reasoning that gates the media fan-out applies to the metadata too.
+async fn may_announce_namespace(
+    auth: Option<&SessionAuth>,
+    context: &SessionContext,
+    namespace: &TrackNamespace,
+) -> bool {
+    // A concrete namespace viewed as the prefix naming exactly it.
+    let prefix = TrackNamespacePrefix {
+        fields: namespace.fields.clone(),
+    };
+
+    authorize(
+        auth,
+        context,
+        AuthzOperation::SubscribeNamespace { prefix: &prefix },
+        None,
+    )
+    .await
+    .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
     use moq_transport::{serve::ServeError, session::SessionError};
 
-    use super::Producer;
+    use super::*;
+    use crate::auth::{AuthDecision, AuthError, AuthHook, AuthRequest, AuthToken, Principal};
+
+    /// Records every operation it is asked about, and answers from a script.
+    ///
+    /// Lets the fan-out gates be tested for the operation they construct, not
+    /// merely for their yes/no answer: authorizing the wrong thing would be as
+    /// much a bypass as authorizing nothing.
+    struct RecordingHook {
+        seen: Mutex<Vec<String>>,
+        decision: fn() -> Result<AuthDecision, AuthError>,
+    }
+
+    impl RecordingHook {
+        fn new(decision: fn() -> Result<AuthDecision, AuthError>) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                decision,
+            })
+        }
+
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AuthHook for RecordingHook {
+        async fn on_setup(
+            &self,
+            _session: &SessionContext,
+            _tokens: &[AuthToken],
+        ) -> Result<AuthDecision, AuthError> {
+            (self.decision)()
+        }
+
+        async fn on_request(&self, request: &AuthRequest<'_>) -> Result<AuthDecision, AuthError> {
+            let detail = match &request.operation {
+                AuthzOperation::Subscribe { namespace, track } => format!(
+                    "subscribe {} {}",
+                    namespace.to_utf8_path(),
+                    track.to_string_lossy()
+                ),
+                AuthzOperation::SubscribeNamespace { prefix } => {
+                    format!("subscribe_namespace {}", prefix.to_utf8_path())
+                }
+                other => format!("other {}", other.label()),
+            };
+            self.seen.lock().unwrap().push(detail);
+            (self.decision)()
+        }
+    }
+
+    fn allow() -> Result<AuthDecision, AuthError> {
+        Ok(AuthDecision::allow(Principal::anonymous()))
+    }
+
+    fn deny() -> Result<AuthDecision, AuthError> {
+        Ok(AuthDecision::deny(DenyReason::ScopeMismatch))
+    }
+
+    fn fault() -> Result<AuthDecision, AuthError> {
+        Err(AuthError::Backend("backend unavailable".to_string()))
+    }
+
+    fn context() -> SessionContext {
+        SessionContext::public(Some("tenant".to_string()))
+    }
+
+    fn session_auth(hook: Arc<RecordingHook>) -> SessionAuth {
+        SessionAuth::new(hook, Principal::anonymous())
+    }
+
+    fn full_name() -> FullTrackName {
+        FullTrackName {
+            namespace: TrackNamespace::from_utf8_path("sports/football"),
+            name: "premium-4k".into(),
+        }
+    }
+
+    /// The fan-out streams media, so it must ask for SUBSCRIBE on the exact
+    /// track — not for the enclosing prefix, and not nothing at all.
+    #[tokio::test]
+    async fn fanout_authorizes_each_track_as_a_subscribe() {
+        let hook = RecordingHook::new(allow);
+        let auth = session_auth(hook.clone());
+
+        may_serve_track_in_fanout(Some(&auth), &context(), &full_name(), 7)
+            .await
+            .expect("allowed");
+
+        assert_eq!(hook.seen(), vec!["subscribe /sports/football premium-4k"]);
+    }
+
+    #[tokio::test]
+    async fn fanout_withholds_a_track_the_token_does_not_cover() {
+        let hook = RecordingHook::new(deny);
+        let auth = session_auth(hook.clone());
+
+        let result = may_serve_track_in_fanout(Some(&auth), &context(), &full_name(), 7).await;
+
+        assert!(result.is_err(), "a denied track must not be served");
+        assert_eq!(hook.seen().len(), 1, "the decision must actually be sought");
+    }
+
+    /// A hook fault is not a statement about this track, so it must not be
+    /// remembered as one; `publish_track_for_namespace` only caches denials
+    /// that are policy decisions.
+    #[tokio::test]
+    async fn fanout_distinguishes_a_fault_from_a_denial() {
+        let denied = may_serve_track_in_fanout(
+            Some(&session_auth(RecordingHook::new(deny))),
+            &context(),
+            &full_name(),
+            7,
+        )
+        .await
+        .expect_err("denied");
+        assert!(denied.is_policy_denial());
+
+        let faulted = may_serve_track_in_fanout(
+            Some(&session_auth(RecordingHook::new(fault))),
+            &context(),
+            &full_name(),
+            7,
+        )
+        .await
+        .expect_err("faulted");
+        assert!(
+            !faulted.is_policy_denial(),
+            "a fault must not be cached as a denial"
+        );
+    }
+
+    /// A session whose scope has no policy is unaffected.
+    #[tokio::test]
+    async fn fanout_permits_everything_when_no_policy_applies() {
+        assert!(may_serve_track_in_fanout(None, &context(), &full_name(), 7)
+            .await
+            .is_ok());
+        assert!(
+            may_announce_namespace(
+                None,
+                &context(),
+                &TrackNamespace::from_utf8_path("sports/football")
+            )
+            .await
+        );
+    }
+
+    /// Announcements disclose existence, so each concrete namespace is
+    /// authorized as the prefix naming exactly it.
+    #[tokio::test]
+    async fn announcements_are_authorized_per_namespace() {
+        let hook = RecordingHook::new(allow);
+        let auth = session_auth(hook.clone());
+        let namespace = TrackNamespace::from_utf8_path("sports/football");
+
+        assert!(may_announce_namespace(Some(&auth), &context(), &namespace).await);
+        assert_eq!(hook.seen(), vec!["subscribe_namespace /sports/football"]);
+    }
+
+    #[tokio::test]
+    async fn announcements_are_withheld_when_denied() {
+        let hook = RecordingHook::new(deny);
+        let auth = session_auth(hook.clone());
+        let namespace = TrackNamespace::from_utf8_path("sports/football");
+
+        assert!(
+            !may_announce_namespace(Some(&auth), &context(), &namespace).await,
+            "a namespace the token cannot touch must not be announced"
+        );
+        assert_eq!(hook.seen().len(), 1);
+    }
 
     #[test]
     fn expected_serve_shutdown_accepts_wrapped_session_errors() {

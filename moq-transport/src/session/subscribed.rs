@@ -438,7 +438,7 @@ impl Drop for Subscribed {
                 id: self.info.id,
                 status_code: Self::publish_done_code(&err),
                 stream_count,
-                reason: ReasonPhrase(err.to_string()),
+                reason: ReasonPhrase::new(err.to_string()),
             });
         } else {
             // Draft-16 §9.8: subscription rejection uses REQUEST_ERROR, not the
@@ -449,7 +449,7 @@ impl Drop for Subscribed {
                     id: self.info.id,
                     error_code: Self::request_error_code(&err),
                     retry_interval: 0,
-                    reason: ReasonPhrase(err.to_string()),
+                    reason: ReasonPhrase::new(err.to_string()),
                 },
             );
             self.forwarder.publisher.drop_subscribe(self.info.id);

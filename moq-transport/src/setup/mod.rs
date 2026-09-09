@@ -8,11 +8,13 @@
 //! The client sends the [Client] message and the server responds with the [Server] message.
 //! Both sides negotate the [Version] and [Role].
 
+mod authorization_token;
 mod client;
 mod param_types;
 mod server;
 mod version;
 
+pub use authorization_token::*;
 pub use client::*;
 pub use param_types::*;
 pub use server::*;

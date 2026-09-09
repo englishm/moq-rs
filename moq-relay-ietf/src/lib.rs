@@ -85,6 +85,7 @@ macro_rules! enabled_root_span {
 pub(crate) use enabled_root_span;
 
 mod api;
+mod auth;
 mod consumer;
 mod coordinator;
 mod covering_prefix_set;
@@ -99,6 +100,7 @@ mod upstream_namespaces;
 mod web;
 
 pub use api::*;
+pub use auth::*;
 pub use consumer::*;
 pub use coordinator::*;
 pub use local::*;

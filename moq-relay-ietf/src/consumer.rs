@@ -12,6 +12,7 @@ use moq_transport::{
 };
 use tokio::sync::Semaphore;
 
+use crate::auth::{authorize, AuthzOperation, SessionAuth};
 use crate::{
     metrics::GaugeGuard, Coordinator, Locals, Producer, RemoteManager, SessionContext,
     SessionInterface, TrackRequest,
@@ -31,17 +32,30 @@ pub struct Consumer {
     forward: Option<Producer>, // Forward all announcements to this subscriber
     /// Relay-level context for this MoQT session.
     context: SessionContext,
+    /// Authorization state for this session. `None` when the scope has no
+    /// authorization policy, in which case every request is permitted.
+    auth: Option<SessionAuth>,
     publish_track_permits: Arc<Semaphore>,
 }
 
 impl Consumer {
-    pub fn new(
+    /// Create a consumer for a session.
+    ///
+    /// `auth` is the session's authorization state, and is deliberately a
+    /// required argument rather than something attached afterwards: a consumer
+    /// with no authorization accepts every publish, so forgetting to supply it
+    /// must be a compile error rather than a silent grant. `None` states that
+    /// the session needs no authorization — its scope has no policy, or the
+    /// relay dialled the peer itself.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         subscriber: Subscriber,
         locals: Locals,
         coordinator: Arc<dyn Coordinator>,
         remotes: RemoteManager,
         forward: Option<Producer>,
         context: SessionContext,
+        auth: Option<SessionAuth>,
     ) -> Self {
         Self {
             subscriber,
@@ -50,6 +64,7 @@ impl Consumer {
             remotes,
             forward,
             context,
+            auth,
             publish_track_permits: Arc::new(Semaphore::new(MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION)),
         }
     }
@@ -179,6 +194,23 @@ impl Consumer {
             futures::future::BoxFuture<'static, Result<(), anyhow::Error>>,
         > = FuturesUnordered::new();
         let ns = published_ns.namespace.to_utf8_path();
+
+        // Authorize before registering anything: an unauthorized namespace
+        // must leave no trace in the local registry or the coordinator.
+        if let Err(reason) = authorize(
+            self.auth.as_ref(),
+            &self.context,
+            AuthzOperation::PublishNamespace {
+                namespace: &published_ns.namespace,
+            },
+            Some(published_ns.info.request_id),
+        )
+        .await
+        {
+            metrics::counter!("moq_relay_announce_errors_total", "phase" => "auth").increment(1);
+            published_ns.reject(reason.request_error_code(), "unauthorized")?;
+            return Err(anyhow::anyhow!("unauthorized publish_namespace"));
+        }
 
         // A namespace forwarded by a peer relay is proxied, not ours, so it is
         // advertised for discovery and nothing more.
@@ -428,6 +460,23 @@ impl Consumer {
 
         let namespace = publish.namespace().clone();
         let track_name = publish.name().clone();
+
+        // Authorize before taking the reader or registering the track.
+        if let Err(reason) = authorize(
+            self.auth.as_ref(),
+            &self.context,
+            AuthzOperation::Publish {
+                namespace: &namespace,
+                track: &track_name,
+            },
+            None,
+        )
+        .await
+        {
+            metrics::counter!("moq_relay_publish_errors_total", "phase" => "auth").increment(1);
+            publish.close(ServeError::Closed(reason.request_error_code()));
+            return Err(anyhow::anyhow!("unauthorized publish"));
+        }
 
         // Take the reader first, then follow the same order as PUBLISH_NAMESPACE:
         // local registration → coordinator registration → PUBLISH_OK.

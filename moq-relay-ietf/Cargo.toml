@@ -28,6 +28,19 @@ moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
 moq-api = { path = "../moq-api", version = "0.2" }
 web-transport = { workspace = true }
 
+# Bearer tokens are held in a type that zeroizes on drop and redacts under
+# Debug. Not optional: the enforcement points compile without `auth-cat`, so
+# the type that carries the credential has to as well.
+secrecy = "0.10"
+
+# Authorization: Common Access Tokens (draft-ietf-moq-c4m). Optional because
+# the token library pulls in a substantial cryptography tree that relays
+# without token authorization should not have to build or audit.
+cat-token = { git = "https://github.com/Quicr/cat-token", rev = "df4905bad7ba24a2713746ed9907691eae7bc61b", optional = true }
+# Reading the untrusted `kid` header to select a verification key. Already in
+# cat-token's own tree, so the feature adds no new crates.
+ciborium = { version = "0.2", optional = true }
+
 # QUIC
 url = "2"
 
@@ -71,12 +84,20 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", optional = true }
 
 [dev-dependencies]
+bytes = "1"
 # test-util provides the paused-clock runtime used to test idle timeouts without
 # sleeping for real.
 tokio = { version = "1", features = ["full", "test-util"] }
 # Used to assert that session correlation fields actually reach formatted output.
 tracing-subscriber = { workspace = true }
+# The CAT tests mint their own keypairs; cat-token can load a public key from
+# PEM but cannot export one, so the tests do that conversion themselves.
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 
 [features]
 default = []
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]
+# Common Access Token authorization (draft-ietf-moq-c4m). Off by default: the
+# trait, wire decoding and enforcement points are always compiled, so a relay
+# built without this still fails closed for any scope that requires tokens.
+auth-cat = ["dep:cat-token", "dep:ciborium"]
