@@ -1673,6 +1673,7 @@ name = "moq-clock-ietf"
 version = "0.6.21"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "moq-native-ietf",
@@ -1733,7 +1734,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64",
  "bytes",
  "cat-token",
  "ciborium",

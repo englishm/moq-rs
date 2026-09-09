@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2026 Cloudflare Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use async_trait::async_trait;

@@ -1,11 +1,11 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2026 Cloudflare Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Per-session authorization state, carried by the producer and consumer.
 
 use std::sync::Arc;
 
-use super::{AuthHook, AuthRequest, AuthzOperation, DenyReason, Principal};
+use super::{AuthHook, AuthRequest, AuthzOperation, DenyReason, Principal, UNSCOPED};
 use crate::SessionContext;
 
 /// The authorization state of one established session.
@@ -55,7 +55,7 @@ impl SessionAuth {
             Ok(decision) => decision,
             Err(err) => {
                 tracing::error!(
-                    scope = session.scope().unwrap_or("<unscoped>"),
+                    scope = session.scope().unwrap_or(UNSCOPED),
                     subject = self.subject(),
                     operation = label,
                     error = %err,
@@ -76,7 +76,7 @@ impl SessionAuth {
             Ok(_) => Ok(()),
             Err(reason) => {
                 tracing::debug!(
-                    scope = session.scope().unwrap_or("<unscoped>"),
+                    scope = session.scope().unwrap_or(UNSCOPED),
                     subject = self.subject(),
                     operation = label,
                     reason = %reason,

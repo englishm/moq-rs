@@ -195,12 +195,6 @@ impl Consumer {
         > = FuturesUnordered::new();
         let ns = published_ns.namespace.to_utf8_path();
 
-        // A namespace forwarded by a peer relay is proxied, not ours, so it is
-        // advertised for discovery and nothing more.
-        if self.context.interface == SessionInterface::Internal {
-            return self.serve_proxied(published_ns).await;
-        }
-
         // Authorize before registering anything: an unauthorized namespace
         // must leave no trace in the local registry or the coordinator.
         if let Err(reason) = authorize(
@@ -216,6 +210,12 @@ impl Consumer {
             metrics::counter!("moq_relay_announce_errors_total", "phase" => "auth").increment(1);
             published_ns.reject(reason.request_error_code(), "unauthorized")?;
             return Err(anyhow::anyhow!("unauthorized publish_namespace"));
+        }
+
+        // A namespace forwarded by a peer relay is proxied, not ours, so it is
+        // advertised for discovery and nothing more.
+        if self.context.interface == SessionInterface::Internal {
+            return self.serve_proxied(published_ns).await;
         }
 
         // Register namespace routing metadata locally. This does not register

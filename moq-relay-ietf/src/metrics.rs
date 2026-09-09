@@ -83,7 +83,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "moq_relay_connection_errors_total",
-        "Connection failures by stage (session_accept, session_run)"
+        "Connection failures by stage (session_accept, scope_resolve, auth_setup, session_run)"
     );
     describe_counter!(
         "moq_relay_publishers_total",
@@ -95,7 +95,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "moq_relay_publish_errors_total",
-        "Publisher-initiated PUBLISH failures by phase (take_reader, local_register, coordinator_register, send_ok)"
+        "Publisher-initiated PUBLISH failures by phase (session_limit, auth, auth_fanout, take_reader, local_register, coordinator_register, send_ok)"
     );
     describe_counter!(
         "moq_relay_announce_ok_total",

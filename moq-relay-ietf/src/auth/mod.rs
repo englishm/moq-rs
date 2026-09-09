@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2026 Cloudflare Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Session and request authorization for the relay.
@@ -89,6 +89,8 @@ pub(crate) use scope::ScopeAuthorizer;
 pub(crate) use session::{authorize, SessionAuth};
 
 use crate::DEFAULT_SCOPE_AUTH_TTL;
+
+const UNSCOPED: &str = "<unscoped>";
 
 /// Session termination code for UNAUTHORIZED (draft-16 §13.4.1).
 pub(crate) const SESSION_ERROR_UNAUTHORIZED: u32 = 0x2;

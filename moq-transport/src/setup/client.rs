@@ -10,16 +10,41 @@
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
 use bytes::Buf as _;
+use std::fmt;
 
 /// Sent by the client to set up the session.
 ///
 /// Message Type = 0x20 (unchanged from draft-11+).
 /// The payload contains only setup parameters; version is agreed via ALPN.
-#[derive(Debug)]
 pub struct Client {
     /// Setup parameters (PATH, AUTHORITY, MAX_REQUEST_ID,
     /// MAX_AUTH_TOKEN_CACHE_SIZE, AUTHORIZATION_TOKEN, MOQT_IMPLEMENTATION, …).
     pub params: KeyValuePairs,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Params<'a>(&'a KeyValuePairs);
+
+        impl fmt::Debug for Params<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let mut list = f.debug_list();
+                let Params(params) = self;
+                for param in &params.0 {
+                    if param.key == u64::from(super::ParameterType::AuthorizationToken) {
+                        list.entry(&format_args!("{{{}: <redacted>}}", param.key));
+                    } else {
+                        list.entry(param);
+                    }
+                }
+                list.finish()
+            }
+        }
+
+        f.debug_struct("Client")
+            .field("params", &Params(&self.params))
+            .finish()
+    }
 }
 
 impl Decode for Client {
@@ -63,7 +88,10 @@ impl Encode for Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::setup::{ParameterType, Version};
+    use crate::{
+        coding::KeyValuePair,
+        setup::{AuthorizationToken, ParameterType, Version},
+    };
     use bytes::BytesMut;
 
     #[test]
@@ -96,6 +124,42 @@ mod tests {
 
         let decoded = Client::decode(&mut buf).unwrap();
         assert_eq!(decoded.params, client.params);
+    }
+
+    #[test]
+    fn repeated_authorization_tokens_round_trip_and_are_redacted() {
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(ParameterType::Path.into(), b"clock".to_vec());
+        params.set_intvalue(ParameterType::MaxRequestId.into(), 100);
+        for token in [
+            AuthorizationToken::new(1, b"first-secret".to_vec()).unwrap(),
+            AuthorizationToken::new(0x63346d, b"second-secret".to_vec()).unwrap(),
+        ] {
+            params.0.push(KeyValuePair::new_bytes(
+                ParameterType::AuthorizationToken.into(),
+                token.encode_value().unwrap(),
+            ));
+        }
+        let client = Client { params };
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("first-secret"));
+        assert!(!debug.contains("second-secret"));
+        assert_eq!(debug.matches("<redacted>").count(), 2);
+
+        let mut buf = BytesMut::new();
+        client.encode(&mut buf).unwrap();
+        let decoded = Client::decode(&mut buf).unwrap();
+
+        assert_eq!(decoded.params, client.params);
+        assert_eq!(
+            decoded
+                .params
+                .0
+                .iter()
+                .filter(|param| param.key == u64::from(ParameterType::AuthorizationToken))
+                .count(),
+            2
+        );
     }
 
     #[test]

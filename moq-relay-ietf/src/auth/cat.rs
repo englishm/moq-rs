@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+// SPDX-FileCopyrightText: 2026 Cloudflare Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Common Access Token authorization (draft-ietf-moq-c4m).
@@ -32,7 +32,7 @@ use moq_transport::coding::{TrackNamespace, TrackNamespacePrefix};
 
 use super::{
     AuthDecision, AuthError, AuthHook, AuthRequest, AuthToken, AuthzOperation, DenyReason,
-    Principal, CAT_TOKEN_TYPE,
+    Principal, CAT_TOKEN_TYPE, UNSCOPED,
 };
 use crate::{
     AuthKeyAlgorithm, AuthPublicKey, ScopeAuthConfig, SessionContext, MAX_SCOPE_AUTH_KEYS,
@@ -150,7 +150,7 @@ impl CatAuthHook {
 
         // Duplicate identifiers would make key selection depend on ordering,
         // which turns a rotation into a coin flip.
-        let mut seen = Vec::new();
+        let mut seen = Vec::with_capacity(config.keys.len());
         for key in &config.keys {
             if let Some(kid) = &key.kid {
                 if seen.contains(&kid.as_str()) {
@@ -170,8 +170,7 @@ impl CatAuthHook {
             .collect::<Result<Vec<_>, _>>()?;
 
         // Clamped rather than trusted: a coordinator returning an enormous
-        // skew would otherwise keep expired tokens valid indefinitely, and
-        // would keep expired tokens valid indefinitely.
+        // skew would otherwise keep expired tokens valid indefinitely.
         let clock_skew =
             duration_to_seconds(config.effective_clock_skew()).min(MAX_CLOCK_SKEW_SECS);
 
@@ -193,7 +192,7 @@ impl CatAuthHook {
         let moqt_validator = MoqtValidator::new().without_revalidation_support();
 
         tracing::info!(
-            scope = scope.unwrap_or("<unscoped>"),
+            scope = scope.unwrap_or(UNSCOPED),
             keys = keys.len(),
             issuers = config.issuers.len(),
             audiences = config.audiences.len(),
@@ -243,7 +242,7 @@ impl CatAuthHook {
         for key in self.candidate_keys(kid.as_deref()) {
             if *budget == 0 {
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or("<unscoped>"),
+                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
                     "exhausted the signature verification budget for this session"
                 );
                 return Err(DenyReason::TokenInvalid);
@@ -264,7 +263,7 @@ impl CatAuthHook {
             None => {
                 let err = best_error.unwrap_or(CatError::SignatureVerificationFailed);
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or("<unscoped>"),
+                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
                     kid = kid.as_deref(),
                     error = %err,
                     "CAT token failed to verify against every configured key"
@@ -279,7 +278,7 @@ impl CatAuthHook {
         // leaked token to its lifetime.
         let Some(expires_at) = verified.claims().core.exp else {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or("<unscoped>"),
+                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
                 subject = verified.claims().informational.sub.as_deref(),
                 "CAT token has no expiry"
             );
@@ -294,7 +293,7 @@ impl CatAuthHook {
 
         if expires_at > horizon {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or("<unscoped>"),
+                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
                 subject = verified.claims().informational.sub.as_deref(),
                 "CAT token expiry is implausibly distant"
             );
@@ -304,9 +303,18 @@ impl CatAuthHook {
         if let Some(not_before) = verified.claims().core.nbf {
             if !(now.saturating_sub(MAX_TOKEN_LIFETIME_SECS)..=horizon).contains(&not_before) {
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or("<unscoped>"),
+                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
                     subject = verified.claims().informational.sub.as_deref(),
                     "CAT token not-before is implausibly distant"
+                );
+                return Err(DenyReason::TokenInvalid);
+            }
+
+            if expires_at.saturating_sub(not_before) > MAX_TOKEN_LIFETIME_SECS {
+                tracing::debug!(
+                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
+                    subject = verified.claims().informational.sub.as_deref(),
+                    "CAT token lifetime exceeds the supported maximum"
                 );
                 return Err(DenyReason::TokenInvalid);
             }
@@ -316,7 +324,7 @@ impl CatAuthHook {
         // verified token into the validated trust state.
         if let Some(claim) = unenforceable_claim(token.expose_value()) {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or("<unscoped>"),
+                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
                 subject = verified.claims().informational.sub.as_deref(),
                 claim,
                 "CAT token carries a restriction this relay cannot enforce"
@@ -329,7 +337,7 @@ impl CatAuthHook {
         // Standard CWT claims: exp, nbf, iss, aud, plus CAT extensions.
         let validated = verified.validate(&self.token_validator).map_err(|err| {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or("<unscoped>"),
+                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
                 error = %err,
                 "CAT token claims rejected"
             );
@@ -341,7 +349,7 @@ impl CatAuthHook {
             .validate_moqt_claims(validated.claims())
             .map_err(|err| {
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or("<unscoped>"),
+                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
                     subject = validated.claims().informational.sub.as_deref(),
                     error = %err,
                     "CAT token MOQT claims rejected"
@@ -393,7 +401,7 @@ impl CatAuthHook {
         // setup, so this check always applies.
         let Some(now) = try_now_unix() else {
             tracing::error!(
-                scope = self.scope.as_deref().unwrap_or("<unscoped>"),
+                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
                 "system clock is before the UNIX epoch; cannot evaluate token expiry"
             );
             return AuthDecision::deny(DenyReason::HookFault {
@@ -403,7 +411,7 @@ impl CatAuthHook {
 
         if now > principal.expires_at.saturating_add(principal.clock_skew) {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or("<unscoped>"),
+                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
                 subject = principal.token.informational.sub.as_deref(),
                 operation = operation.label(),
                 "CAT token expired mid-session"
@@ -416,7 +424,7 @@ impl CatAuthHook {
             AuthDecision::allow(established.clone())
         } else {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or("<unscoped>"),
+                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
                 subject = principal.token.informational.sub.as_deref(),
                 operation = operation.label(),
                 "CAT authorization denied: operation outside token scope"
@@ -487,7 +495,7 @@ impl AuthHook for CatAuthHook {
 
         if candidates.peek().is_none() {
             tracing::debug!(
-                scope = session.scope().unwrap_or("<unscoped>"),
+                scope = session.scope().unwrap_or(UNSCOPED),
                 presented = tokens.len(),
                 "no CAT token in CLIENT_SETUP"
             );
@@ -523,7 +531,7 @@ impl AuthHook for CatAuthHook {
         // predicate, as the namespace-level actions are.
         if !scope_authorizes(&decoded, MoqtAction::ClientSetup, None, None) {
             tracing::debug!(
-                scope = session.scope().unwrap_or("<unscoped>"),
+                scope = session.scope().unwrap_or(UNSCOPED),
                 subject = decoded.informational.sub.as_deref(),
                 "CAT token does not authorize CLIENT_SETUP"
             );
@@ -531,7 +539,7 @@ impl AuthHook for CatAuthHook {
         }
 
         tracing::debug!(
-            scope = session.scope().unwrap_or("<unscoped>"),
+            scope = session.scope().unwrap_or(UNSCOPED),
             subject = decoded.informational.sub.as_deref(),
             "CAT token accepted"
         );
@@ -2401,6 +2409,38 @@ mod tests {
                 .unwrap();
             assert!(!decision.is_allowed(), "nbf {nbf} must be refused");
         }
+    }
+
+    #[tokio::test]
+    async fn a_past_not_before_is_valid_but_total_lifetime_is_bounded() {
+        let key = generate_key();
+        let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
+        let now = now_unix();
+
+        let mut live = base_token();
+        live.core.nbf = Some(now - 3600);
+        live.core.exp = Some(now + 3600);
+        let encoded = Bytes::from(encode_token(&live, &key.signer).unwrap());
+        assert!(hook
+            .on_setup(&session(), &[auth_token(encoded)])
+            .await
+            .unwrap()
+            .is_allowed());
+
+        let mut token = base_token();
+        token.core.nbf = Some(now - MAX_TOKEN_LIFETIME_SECS + 60);
+        token.core.exp = Some(now + MAX_TOKEN_LIFETIME_SECS - 60);
+
+        let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
+        let decision = hook
+            .on_setup(&session(), &[auth_token(encoded)])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            decision.deny_reason(),
+            Some(DenyReason::TokenInvalid)
+        ));
     }
 
     /// Admission cost must not scale with what the peer chooses to send.

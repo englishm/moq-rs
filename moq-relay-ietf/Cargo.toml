@@ -27,7 +27,6 @@ moq-transport = { path = "../moq-transport", version = "0.16" }
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
 moq-api = { path = "../moq-api", version = "0.2" }
 web-transport = { workspace = true }
-bytes = "1"
 
 # Bearer tokens are held in a type that zeroizes on drop and redacts under
 # Debug. Not optional: the enforcement points compile without `auth-cat`, so
@@ -38,9 +37,8 @@ secrecy = "0.10"
 # the token library pulls in a substantial cryptography tree that relays
 # without token authorization should not have to build or audit.
 cat-token = { git = "https://github.com/Quicr/cat-token", rev = "df4905bad7ba24a2713746ed9907691eae7bc61b", optional = true }
-# Reading the untrusted `kid` header to select a verification key. Both are
-# already in cat-token's own tree, so the feature adds no new crates.
-base64 = { version = "0.22", optional = true }
+# Reading the untrusted `kid` header to select a verification key. Already in
+# cat-token's own tree, so the feature adds no new crates.
 ciborium = { version = "0.2", optional = true }
 
 # QUIC
@@ -86,6 +84,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", optional = true }
 
 [dev-dependencies]
+bytes = "1"
 # test-util provides the paused-clock runtime used to test idle timeouts without
 # sleeping for real.
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -101,4 +100,4 @@ metrics-prometheus = ["dep:metrics-exporter-prometheus"]
 # Common Access Token authorization (draft-ietf-moq-c4m). Off by default: the
 # trait, wire decoding and enforcement points are always compiled, so a relay
 # built without this still fails closed for any scope that requires tokens.
-auth-cat = ["dep:cat-token", "dep:base64", "dep:ciborium"]
+auth-cat = ["dep:cat-token", "dep:ciborium"]

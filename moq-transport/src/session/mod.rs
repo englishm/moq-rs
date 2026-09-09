@@ -45,7 +45,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use request_id::max_request_id_from_params;
 use std::sync::{Arc, Mutex};
 
-use crate::coding::{KeyValuePairs, Value};
+use crate::coding::{KeyValuePair, KeyValuePairs, Value};
 use crate::message::Message;
 use crate::mlog;
 use crate::watch::Queue;
@@ -193,7 +193,7 @@ pub struct Session {
 
     /// Setup parameters the peer sent in CLIENT_SETUP.
     ///
-    /// Retained verbatim so the application layer can read parameters the
+    /// Retained in decoded form so the application layer can read parameters the
     /// transport does not interpret itself — notably AUTHORIZATION TOKEN
     /// (draft-16 §9.3.1.5), which the relay's authorization hook decodes.
     /// Empty for sessions created via `connect()`, which receive
@@ -695,6 +695,25 @@ impl Session {
         .await
     }
 
+    /// Create an outbound/client connection carrying authorization tokens in
+    /// CLIENT_SETUP.
+    pub async fn connect_with_tokens(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        tokens: Vec<setup::AuthorizationToken>,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_config_and_session_id_and_tokens(
+            session,
+            SessionId::generate(),
+            mlog_path,
+            transport,
+            SessionConfig::default(),
+            tokens,
+        )
+        .await
+    }
+
     /// Create an outbound/client QUIC connection with explicit session configuration.
     ///
     /// Generates a local [`SessionId`] fallback. Use
@@ -708,12 +727,13 @@ impl Session {
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
         // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
-        Self::connect_with_config_and_session_id(
+        Self::connect_with_config_and_session_id_and_tokens(
             session,
             SessionId::generate(),
             mlog_path,
             transport,
             config,
+            Vec::new(),
         )
         .await
     }
@@ -727,6 +747,47 @@ impl Session {
         mlog_path: Option<PathBuf>,
         transport: Transport,
         config: SessionConfig,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_config_and_session_id_and_tokens(
+            session,
+            session_id,
+            mlog_path,
+            transport,
+            config,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Create an outbound/client connection with explicit session
+    /// configuration and authorization tokens.
+    pub async fn connect_with_config_and_tokens(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        config: SessionConfig,
+        tokens: Vec<setup::AuthorizationToken>,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_config_and_session_id_and_tokens(
+            session,
+            SessionId::generate(),
+            mlog_path,
+            transport,
+            config,
+            tokens,
+        )
+        .await
+    }
+
+    /// Create an outbound/client connection with explicit configuration,
+    /// correlation ID, and authorization tokens.
+    pub async fn connect_with_config_and_session_id_and_tokens(
+        session: web_transport::Session,
+        session_id: SessionId,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        config: SessionConfig,
+        tokens: Vec<setup::AuthorizationToken>,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let url = session.url().clone();
         let url_path = url.path();
@@ -779,6 +840,13 @@ impl Session {
             setup::ParameterType::MaxRequestId.into(),
             our_max_request_id,
         );
+
+        for token in tokens {
+            params.0.push(KeyValuePair::new_bytes(
+                setup::ParameterType::AuthorizationToken.into(),
+                token.encode_value()?,
+            ));
+        }
 
         let client = setup::Client { params };
 

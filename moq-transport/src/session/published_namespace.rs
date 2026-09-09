@@ -107,8 +107,10 @@ impl PublishedNamespace {
 
     /// Reject the PUBLISH_NAMESPACE; the error is sent on drop.
     ///
-    /// The REQUEST_ERROR carries UNINTERESTED. Use [`reject`](Self::reject) to
-    /// send a specific error code such as UNAUTHORIZED.
+    /// Before [`ok`](Self::ok), the peer receives REQUEST_ERROR with
+    /// UNINTERESTED. After `ok`, it receives PUBLISH_NAMESPACE_CANCEL with the
+    /// same code. Use [`reject`](Self::reject) to send a specific error code
+    /// such as UNAUTHORIZED.
     pub fn close(mut self, err: ServeError) -> Result<(), ServeError> {
         self.error = Some(err);
         Ok(())
@@ -233,7 +235,7 @@ mod tests {
     use super::*;
 
     use crate::coding::{Decode, Encode, TrackNamespace};
-    use crate::session::{PendingRequests, RequestId, Subscriber};
+    use crate::session::{PendingRequests, RequestId, SessionId, Subscriber};
     use crate::watch::Queue;
 
     /// Build a `PublishedNamespace` wired to a queue the test can drain, so
@@ -267,6 +269,7 @@ mod tests {
             None,
             RequestId::new(0, 100, 100, 1),
             PendingRequests::default(),
+            SessionId::generate(),
         );
 
         let (send, recv) =

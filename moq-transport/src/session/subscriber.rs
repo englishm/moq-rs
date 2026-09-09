@@ -333,6 +333,36 @@ impl Subscriber {
         Self::connect_with_session_id(session, SessionId::generate(), transport).await
     }
 
+    /// Connect while presenting authorization tokens in CLIENT_SETUP.
+    pub async fn connect_with_tokens(
+        session: web_transport::Session,
+        transport: super::Transport,
+        tokens: Vec<crate::setup::AuthorizationToken>,
+    ) -> Result<(Session, Self), SessionError> {
+        let (session, _, subscriber) =
+            Session::connect_with_tokens(session, None, transport, tokens).await?;
+        Ok((session, subscriber))
+    }
+
+    /// Connect with a peer-observed correlation ID while presenting authorization tokens.
+    pub async fn connect_with_session_id_and_tokens(
+        session: web_transport::Session,
+        session_id: SessionId,
+        transport: super::Transport,
+        tokens: Vec<crate::setup::AuthorizationToken>,
+    ) -> Result<(Session, Self), SessionError> {
+        let (session, _, subscriber) = Session::connect_with_config_and_session_id_and_tokens(
+            session,
+            session_id,
+            None,
+            transport,
+            SessionConfig::default(),
+            tokens,
+        )
+        .await?;
+        Ok((session, subscriber))
+    }
+
     /// Create a configured subscriber session using a generated local correlation ID.
     ///
     /// Use [`Self::connect_with_config_and_session_id`] when a peer-observed QUIC connection ID is
